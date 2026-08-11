@@ -152,6 +152,23 @@ pub fn await_animation(
     watch_animation(|| target.char_anim(idx), budget_frames, stall_polls)
 }
 
+/// Poll until a character is actually readable, or `tries` samples have come back empty.
+///
+/// A match doesn't exist the instant `spawn` returns: the engine still has to construct
+/// the characters, and how long that takes depends on what content it had to load. Every
+/// driver here used to paper over that with a fixed delay or by grepping the log for a
+/// hopeful line, which costs the first observation of every run — the Fraymakers scan
+/// opened with `NoSample` and silently threw away its first driven state.
+pub fn await_live(
+    mut sample: impl FnMut() -> Result<Option<AnimState>>,
+    tries: u32,
+) -> Result<Option<AnimState>> {
+    for _ in 0..tries.max(1) {
+        if let Some(s) = sample()? { return Ok(Some(s)); }
+    }
+    Ok(None)
+}
+
 /// The frame-watching state machine itself, over any source of samples.
 ///
 /// Split out from [`await_animation`] because the two live drivers reach the engine
@@ -246,6 +263,13 @@ pub fn run_command(target: &mut dyn DebugTarget, line: &str) -> Result<Option<St
                     "AWAIT:{:?} anim={} frame={}/{} frames_seen={} pos=({:.1},{:.1}) state={}",
                     w.outcome, s.anim, s.frame, s.total, w.frames_seen, s.x, s.y, s.state),
                 None => format!("AWAIT:{:?} (no live character p{idx})", w.outcome),
+            })
+        }
+        Command::AwaitMatch { idx, tries } => {
+            let live = await_live(|| target.char_anim(idx), tries)?;
+            Some(match live {
+                Some(s) => format!("MATCHREADY:p{idx} anim={} pos=({:.1},{:.1})", s.anim, s.x, s.y),
+                None => format!("MATCHREADY:none (p{idx} never became readable in {tries} tries)"),
             })
         }
         Command::Console => Some(target.console()?),

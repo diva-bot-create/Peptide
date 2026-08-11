@@ -772,6 +772,15 @@ impl Ssf2Target {
     ///
     /// Position is the character's own `X`/`Y` fields, not `getX()` (which carries an
     /// offset).
+    ///
+    /// SAMPLING RATE — the reason a frame COUNT off this is not trustworthy. Every field
+    /// is a separate synchronous reflection round trip over file-IPC, so one sample costs
+    /// several, and measured against a live match a sample lands roughly every ~14 SSF2
+    /// frames. A 14-frame attack is therefore over between two samples: `await` reports
+    /// which animation played (correct) but `frames_seen=0` (useless). `state` is dropped
+    /// from the sample for that reason — nothing decides on it, and it was pure latency.
+    /// Comparing frame counts against Fraymakers needs ENGINE-SIDE recording (have SSF2
+    /// log its own label+frame each tick, then read the trace), not faster polling.
     fn compose_anim_feed(&self, idx: usize) -> Result<String> {
         let base = format!("match.getCharacter({idx})");
         let sane = |s: String| {
@@ -785,9 +794,7 @@ impl Ssf2Target {
         let frame = num(&format!("{base}.MC.currentFrame")).map(|f| f - 1.0).unwrap_or(-1.0);
         let x = num(&format!("{base}.X")).unwrap_or(0.0);
         let y = num(&format!("{base}.Y")).unwrap_or(0.0);
-        let state = self.eval_quiet(&format!("{base}.State")).ok().and_then(sane)
-            .unwrap_or_else(|| "?".into());
-        Ok(format!("{anim}|{frame}|-1|{x}|{y}|{state}"))
+        Ok(format!("{anim}|{frame}|-1|{x}|{y}|?"))
     }
 
     /// A character's current animation name, read live (None when there's no

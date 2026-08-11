@@ -64,6 +64,8 @@ pub const COMMANDS: &[Cmd] = &[
           args: "[depth]",                       help: "dump the live object tree (name/class/position/size/frame per node) — the stage-triage ground truth. SSF2 walks the display list; depth defaults to 6" },
     Cmd { name: "await",   aliases: &["settle", "playout"],  wire: '\0',
           args: "[pN] [budgetFrames]",           help: "let the current animation PLAY OUT, watching the engine's own frame counter (never a wall-clock delay): returns when it completes / loops / changes / stalls. reports the outcome, frames actually seen, and end position. budget is a ceiling (a looping animation never finishes), default 240" },
+    Cmd { name: "awaitmatch", aliases: &["ready", "awaitspawn"], wire: '\0',
+          args: "[pN] [tries]",                  help: "block until a character is actually READABLE (the match is up, not just spawn-acknowledged) — the deterministic replacement for sleeping after spawn. default 60 tries" },
     Cmd { name: "addCharacter", aliases: &["addchar", "add"], wire: 'n',
           args: "",                              help: "drop one more fighter into the LIVE match on demand (re-spawns the last roster char via the deferred-spawn path) — no relaunch (peptide todo #3)" },
     Cmd { name: "exit",    aliases: &["quit", "stop", "x"], wire: 'x',
@@ -357,6 +359,10 @@ pub enum Command {
     /// `budget` bounds the watch (a looping animation never finishes) — a ceiling,
     /// not a pace.
     Await { idx: usize, budget: u32 },
+    /// Block until a character is readable — the match is genuinely up, not just
+    /// `spawn`-acknowledged. Replaces "sleep a few seconds after spawn", which loses
+    /// the first observation when the engine is slow and wastes the wait when it isn't.
+    AwaitMatch { idx: usize, tries: u32 },
     /// Drop one more fighter into the live match (peptide todo #3).
     AddCharacter,
     /// Cleanly shut the engine down.
@@ -479,6 +485,18 @@ pub fn parse(line: &str) -> Command {
                     }
                 }
                 return Command::Await { idx, budget };
+            }
+            "awaitmatch" | "ready" | "awaitspawn" => {
+                let mut idx = 0usize;
+                let mut tries = 60u32;
+                for a in &rest {
+                    if let Some(n) = a.strip_prefix('p').and_then(|n| n.parse::<usize>().ok()) {
+                        idx = n;
+                    } else if let Ok(n) = a.parse::<u32>() {
+                        tries = n;
+                    }
+                }
+                return Command::AwaitMatch { idx, tries };
             }
             "addCharacter" => return Command::AddCharacter,
             "exit" => return Command::Exit,
@@ -604,8 +622,8 @@ pub fn command_to_wire(cmd: &Command) -> Translated {
         // `await` is a HOST-side polling loop over the engine's frame counter, not a wire
         // verb — there is nothing to send. It's executed by `run_command`, which owns the
         // loop; reaching here means a caller translated it to wire by mistake.
-        Command::Await { .. } => Translated::Client(
-            "await is executed host-side (run_command), not sent to the engine\n".into()),
+        Command::Await { .. } | Command::AwaitMatch { .. } => Translated::Client(
+            "await/awaitmatch are executed host-side (run_command), not sent to the engine\n".into()),
         Command::Hold(m) => Translated::Wire(format!("i {m}")),
         Command::Seq(masks) => Translated::Wire(masks.iter().map(|m| format!("i {m}")).collect::<Vec<_>>().join("\n")),
         Command::Scenario { setup, masks } => {

@@ -136,22 +136,29 @@ pub fn serve(port: u16, token: Option<&str>) {
     let mut first = true;
     for line in stdin.lock().lines() {
         let Ok(raw) = line else { break };
-        // `await` is executed HERE, host-side, by polling the engine's frame counter —
-        // it has no wire verb. This is the pacing primitive: a caller sends a state, then
-        // `await`, and the next command doesn't go out until the animation has actually
-        // played (or looped / stalled), whatever that took in wall-clock terms.
-        if let crate::interpreter::Command::Await { idx, budget } =
-            crate::interpreter::parse(&raw)
+        // `await` / `awaitmatch` are executed HERE, host-side, by polling the engine's
+        // own animation clock — neither has a wire verb. This is the pacing primitive:
+        // a caller sends a state, then `await`, and the next command doesn't go out until
+        // the animation has actually played (or looped / stalled), whatever that took in
+        // wall-clock terms.
+        let parsed = crate::interpreter::parse(&raw);
+        if matches!(parsed, crate::interpreter::Command::Await { .. }
+                          | crate::interpreter::Command::AwaitMatch { .. })
         {
+            let idx = match parsed {
+                crate::interpreter::Command::Await { idx, .. }
+                | crate::interpreter::Command::AwaitMatch { idx, .. } => idx,
+                _ => 0,
+            };
             let w = &mut write_half;
-            let watch = crate::debug_target::watch_animation(|| {
+            // One sampler for both: ask for the clock, then take the next reply that is
+            // actually a sample. Replies from EARLIER commands are still queued (`E:true`
+            // from the toState that got us here), so returning the first thing off the
+            // channel reads a stale value and the watch gives up before it starts.
+            let mut sample = || {
                 if !send_wire(w, &format!("e animFeed({idx})")) {
                     return Ok(None);
                 }
-                // Take the next reply that is actually an animation sample. Replies from
-                // EARLIER commands are still queued (`E:true` from the toState that got us
-                // here), so returning the first thing off the channel reads a stale value
-                // and the watch gives up before it starts.
                 let deadline = Instant::now() + Duration::from_millis(1500);
                 while Instant::now() < deadline {
                     match eval_rx.recv_timeout(Duration::from_millis(200)) {
@@ -165,19 +172,29 @@ pub fn serve(port: u16, token: Option<&str>) {
                     }
                 }
                 Ok(None)
-            }, budget, 3);
-            match watch {
-                Ok(w) => {
-                    let msg = match &w.last {
-                        Some(s) => format!(
-                            "AWAIT:{:?} anim={} frame={}/{} frames_seen={} pos=({:.1},{:.1})",
-                            w.outcome, s.anim, s.frame, s.total, w.frames_seen, s.x, s.y),
-                        None => format!("AWAIT:{:?} (no live character p{idx})", w.outcome),
-                    };
-                    println!("<< {msg}");
+            };
+            let msg = match parsed {
+                crate::interpreter::Command::AwaitMatch { tries, .. } => {
+                    match crate::debug_target::await_live(sample, tries) {
+                        Ok(Some(s)) => format!("MATCHREADY:p{idx} anim={} pos=({:.1},{:.1})", s.anim, s.x, s.y),
+                        Ok(None) => format!("MATCHREADY:none (p{idx} never became readable in {tries} tries)"),
+                        Err(e) => format!("MATCHREADY:error {e}"),
+                    }
                 }
-                Err(e) => eprintln!("peptide-bridge: await: {e}"),
-            }
+                crate::interpreter::Command::Await { budget, .. } => {
+                    match crate::debug_target::watch_animation(&mut sample, budget, 3) {
+                        Ok(w) => match &w.last {
+                            Some(s) => format!(
+                                "AWAIT:{:?} anim={} frame={}/{} frames_seen={} pos=({:.1},{:.1})",
+                                w.outcome, s.anim, s.frame, s.total, w.frames_seen, s.x, s.y),
+                            None => format!("AWAIT:{:?} (no live character p{idx})", w.outcome),
+                        },
+                        Err(e) => format!("AWAIT:error {e}"),
+                    }
+                }
+                _ => unreachable!(),
+            };
+            println!("<< {msg}");
             first = false;
             continue;
         }
