@@ -217,10 +217,19 @@ dimensions below are the rest.
 `/* ? */` (decompiler couldn't recover an expr/condition/receiver), `[SSF2-only:` (no FM
 equivalent), and `TODO` (value punted to a default). lower is better. it's the safe
 before/after gate for decompiler/mapping changes, since a real fix should *drop* the marker
-count without adding new ones, and the in-engine spawn sweep still has to pass. ten
-characters are fully `/* ? */`-clean. the decompiler-quality outliers worth a focused pass
-later are `kirby`, `tails`, `rayman`, `pacman`, `goku`/`lucario`, `dedede`, `sonic`,
-`yoshi`.
+count without adding new ones, and the in-engine spawn sweep still has to pass. read it
+alongside the amount of code emitted, though: a decompiler fix that recovers a previously
+dropped body ADDS markers, because the untranslatable calls inside it were invisible while
+the whole body was missing. seven characters are fully `/* ? */`-clean. the
+decompiler-quality outliers worth a focused pass are `bowser`, `kirby`, `dedede`, `rayman`,
+`krystal`, `sora`, `lucario`, `wario`.
+
+the other half of the measurement is `conversion_log.json :: unknown`, the per-character
+tally of call sites the converter doesn't recognize. it counts only genuine gaps: names a
+regex mapping emits, the character's own helper functions, and Haxe stdlib methods are all
+discounted, so an entry there means "no Fraymakers equivalent" rather than "the converter
+didn't recognize the name". corpus total is 1619 calls across 55 names (see "character
+system gaps" below).
 
 ## how parity should be verified going forward
 
@@ -309,56 +318,39 @@ converted stages makes them look flat compared to SSF2):
 
 ## character system gaps
 
-these are per-character behaviors in the "unknown" stream (not in ssf2_only -- they're calls the
-converter doesn't classify at all). the ssf2_only universal gaps (item system, getCharacter,
-getMetalStatus, etc.) are already covered above in "SSF2-only / no-FM-equivalent inventory".
+calls in the `conversion_log.json :: unknown` stream: SSF2 API the converter doesn't classify at
+all, as opposed to the `ssf2_only` universal gaps (item system, getCharacter, getMetalStatus)
+covered above in "SSF2-only / no-FM-equivalent inventory".
 
-**most "unknown" calls are NOT broken.** an "unknown" tally counts call SITES of functions the
-converter doesn't recognize -- but the author-defined helper functions (`updateAuraPaws`,
-`isDarkPit`, `hurtSelf`, etc.) ARE emitted and translated into the character's `Script.hx`, so
-the calls resolve. e.g. `function isDarkPit()` is emitted at Pit/Script.hx:389 with a real body
-(`return self.getCostumeShader().paletteSwapPA.replacements[76] == 4289855743`). the genuine
-work here is decompiler BODY quality, not call mapping. the one confirmed broken body in the
-corpus is **pichu `hurtSelf`** -- emitted as `function hurtSelf(arg0) {}` (empty; the SSF2
-statements were dropped in decompilation), so pichu's recoil moves never self-damage. fixing it
-needs the real SSF2 body recovered (don't fabricate `setDamage(getDamage()+arg0)` from the name).
-the only intentional empties are `inputUpdateHook` + `handleLinkFrames` (template stubs on all 49).
+a character's OWN helper functions don't appear here. `updateAuraPaws`, `isDarkPit`, `hurtSelf`
+and friends are emitted and translated into that character's `Script.hx`, so their calls resolve;
+the tally discounts every name the assembled script defines. the work they represent is decompiler
+BODY quality, tracked by the `/* ? */` counts in "measuring progress", not call mapping.
 
 all 49 characters (47 SSF files, incl. multi-char bowser/wario/zelda) convert exit 0.
-corpus sweep: PASS=49 FAIL=0. the numbers below are aggregate call counts from
-`conversion_log.json :: unknown`.
+corpus sweep: PASS=49 FAIL=0. the only empty function bodies left in the corpus are the
+intentional template stubs (`inputUpdateHook` on all 49, `onTeardown` on 2).
 
-**per-character unported systems:**
+**the whole remaining stream**, 1619 calls across 55 names. the item system alone is 73% of it:
 
-| char | unknown call | count | what it is | port path |
+| call | count | chars | what it is | port path |
 |---|---|---|---|---|
-| lucario | updateAuraPaws | 507 | aura system: scales damage+KB with lucario's own % damage; the "paws" are visual rings | FM has no built-in % scaling; needs a Script.hx hook on each hit to read `getSelfDamage()` and call `updateHitboxStats` |
-| goku | resetKaioKenBackEffect | 66 | kaioken VFX cleanup (resets a back-glow MC) | FM no analog; port as createVfx remove call when it surfaces |
-| goku | applyDamageMod | 62 | kaioken damage multiplier (scales outgoing damage while powered up) | same hook as lucario aura; read a "power level" state var, multiply via `updateHitboxStats` |
-| pit | isDarkPit | 167 | checks whether the current costume is dark pit (different specials) | FM costume index: `getCostumeIndex()` returns the palette slot; check `== 1` for dark pit costume |
-| sonic | getFeetFrames | 94 | detects which frames have feet on the ground for step-sfx triggering | port as animation-label checks in the Script.hx; play step SFX on the identified frames |
-| waluigi | tweenRotation | 68 | smooth rotation tween between angles on waluigi's spinning moves | FM: `setRotation()` works in hscript; implement linear tween in Script.hx update loop |
-| pacman | applyColourTo | 45 | changes pacman's hue to match the ghost he's become (red/pink/blue/orange) | FM: `setCostumeShader()` can tint; map ghost type to shader params |
-| pichu | hurtSelf | 35 | pichu's electric moves deal recoil to himself; called as `hurtSelf(1.5)` (DAir), etc. | CONFIRMED BROKEN: emitted body is empty `{}` (decompiler dropped the SSF2 statements). recover the real body from the SSF2 frame-script def; don't fabricate it |
-| kirby | becomeSolid | 34 | kirby stone form: temporarily immune to knockback while transformed | FM `becomeInvulnerable()` or `setHitboxActive(false)` for the immune window; check FM API |
-| zelda/sheik | sparkle | 52 | transformation sparkle VFX | port as `createVfx(sparkle_id)` when `sparkle_id` is found in the VFX table |
-| isaac/zelda/sheik | cast | 589 | AS3 type-cast expressions the decompiler surfaced as calls; NOT a gameplay call | zero gameplay impact; cosmetic decompiler artifact in the generated code |
-| wario/wario_man | clearTimers | 48 | wario-man transformation: resets all active timers on transform in/out | FM timer API: iterate and cancel timers; or just reset state in the transformation trigger |
-| (38 chars) | forceGrabbedHurtFrame | 206 | tells the grabbed character to hold a specific hurt frame while being thrown | FM: grabbed characters are set to state `GRABBED`; the frame is driven by the grabber's animation; likely can just drop this call |
-| metaknight | toString | 203 | `toString()` calls the decompiler emitted for string formatting; not a gameplay call | zero gameplay impact; decompiler artifact |
+| activateItem / deactivateItem | 678 / 506 | 42 | item grab/drop | part of the item-system gap; no FM item API |
+| forceGrabbedHurtFrame | 130 | 32 | holds the grabbed character on a specific hurt frame during a throw | check whether FM's `GRABBED` state already drives the right frame; if so these are no-ops to comment out |
+| getScale | 62 | 9 | reads the character's uniform scale | FM splits the axes: `getScaleX()` / `getScaleY()`, no uniform accessor |
+| attachEffectOverlay | 22 | 9 | overlay VFX pinned to the character | no FM equivalent found; closest is createVfx with `relativeWith` |
+| applyPalette | 22 | 4 | runtime palette swap | FM: `setCostumeShader()` |
+| getOwnStats | 15 | 2 | the actor's own stat block | no FM equivalent; SSF2 hazard/actor idiom |
+| setupAutolinkAngle / stopAutolinkAngle / updateAutolinkTarget | 10 / 12 / 4 | 4 | SSF2 autolink (an attack steering itself toward the target it hit) | no FM equivalent; needs a Script.hx hook on HIT_DEALT |
+| addToDamageMeter / removeFromDamageMeter / updateBar / throbDamageCounter | 9 / 9 / 9 / 8 | 9 | SSF2 HUD damage-meter drawing | no FM equivalent; FM owns its own HUD |
+| takeDamage | 8 | 7 | deal damage to another object | no FM equivalent by that name; `updateHitboxStats` / a real hitbox is the FM route |
 
-**universal unknown calls** (all 48 chars):
-
-| call | total count | what it is |
-|---|---|---|
-| set / get | 7491 / 1811 | AS3 property accessor syntax that the decompiler surfaced as method calls; harmless |
-| createVfx | 7233 | visual effect spawner; mapped to FM createVfx equivalent; logged as unknown because the VFX id lookup isn't confirmed |
-| setAutocancel | 1820 | autocancel window (the frame range an attack can be cancelled into a landing); no confirmed FM equivalent yet |
-| activateItem / deactivateItem | 770 / 574 | item grab/drop; part of the item system gap |
-| getJumpSpeed | 74 | reads character's current jump speed for mid-jump state checks; use `physics.currentVelocityY` |
-| split | 84 | string split calls; decompiler artifact |
-| parseFloat | 43 | string-to-float; decompiler artifact |
-| removeChild | 48 | Flash display list; already flagged in ssf2_only section |
+the remaining ~40 names are 1-6 calls each on 1-4 characters (`toDodgeRoll`, `grab`,
+`generateCharacterItem`, `getHomingTarget`, `spitFoe`, `setInvincibility`, …). they're
+long-tail per-move SSF2 API, worth mapping only when a specific character is being audited.
+`reset`, `tick`, `dispose`, `start` and `distance` all exist in the Fraymakers API under the
+same names but on types the converter can't confirm from the call site, so confirm the receiver
+before treating one as a gap.
 
 ---
 
@@ -383,6 +375,14 @@ the live list of open converter issues. strike an entry when you fix it.
 - **frame-script / API translation is incomplete.** `commands.jsonc` handles the bulk of
   SSF2 API calls, and the `ssf2_only` list plus the `conversion_log.json :: unknown` stream
   surface whatever's left. the generated `.hx` always wants a human read.
+
+- **decompiler body quality is the main translation gap.** call mapping is in decent shape
+  (1619 unmapped calls corpus-wide, mostly the item system); what's left is bodies the
+  decompiler recovers imperfectly, counted per character by the `/* ? */` markers. an
+  unrecognized opcode is the expensive failure mode: the instruction stream desyncs and the
+  rest of the method decodes as nothing, silently, so a body can go missing without any
+  marker at all. when auditing a character, check for suspiciously short or empty function
+  bodies against `dump_method <ssf> find <name>`, not just the marker count.
 
 - **projectile behaviour is stubbed.** projectile *entities* (visuals, boxes, animations,
   palettes) generate fine. projectile *behaviour* (`<Pascal>Script.hx`) is template
@@ -440,18 +440,18 @@ are catalogued in the two new sections above; the items here are the main conver
 5. **projectile behaviour.** the `<Pascal>Script.hx` stubs need real translated logic from
    the decompiler + JSONC pipeline.
 
-6. **character system gaps (in priority order):**
-   a. `setAutocancel` (1820 calls, all 48 chars) -- find the FM equivalent in the API types
-      and add a mapping in `commands.jsonc`. this is the highest-count universal unknown.
-   b. `pichu` hurtSelf (35 calls) -- simple: disasm pichu per-move self-damage values, add
-      a `damageSelf` shim in commands.jsonc mapping to `takeDamage` or direct % write.
-   c. `lucario` updateAuraPaws (507 calls) -- aura system needs a Script.hx hook; the
-      per-hit damage multiplier read from getSelfDamage() + updateHitboxStats call.
-   d. `pit` isDarkPit (167 calls) -- map to `getCostumeIndex() == 1`; add to commands.jsonc.
-   e. `waluigi` tweenRotation (68 calls) -- implement a linear tween helper in Script.hx.
-   f. `goku` applyDamageMod (62 calls) -- same updateHitboxStats hook as lucario.
-   g. `forceGrabbedHurtFrame` (206 calls, 38 chars) -- investigate if the FM grabbed state
-      already drives the correct frame; if yes, comment these out as no-ops.
+6. **character system gaps (in priority order):** see the table in "character system gaps"
+   for the full stream.
+   a. `forceGrabbedHurtFrame` (130 calls, 32 chars) -- investigate whether the FM grabbed
+      state already drives the correct frame; if yes, comment these out as no-ops. the
+      biggest entry that isn't the item system.
+   b. the SSF2 autolink group (`setupAutolinkAngle` / `stopAutolinkAngle` /
+      `updateAutolinkTarget`, 4 chars) -- one Script.hx hook on HIT_DEALT covers all three.
+   c. `getScale` (62 calls, 9 chars) -- FM splits the axes; decide whether to emit
+      `getScaleX()` or carry a helper that asserts the two match.
+   d. the HUD damage-meter group (`addToDamageMeter` / `removeFromDamageMeter` /
+      `updateBar` / `throbDamageCounter`, 9 chars) -- FM owns its own HUD, so these are
+      probably `ssf2_only` no_equivalent rather than a port.
 
 7. **validate stat scaling** against hand-tuned reference characters.
 
