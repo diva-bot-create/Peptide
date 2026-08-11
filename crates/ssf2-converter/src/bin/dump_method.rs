@@ -48,6 +48,9 @@ fn rd_u30(b: &[u8], i: &mut usize) -> u32 {
     r
 }
 fn rd_s24(b: &[u8], i: &mut usize) -> i32 {
+    // `find` disassembles every body in the file, so a truncated tail has to read as 0
+    // rather than panic partway through the scan.
+    if *i + 3 > b.len() { *i = b.len(); return 0; }
     let v = (b[*i] as i32) | ((b[*i+1] as i32) << 8) | ((b[*i+2] as i32) << 16);
     *i += 3;
     if v & 0x800000 != 0 { v - 0x1000000 } else { v }
