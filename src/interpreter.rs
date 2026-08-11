@@ -62,6 +62,8 @@ pub const COMMANDS: &[Cmd] = &[
           args: "",                              help: "run the engine's debug console `help` command (RAN) — a side-effecting call hscript can't make, so it stays a wire byte" },
     Cmd { name: "tree",    aliases: &["dump"],              wire: '\0',
           args: "[depth]",                       help: "dump the live object tree (name/class/position/size/frame per node) — the stage-triage ground truth. SSF2 walks the display list; depth defaults to 6" },
+    Cmd { name: "await",   aliases: &["settle", "playout"],  wire: '\0',
+          args: "[pN] [budgetFrames]",           help: "let the current animation PLAY OUT, watching the engine's own frame counter (never a wall-clock delay): returns when it completes / loops / changes / stalls. reports the outcome, frames actually seen, and end position. budget is a ceiling (a looping animation never finishes), default 240" },
     Cmd { name: "addCharacter", aliases: &["addchar", "add"], wire: 'n',
           args: "",                              help: "drop one more fighter into the LIVE match on demand (re-spawns the last roster char via the deferred-spawn path) — no relaunch (peptide todo #3)" },
     Cmd { name: "exit",    aliases: &["quit", "stop", "x"], wire: 'x',
@@ -348,6 +350,13 @@ pub enum Command {
     /// Dump the live object tree to the given depth — the stage-triage ground truth
     /// (every live game object with its name/class/position/size/frame).
     Tree(u32),
+    /// Watch a character's animation until it finishes, loops, changes, or stalls,
+    /// polling the ENGINE'S OWN frame counter. The frame-accurate replacement for
+    /// "sleep and hope": a wall-clock wait either observes a half-played animation or
+    /// spends most of its time idle, and which one it does changes with engine load.
+    /// `budget` bounds the watch (a looping animation never finishes) — a ceiling,
+    /// not a pace.
+    Await { idx: usize, budget: u32 },
     /// Drop one more fighter into the live match (peptide todo #3).
     AddCharacter,
     /// Cleanly shut the engine down.
@@ -453,6 +462,23 @@ pub fn parse(line: &str) -> Command {
             "tree" => {
                 let depth = rest.first().and_then(|d| d.parse().ok()).unwrap_or(6);
                 return Command::Tree(depth);
+            }
+            "await" | "settle" | "playout" => {
+                // await [pN] [budgetFrames] — both optional, either order-independent
+                // enough that a bare `await` is the common case.
+                let mut idx = 0usize;
+                let mut budget = 240u32;
+                for a in &rest {
+                    if let Some(n) = a.strip_prefix('p').and_then(|n| n.parse::<usize>().ok()) {
+                        idx = n;
+                    } else if let Ok(n) = a.parse::<u32>() {
+                        budget = n;
+                    } else {
+                        return Command::Client(format!(
+                            "await: don't understand {a:?}\nusage: await [pN] [budgetFrames]\n"));
+                    }
+                }
+                return Command::Await { idx, budget };
             }
             "addCharacter" => return Command::AddCharacter,
             "exit" => return Command::Exit,
@@ -575,6 +601,11 @@ pub fn command_to_wire(cmd: &Command) -> Translated {
             Translated::Wire(wire)
         }
         Command::Eval(e) => Translated::Wire(if e.is_empty() { "e".into() } else { format!("e {e}") }),
+        // `await` is a HOST-side polling loop over the engine's frame counter, not a wire
+        // verb — there is nothing to send. It's executed by `run_command`, which owns the
+        // loop; reaching here means a caller translated it to wire by mistake.
+        Command::Await { .. } => Translated::Client(
+            "await is executed host-side (run_command), not sent to the engine\n".into()),
         Command::Hold(m) => Translated::Wire(format!("i {m}")),
         Command::Seq(masks) => Translated::Wire(masks.iter().map(|m| format!("i {m}")).collect::<Vec<_>>().join("\n")),
         Command::Scenario { setup, masks } => {
