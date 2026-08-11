@@ -206,6 +206,31 @@ once (boot→READY budget via `FRAY_READY_BUDGET`), fires the first command at R
 the rest by `gap_s` (fractional OK). example:
 `./tools/runseq.sh 6 "spawn sandbag" "match.getCharacters()[0].getStateName()" "match.getCharacters()[0].toState(CState.JAB)"`.
 
+### script-error scan (does the translated code actually RUN?)
+
+`tools/tests/script_error_scan.sh <id> …` converts, exports, then drives the character through
+every `CState` and collects each trapped hscript error into a per-character signature:
+
+```
+SCAN_OUT=/tmp/before tools/tests/script_error_scan.sh sandbag falco   # baseline
+…converter change…
+SCAN_OUT=/tmp/after  tools/tests/script_error_scan.sh sandbag falco
+diff -r /tmp/before /tmp/after
+```
+
+this is a different question from the spawn sweep. `batch_spawn_test.sh` asks "does it launch
+and move"; Fraymakers TRAPS a script error, logs it, and carries on with that frame script dead
+from the failing line onward, so a broken handler passes a spawn test and looks fine from the
+outside. the signature is error text only (no counts, no positions), so two runs of the same
+build match exactly and a diff is all real change.
+
+two things the driving has to get right, both of which produce convincing garbage if you skip
+them: **park between states** (driving FALL or an aerial leaves the fighter airborne, it drifts
+out of the blast zone and dies, and every later action then errors on frame 1) and **spawn two
+characters** (the `scenario` park addresses p0 AND p1, so a solo roster half-fails on a null p1
+and floods the signature). `SCAN_EXPORT=0` reuses the published `.fra` when you only changed the
+driving.
+
 the `peptide` binary also exposes **read-only engine-inspection subcommands** used when
 re-deriving the engine integration on a new build. their existence is noted in
 [`AGENT_CONTEXT.md`](AGENT_CONTEXT.md) "engine-side knowledge is not in this repo"; the
@@ -307,10 +332,11 @@ live.** every state produces the expected `ANIM:<STATE>` transition + `M:OK` and
 per-character coverage lives in [`docs/STATUS.md`](docs/STATUS.md).
 
 **open / deferred converter bugs surfaced during validation:**
-- **IntervalTimer null callback (charge states).** charge frame scripts emit an add-timer call
-  whose third argument should be the timer *callback* but is instead the effects array, so the
-  timer null-derefs when it fires (only on a charged smash). the `abc_parser` mis-resolved the
-  SSF2 callback to the effects variable; the fix is in the AS3→hscript callback resolution.
+- **add-timer callback resolution (charge states).** charge frame scripts emit an add-timer
+  call whose third argument should be the timer *callback* but is instead the effects array.
+  `abc_parser` mis-resolves the SSF2 callback to the effects variable; the fix is in the
+  AS3→hscript callback resolution. the emitted call is neutralized to an empty closure with a
+  TODO, so it no longer null-derefs on a charged smash, but the timer does nothing.
 
 ---
 
