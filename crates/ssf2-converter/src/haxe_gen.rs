@@ -940,6 +940,9 @@ fn generate_script(data: &CharacterData, _char_id: &str, populated_jabs: usize) 
     // NAME is defined as a local function here (comment_out runs per-method and
     // can't see sibling defs). Restore those calls.
     out = crate::api_mappings::uncomment_local_fn_calls(&out);
+    // Same reconciliation on the bookkeeping: a call to a helper this file defines is
+    // not an unmapped gap, so drop it from the conversion log's `unknown` tally.
+    crate::api_mappings::discount_local_fn_calls(&out);
 
     // Final pass: any commenter that neutralized a block-opening `{` (e.g. an inline
     // SSF2-only translator on `if (self.getMC()...) {`) leaves the matching `}` live

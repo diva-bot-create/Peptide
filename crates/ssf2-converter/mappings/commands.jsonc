@@ -793,6 +793,53 @@
     { "name": "setMode", "note": "SSF2Camera.setMode(mode) → FM Camera.setMode(mode):Int. CameraMode enum members differ in name but call passes through." },
     { "name": "setXSpeed", "note": "SSF2Platform.setXSpeed(value) (px/frame) -> FM Entity.setXSpeed(speed). Facing-relative semantics preserved per existing converter convention." },
     { "name": "setYSpeed", "note": "SSF2Platform.setYSpeed(value) (px/frame) -> FM Entity.setYSpeed(speed)." },
+    // emitted by earlier passes and valid FM API, so they were never rewritten — they
+    // just weren't declared here, which read back as thousands of phantom gaps.
+    { "name": "createVfx", "note": "match.createVfx(vfxStats, owner?) — FM API, same name" },
+    { "name": "removeChild", "note": "DisplayObject.removeChild(displayObject) — the one Flash-shaped call FM does have" },
+    { "name": "hitTestStructuresWithLineSegment", "note": "FM structure raycast; the target of the hitTestGround rewrite" },
+  ],
+
+  // ─── Haxe / hscript standard library ──────────────────────────────────
+  // Methods the decompiler surfaces as bare `.name(` call sites on Array /
+  // String / Math / Std receivers. They resolve in hscript exactly as written,
+  // so they're neither a rename nor a gap — declaring them keeps the
+  // conversion_log `unknown` stream meaning "no Fraymakers equivalent".
+  "haxe_builtins": [
+    { "name": "push", "note": "Array" },
+    { "name": "pop", "note": "Array" },
+    { "name": "shift", "note": "Array" },
+    { "name": "unshift", "note": "Array" },
+    { "name": "splice", "note": "Array" },
+    { "name": "slice", "note": "Array / String" },
+    { "name": "concat", "note": "Array" },
+    { "name": "join", "note": "Array" },
+    { "name": "sort", "note": "Array" },
+    { "name": "indexOf", "note": "Array / String" },
+    { "name": "split", "note": "String" },
+    { "name": "charAt", "note": "String" },
+    { "name": "substr", "note": "String" },
+    { "name": "substring", "note": "String" },
+    { "name": "toLowerCase", "note": "String" },
+    { "name": "toUpperCase", "note": "String" },
+    { "name": "toString", "note": "Std / any" },
+    { "name": "string", "note": "Std.string" },
+    { "name": "parseInt", "note": "Std.parseInt" },
+    { "name": "parseFloat", "note": "Std.parseFloat" },
+    { "name": "abs", "note": "Math" },
+    { "name": "min", "note": "Math" },
+    { "name": "max", "note": "Math" },
+    { "name": "floor", "note": "Math" },
+    { "name": "ceil", "note": "Math" },
+    { "name": "round", "note": "Math" },
+    { "name": "sqrt", "note": "Math" },
+    { "name": "pow", "note": "Math" },
+    { "name": "sin", "note": "Math" },
+    { "name": "cos", "note": "Math" },
+    { "name": "tan", "note": "Math" },
+    { "name": "atan", "note": "Math" },
+    { "name": "atan2", "note": "Math" },
+    { "name": "random", "note": "Math" },
   ],
 
   // ─── SSF2-only calls (commented out in output) ─────────────────────────
