@@ -19,10 +19,20 @@
 #   tools/tests/cross_engine_compare.sh mario attack special
 #
 # Output: a per-input table of (animation, frames played, distance travelled) from each
-# engine, and the deltas. Frame counts are directly comparable — SSF2 runs at 30fps and
-# Fraymakers at 60, so the converter doubles frame counts and an SSF2 animation of N
-# frames should read as ~2N in Fraymakers. That ratio is the thing to look at; the
-# script reports it rather than pretending the raw numbers should match.
+# engine.
+#
+# WHAT THIS CAN AND CANNOT TELL YOU RIGHT NOW.
+#   * ANIMATION IDENTITY is trustworthy on both sides. "the same input produces move X
+#     here and move Y there" is a real answer, and it's the check nothing else could do.
+#   * FRAME COUNTS are trustworthy on the Fraymakers side only. SSF2's are read by
+#     polling, and every field is a separate reflection round trip over file-IPC, so a
+#     sample lands roughly every ~14 SSF2 frames — a 14-frame attack finishes between two
+#     samples and reports frames_seen=0. Faster polling is not the fix; SSF2 has to record
+#     its own label+frame each tick and hand over the trace. Until then, read the SSF2
+#     frame column as "did it play at all", not as a count.
+#   * The eventual comparison is a RATIO, not equality: SSF2 runs at 30fps and Fraymakers
+#     at 60, and the converter doubles frame counts, so an SSF2 animation of N frames
+#     should read as ~2N in Fraymakers.
 set -u
 cd "$(cd "$(dirname "$0")/../.." && pwd)"
 
@@ -41,12 +51,24 @@ ssf2_side() {
   sleep 2; rm -rf "$HOME/.peptide/session" 2>/dev/null
   "$BIN" ssf2 session --char "$CHAR" > "$OUT/ssf2.log" 2>&1 &
   local sess=$!
-  # wait for the match, by looking for it rather than sleeping a fixed amount
+  # Ask the ENGINE whether the match is up, rather than guessing from a log line.
+  # `awaitmatch` polls until a character is readable and answers MATCHREADY either way;
+  # grepping for ANIM: was a guess that failed whenever the engine happened not to emit
+  # one before the timeout.
   local waited=0
-  until grep -q "ANIM:" "$OUT/ssf2.log" 2>/dev/null; do
+  until grep -q "peptide ssf2 tell" "$OUT/ssf2.log" 2>/dev/null; do
+    sleep 2; waited=$((waited+2))
+    [ $waited -gt 90 ] && { echo "[ssf2] session never came up" >&2; kill $sess 2>/dev/null; return 1; }
+  done
+  "$BIN" ssf2 tell "awaitmatch p0 90" >/dev/null 2>&1
+  waited=0
+  until grep -q "MATCHREADY:" "$OUT/ssf2.log" 2>/dev/null; do
     sleep 2; waited=$((waited+2))
     [ $waited -gt 90 ] && { echo "[ssf2] never reached a match" >&2; kill $sess 2>/dev/null; return 1; }
   done
+  if grep -q "MATCHREADY:none" "$OUT/ssf2.log"; then
+    echo "[ssf2] match never became readable" >&2; kill $sess 2>/dev/null; return 1
+  fi
   local i seen=0
   for i in "${INPUTS[@]}"; do
     "$BIN" ssf2 tell "reset"        >/dev/null 2>&1; sleep 1
@@ -69,7 +91,7 @@ ssf2_side() {
 
 # ── Fraymakers side ──────────────────────────────────────────────────────────
 fray_side() {
-  local cmds=("spawn $CHAR,$CHAR thespire commandervideoassist" "match.getCharacters()[0].getStateName()")
+  local cmds=("spawn $CHAR,$CHAR thespire commandervideoassist" "awaitmatch")
   local i
   for i in "${INPUTS[@]}"; do
     cmds+=("scenario 0,73 140,73" "MARK $i" "seq $i:2" "await p0 120")
@@ -101,17 +123,23 @@ ssf2_side || echo "[compare] SSF2 side unavailable — Fraymakers results only" 
 extract fray "$OUT/fray.log" > "$OUT/fray.tsv"
 extract ssf2 "$OUT/ssf2.log" > "$OUT/ssf2.tsv" 2>/dev/null || : > "$OUT/ssf2.tsv"
 
-printf '%-10s %-22s %-22s %s\n' "input" "ssf2 (anim/frames/x)" "fray (anim/frames/x)" "frame ratio"
-printf '%-10s %-22s %-22s %s\n' "-----" "--------------------" "--------------------" "-----------"
+printf '%-10s  %-24s  %-24s  %s\n' "input" "SSF2 anim (frames*)" "Fraymakers anim (frames)" "verdict"
+printf '%-10s  %-24s  %-24s  %s\n' "-----" "-------------------" "------------------------" "-------"
 for i in "${INPUTS[@]}"; do
-  s=$(awk -F'\t' -v k="$i" '$2==k {print $3"/"$4"/"$5; exit}' "$OUT/ssf2.tsv")
-  f=$(awk -F'\t' -v k="$i" '$2==k {print $3"/"$4"/"$5; exit}' "$OUT/fray.tsv")
-  sf=$(echo "${s:-//}" | cut -d/ -f2); ff=$(echo "${f:-//}" | cut -d/ -f2)
-  ratio="-"
-  if [ -n "${sf:-}" ] && [ -n "${ff:-}" ] && [ "${sf:-0}" -gt 0 ] 2>/dev/null; then
-    ratio=$(awk -v a="$ff" -v b="$sf" 'BEGIN{printf "%.2fx", a/b}')
+  sa=$(awk -F'\t' -v k="$i" '$2==k {print $3; exit}' "$OUT/ssf2.tsv")
+  sf=$(awk -F'\t' -v k="$i" '$2==k {print $4; exit}' "$OUT/ssf2.tsv")
+  fa=$(awk -F'\t' -v k="$i" '$2==k {print $3; exit}' "$OUT/fray.tsv")
+  ff=$(awk -F'\t' -v k="$i" '$2==k {print $4; exit}' "$OUT/fray.tsv")
+  verdict="-"
+  if [ -z "${sa:-}" ]; then verdict="SSF2 no observation"
+  elif [ -z "${fa:-}" ]; then verdict="FRAYMAKERS DID NOTHING"
+  elif [ "${sa}" = "stand" ] || [ "${sa}" = "idle" ]; then verdict="SSF2 didn't leave idle"
+  else verdict="both moved"
   fi
-  printf '%-10s %-22s %-22s %s\n' "$i" "${s:-(none)}" "${f:-(none)}" "$ratio"
+  printf '%-10s  %-24s  %-24s  %s\n' \
+    "$i" "${sa:-(none)} (${sf:-?})" "${fa:-(none)} (${ff:-?})" "$verdict"
 done
 echo
+echo "* SSF2 frame counts are NOT reliable (sampled ~every 14 SSF2 frames over file-IPC);"
+echo "  read them as did-it-play, not as counts. Animation names are reliable on both."
 echo "raw: $OUT/ssf2.tsv  $OUT/fray.tsv  (logs alongside)"

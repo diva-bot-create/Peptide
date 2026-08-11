@@ -74,7 +74,10 @@ scan_one() {
   # need to connect, only to execute. The leading no-op read lets the character finish
   # constructing before the first park (a command sent too early reports its own
   # hscript-origin error and pollutes the signature).
-  local cmds=("spawn $c,$c thespire commandervideoassist" "match.getCharacters()[0].getStateName()")
+  # `awaitmatch` blocks until a character is actually readable. The throwaway read this
+  # replaces lost the first driven state on every run: the match isn't up the instant
+  # spawn returns, so the first observation always came back NoSample.
+  local cmds=("spawn $c,$c thespire commandervideoassist" "awaitmatch")
   local s
   for s in $STATES; do
     # park, drive the state, then let it PLAY OUT. `await` watches the engine's own
