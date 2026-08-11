@@ -37,7 +37,10 @@ BIN=./build/release/peptide
 SSFS="${SSF2_SSFS_DIR:-../ssf2-ssfs}"
 SCAN_OUT="${SCAN_OUT:-}"
 SCAN_EXPORT="${SCAN_EXPORT:-1}"
-GAP="${SCAN_GAP:-1}"
+# A FLOOR between sends, not the pacing mechanism — `await` does the real waiting by
+# watching the engine's frame counter. Nothing here should ever depend on a duration.
+GAP="${SCAN_GAP:-0.3}"
+AWAIT_BUDGET="${SCAN_AWAIT_BUDGET:-180}"
 PARK="${SCAN_PARK:-scenario 0,73 140,73}"
 [ -n "$SCAN_OUT" ] && mkdir -p "$SCAN_OUT"
 
@@ -74,10 +77,14 @@ scan_one() {
   local cmds=("spawn $c,$c thespire commandervideoassist" "match.getCharacters()[0].getStateName()")
   local s
   for s in $STATES; do
-    cmds+=("$PARK" "match.getCharacters()[0].toState(CState.$s)")
+    # park, drive the state, then let it PLAY OUT. `await` watches the engine's own
+    # frame counter and returns when the animation completes / loops / changes / stalls,
+    # so the next state is never driven over a half-played one. The gap below is only a
+    # floor between sends; the pacing that matters is the await.
+    cmds+=("$PARK" "match.getCharacters()[0].toState(CState.$s)" "await p0 $AWAIT_BUDGET")
   done
 
-  echo "[$c] driving ${#cmds[@]} commands across ${#STATES} states" >&2
+  echo "[$c] driving ${#cmds[@]} commands across $(echo $STATES | wc -w | tr -d ' ') states" >&2
   FRAY_CHAR="$c" tools/runseq.sh "$GAP" "${cmds[@]}" >"$log" 2>&1
 
   # Signature: error text only, deduped, sorted. No counts — a handler that fires every
@@ -99,6 +106,18 @@ scan_one() {
     echo "# $c  launched=$launched crash=$crash errors=$(printf '%s' "$sig" | grep -c .)"
     printf '%s\n' "$sig"
   } | if [ -n "$SCAN_OUT" ]; then tee "$SCAN_OUT/$c.errors"; else cat; fi
+
+  # The BEHAVIOURAL signature, next to the error one: what each driven state actually
+  # played and how far it moved, straight off the frame counter. This is the half that
+  # can be compared against the same drive on SSF2 — an animation that plays a different
+  # number of frames, or moves the character a different distance, is a conversion bug
+  # that no error message will ever report.
+  if [ -n "$SCAN_OUT" ]; then
+    grep -o 'AWAIT:.*' "$log" \
+      | sed 's/ pos=(\([-0-9.]*\),\([-0-9.]*\))/ pos=(\1,\2)/' \
+      > "$SCAN_OUT/$c.anims"
+    echo "[$c] $(grep -c . "$SCAN_OUT/$c.anims") animation observations -> $SCAN_OUT/$c.anims" >&2
+  fi
 }
 
 for c in "$@"; do

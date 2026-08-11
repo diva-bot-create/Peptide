@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::interpreter::{translate, gloss, Translated};
 
@@ -92,9 +92,15 @@ pub fn serve(port: u16, token: Option<&str>) {
     // socket -> stdout; signal once the engine reports READY. Keep a small ring of
     // the last meaningful events so a crash dump can show what was happening.
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    // Eval replies are also forwarded here so a host-side command can READ engine state
+    // instead of sleeping. `await` polls the animation clock over this channel; without
+    // it the only way to "wait for an animation" is a wall-clock guess, which observes a
+    // half-played animation under load and idles the rest of the time.
+    let (eval_tx, eval_rx) = mpsc::channel::<String>();
     thread::spawn(move || {
         let mut history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         pump_engine_lines(reader, &ready_tx, |raw, pretty| {
+            if let Some(v) = raw.strip_prefix("E:") { let _ = eval_tx.send(v.to_string()); }
             println!("{pretty}");
             if raw.starts_with(|c: char| c.is_ascii_uppercase()) && raw.contains(':') {
                 history.push_back(raw.to_string());
@@ -130,6 +136,51 @@ pub fn serve(port: u16, token: Option<&str>) {
     let mut first = true;
     for line in stdin.lock().lines() {
         let Ok(raw) = line else { break };
+        // `await` is executed HERE, host-side, by polling the engine's frame counter —
+        // it has no wire verb. This is the pacing primitive: a caller sends a state, then
+        // `await`, and the next command doesn't go out until the animation has actually
+        // played (or looped / stalled), whatever that took in wall-clock terms.
+        if let crate::interpreter::Command::Await { idx, budget } =
+            crate::interpreter::parse(&raw)
+        {
+            let w = &mut write_half;
+            let watch = crate::debug_target::watch_animation(|| {
+                if !send_wire(w, &format!("e animFeed({idx})")) {
+                    return Ok(None);
+                }
+                // Take the next reply that is actually an animation sample. Replies from
+                // EARLIER commands are still queued (`E:true` from the toState that got us
+                // here), so returning the first thing off the channel reads a stale value
+                // and the watch gives up before it starts.
+                let deadline = Instant::now() + Duration::from_millis(1500);
+                while Instant::now() < deadline {
+                    match eval_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(v) => {
+                            if let Some(s) = crate::debug_target::AnimState::parse(&v) {
+                                return Ok(Some(s));
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(_) => return Ok(None),
+                    }
+                }
+                Ok(None)
+            }, budget, 3);
+            match watch {
+                Ok(w) => {
+                    let msg = match &w.last {
+                        Some(s) => format!(
+                            "AWAIT:{:?} anim={} frame={}/{} frames_seen={} pos=({:.1},{:.1})",
+                            w.outcome, s.anim, s.frame, s.total, w.frames_seen, s.x, s.y),
+                        None => format!("AWAIT:{:?} (no live character p{idx})", w.outcome),
+                    };
+                    println!("<< {msg}");
+                }
+                Err(e) => eprintln!("peptide-bridge: await: {e}"),
+            }
+            first = false;
+            continue;
+        }
         // Translate the friendly command into the engine wire line; `help` is
         // handled here and never reaches the engine.
         match translate(&raw) {

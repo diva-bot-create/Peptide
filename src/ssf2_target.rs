@@ -598,6 +598,13 @@ impl DebugTarget for Ssf2Target {
 
     /// SSF2 matchStatus: cheap when idle (short-circuit if no live match), else the
     /// composed `<id>|<dmg>|<anim>` feed read live from the engine.
+    /// SSF2 has no script interpreter, so `animFeed(i)` can't be evaluated as hscript;
+    /// the same fields are read by reflection instead and returned in the same shape.
+    fn char_anim(&mut self, idx: usize) -> Result<Option<crate::debug_target::AnimState>> {
+        if !self.match_live() { return Ok(None); }
+        Ok(crate::debug_target::AnimState::parse(&self.compose_anim_feed(idx)?))
+    }
+
     fn match_status(&mut self) -> Result<Option<String>> {
         if !self.match_live() { return Ok(None); }
         let feed = self.compose_match_status()?;
@@ -745,6 +752,42 @@ impl Ssf2Target {
             out.push_str(&format!("{id}|{dmg}|{anim}"));
         }
         Ok(out)
+    }
+
+    /// `commands.hsx::animFeed`: the animation CLOCK for one character, in the shared
+    /// `<anim>|<frame>|<total>|<x>|<y>|<state>` shape, read live off the character's
+    /// MovieClip. Three ways the two engines disagree, all reconciled here so a
+    /// cross-engine frame comparison actually compares the same thing:
+    ///
+    /// * **identity** — `currentLabel` is the timeline label ("stand"), which is what
+    ///   Fraymakers reports as `currentAnimation`. `CurrentAnimation.Name` is the
+    ///   hitbox-animation name ("mario_stand") and would never match.
+    /// * **origin** — SSF2 MovieClip frames are 1-based, Fraymakers' are 0-based.
+    /// * **total** — SSF2's `totalFrames` is the length of the character's WHOLE
+    ///   timeline (every animation concatenated, e.g. 95), not of the current
+    ///   animation; Fraymakers reports the current animation's length. There's no
+    ///   cheap SSF2 equivalent, so this reports `-1` (unknown) and lets the watcher
+    ///   end on a label change or a frame wrap instead of on a frame count. Reporting
+    ///   SSF2's number here would make every animation look like it ended early.
+    ///
+    /// Position is the character's own `X`/`Y` fields, not `getX()` (which carries an
+    /// offset).
+    fn compose_anim_feed(&self, idx: usize) -> Result<String> {
+        let base = format!("match.getCharacter({idx})");
+        let sane = |s: String| {
+            let t = s.trim().to_string();
+            if t == "null" || t == "undefined" || t.is_empty() { None } else { Some(t) }
+        };
+        let Some(anim) = self.eval_quiet(&format!("{base}.MC.currentLabel")).ok().and_then(sane)
+        else { return Ok(String::new()) };
+        let num = |e: &str| self.eval_quiet(e).ok().and_then(sane)
+            .and_then(|s| s.parse::<f64>().ok());
+        let frame = num(&format!("{base}.MC.currentFrame")).map(|f| f - 1.0).unwrap_or(-1.0);
+        let x = num(&format!("{base}.X")).unwrap_or(0.0);
+        let y = num(&format!("{base}.Y")).unwrap_or(0.0);
+        let state = self.eval_quiet(&format!("{base}.State")).ok().and_then(sane)
+            .unwrap_or_else(|| "?".into());
+        Ok(format!("{anim}|{frame}|-1|{x}|{y}|{state}"))
     }
 
     /// A character's current animation name, read live (None when there's no

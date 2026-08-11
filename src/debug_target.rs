@@ -56,6 +56,154 @@ pub trait DebugTarget {
     fn tree(&mut self, _depth: u32) -> Result<String> {
         Ok("tree: no live object-tree walk on this engine yet (SSF2-only)".into())
     }
+
+    /// Character `idx`'s live animation clock. Default: eval the engine's `animFeed(i)`
+    /// helper. `None` when that character doesn't exist (or there's no live match).
+    ///
+    /// This is the primitive every frame-accurate operation is built on. Waiting on
+    /// wall-clock time is not a valid substitute: an engine's frame rate varies with
+    /// load, so a sleep long enough to be safe is mostly idle and a sleep short enough
+    /// to be quick silently observes a half-played animation. Read the clock instead.
+    fn char_anim(&mut self, idx: usize) -> Result<Option<AnimState>> {
+        Ok(non_empty(strip_eval(self.eval(&format!("animFeed({idx})"))?))
+            .and_then(|s| AnimState::parse(&s)))
+    }
+}
+
+/// One sample of a character's animation clock: which animation, how far into it, how
+/// long it is, and where the character is. `frame`/`total` are `-1` when the engine
+/// couldn't report them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnimState {
+    pub anim: String,
+    pub frame: i32,
+    pub total: i32,
+    pub x: f64,
+    pub y: f64,
+    pub state: String,
+}
+
+impl AnimState {
+    /// Parse the shared `<anim>|<frame>|<total>|<x>|<y>|<state>` wire shape both
+    /// backends emit. Returns `None` if it isn't that shape, so a garbled or
+    /// no-live-match reply reads as "no sample" rather than a bogus one.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        // an engine reply can carry a leading tag or trailing noise; take the last
+        // line that actually has the field count we need.
+        let line = s.lines().rev().find(|l| l.matches('|').count() >= 5)?;
+        let f: Vec<&str> = line.rsplitn(6, '|').collect();
+        // rsplitn yields reversed; re-order to (anim, frame, total, x, y, state)
+        let (state, y, x, total, frame, anim) = (f[0], f[1], f[2], f[3], f[4], f[5]);
+        Some(AnimState {
+            anim: anim.trim().trim_start_matches("E:").trim().to_string(),
+            frame: frame.trim().parse().unwrap_or(-1),
+            total: total.trim().parse().unwrap_or(-1),
+            x: x.trim().parse().unwrap_or(0.0),
+            y: y.trim().parse().unwrap_or(0.0),
+            state: state.trim().to_string(),
+        })
+    }
+    /// `true` once the clock has reached the end of the animation.
+    pub fn at_end(&self) -> bool { self.total > 0 && self.frame >= self.total - 1 }
+}
+
+/// Why [`await_animation`] stopped watching.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AnimOutcome {
+    /// Played to its last frame.
+    Completed,
+    /// The clock wrapped back — a looping animation, which never "finishes".
+    Looped,
+    /// The engine moved on to a different animation.
+    Changed,
+    /// The clock stopped advancing without reaching the end (a paused or dead handler).
+    Stalled,
+    /// Ran out of budget while still advancing.
+    BudgetExhausted,
+    /// No character / no readable clock.
+    NoSample,
+}
+
+/// The result of watching one animation play: how it ended, the last sample taken, and
+/// how many distinct frames were actually observed advancing.
+#[derive(Clone, Debug)]
+pub struct AnimWatch {
+    pub outcome: AnimOutcome,
+    pub last: Option<AnimState>,
+    pub frames_seen: u32,
+}
+
+/// Watch character `idx`'s animation until it finishes, loops, changes, or stalls —
+/// polling the engine's own frame counter, never a wall-clock delay.
+///
+/// `budget_frames` bounds the watch so a looping or wedged animation can't hang the
+/// caller; it is a CEILING, not a pace. `stall_polls` is how many consecutive samples
+/// may show the same frame before we call it stalled — the engine is genuinely
+/// between frames sometimes, so one repeat is not evidence of anything.
+///
+/// Goes through `char_anim`, so it works on Fraymakers and SSF2 without a branch.
+pub fn await_animation(
+    target: &mut dyn DebugTarget,
+    idx: usize,
+    budget_frames: u32,
+    stall_polls: u32,
+) -> Result<AnimWatch> {
+    watch_animation(|| target.char_anim(idx), budget_frames, stall_polls)
+}
+
+/// The frame-watching state machine itself, over any source of samples.
+///
+/// Split out from [`await_animation`] because the two live drivers reach the engine
+/// differently: the `DebugTarget` path calls `char_anim` and gets the reply back
+/// inline, while `bridge::serve` hands its socket reader to a printing thread and has
+/// to pick replies off a channel. Only the sampling differs; the decision about when
+/// an animation is done must not.
+pub fn watch_animation(
+    mut sample: impl FnMut() -> Result<Option<AnimState>>,
+    budget_frames: u32,
+    stall_polls: u32,
+) -> Result<AnimWatch> {
+    let Some(first) = sample()? else {
+        return Ok(AnimWatch { outcome: AnimOutcome::NoSample, last: None, frames_seen: 0 });
+    };
+    let start_anim = first.anim.clone();
+    let mut prev = first;
+    let mut frames_seen = 0u32;
+    let mut same_frame = 0u32;
+    let mut polls = 0u32;
+    // A poll costs a round trip, so the budget is counted in polls too — an engine that
+    // advances several frames between samples still terminates.
+    let max_polls = budget_frames.max(1) * 2;
+    loop {
+        polls += 1;
+        if polls > max_polls {
+            return Ok(AnimWatch { outcome: AnimOutcome::BudgetExhausted, last: Some(prev), frames_seen });
+        }
+        let Some(cur) = sample()? else {
+            return Ok(AnimWatch { outcome: AnimOutcome::NoSample, last: Some(prev), frames_seen });
+        };
+        if cur.anim != start_anim {
+            return Ok(AnimWatch { outcome: AnimOutcome::Changed, last: Some(cur), frames_seen });
+        }
+        if cur.frame < prev.frame {
+            return Ok(AnimWatch { outcome: AnimOutcome::Looped, last: Some(cur), frames_seen });
+        }
+        if cur.frame > prev.frame {
+            frames_seen += cur.frame.saturating_sub(prev.frame).unsigned_abs();
+            same_frame = 0;
+        } else {
+            same_frame += 1;
+            if same_frame >= stall_polls.max(1) {
+                let outcome = if cur.at_end() { AnimOutcome::Completed } else { AnimOutcome::Stalled };
+                return Ok(AnimWatch { outcome, last: Some(cur), frames_seen });
+            }
+        }
+        if cur.at_end() {
+            return Ok(AnimWatch { outcome: AnimOutcome::Completed, last: Some(cur), frames_seen });
+        }
+        prev = cur;
+    }
 }
 
 /// Drop a leading `E:` (the Fraymakers eval-reply wrapper) so feed payloads are
@@ -90,6 +238,15 @@ pub fn run_command(target: &mut dyn DebugTarget, line: &str) -> Result<Option<St
                 }
             }
             Some(out)
+        }
+        Command::Await { idx, budget } => {
+            let w = await_animation(target, idx, budget, 3)?;
+            Some(match &w.last {
+                Some(s) => format!(
+                    "AWAIT:{:?} anim={} frame={}/{} frames_seen={} pos=({:.1},{:.1}) state={}",
+                    w.outcome, s.anim, s.frame, s.total, w.frames_seen, s.x, s.y, s.state),
+                None => format!("AWAIT:{:?} (no live character p{idx})", w.outcome),
+            })
         }
         Command::Console => Some(target.console()?),
         Command::Tree(depth) => Some(target.tree(depth)?),

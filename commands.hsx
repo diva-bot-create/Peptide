@@ -49,6 +49,29 @@ match = {
   characterCount: function() { return getCharacters().length; }
 };
 
+// animFeed(i) — one character's live ANIMATION CLOCK, the thing anything frame-accurate has
+// to be driven off. Returns "<anim>|<frame>|<total>|<x>|<y>|<state>", or "" when that
+// character doesn't exist. `frame`/`total` are what make waiting real: the host can tell a
+// playing animation from a finished one from a looping one, instead of sleeping some number
+// of milliseconds and hoping. SSF2 answers the same shape from its own display list
+// (ssf2_target::char_anim), so a frame-driven test reads identically on both engines.
+animFeed = function(i) {
+  var c = getCharacters()[i];
+  if (c == null) return "";
+  var a  = (c.animation != null) ? c.animation : null;
+  var an = (a != null && a.currentAnimation != null) ? a.currentAnimation : "?";
+  var fr = (a != null && a.currentFrame != null) ? a.currentFrame : -1;
+  var tt = (a != null && a.totalFrames != null) ? a.totalFrames : -1;
+  var b  = (c.body != null) ? c.body : null;
+  var x  = (b != null && b.x != null) ? b.x : 0;
+  var y  = (b != null && b.y != null) ? b.y : 0;
+  // NO try/catch here: the engine's hscript rejects it, and a parse error in this file
+  // takes out EVERY helper (matchStatus, getCharacters, the lot) with no error of its
+  // own — the symptom is `e` silently returning nothing. Null-guard instead.
+  var st = c.getStateName();
+  return an + "|" + fr + "|" + tt + "|" + x + "|" + y + "|" + st;
+};
+
 // matchStatus() — the data behind Peptide's "matchStatus" TCP channel (a host-polled feed,
 // NOT chat). Returns "MATCHSTATUS:" + one record per active character, ";"-separated, each
 // "<id>|<damage>|<animation>". Robust to no live match (returns just "MATCHSTATUS:"). Every
