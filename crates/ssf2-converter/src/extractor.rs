@@ -328,6 +328,82 @@ pub fn extract(swf: &SwfFile, char_name: &str) -> Result<CharacterData> {
         }
     }
 
+    // SSF2 `removeTimer(callback)` identifies a timer by its CALLBACK; Fraymakers
+    // `addTimer(interval, repeats, func, options?)` returns a uid and `removeTimer(uid)`
+    // takes that uid. Passing the function straight through is a runtime type error
+    // ("Can't cast (void ()) to i32"), the engine traps it, and the timer is never
+    // removed — so every SSF2 poll that's supposed to stop itself runs forever.
+    //
+    // Bridge the two by remembering the uid: for a callback that is BOTH registered by a
+    // named `addTimer` and cancelled by name, synthesize a persistent `<name>_timer`
+    // slot, capture the uid into it at registration, and cancel through it. Emitted in
+    // `self.<var>` form so the persistent-state pass wraps it into `.set()`/`.get()` with
+    // every other instance var. A `removeTimer` whose argument isn't a bare identifier
+    // (`removeTimer(effects.get(i))`) can't be resolved statically and is left alone.
+    //
+    // The slot defaults to -1, so if a later pass drops the registration (the callback is
+    // cancelled from a script that survives while the one that registered it doesn't) the
+    // cancel degrades to `removeTimer(-1)`, which the engine answers `false`. Same
+    // not-removed behaviour as before, minus the trapped type error.
+    //
+    // Runs on the decompiled source, so it matches the SSF2 spellings (`createTimer` /
+    // `destroyTimer`) as well as the Fraymakers ones — the commands.jsonc rename to
+    // add/removeTimer happens downstream of here.
+    {
+        // decompiler output at this stage carries a doubled receiver
+        // (`self.self.createTimer(…)`) and prefixes the callback (`self.dashCheck`);
+        // both are normalized downstream, so match them loosely and re-emit verbatim.
+        const RECV: &str = r"((?:self\.)+)";
+        const ADD: &str = r"((?:create|add)Timer)";
+        const RM:  &str = r"((?:destroy|remove)Timer)";
+        let add_re = regex::Regex::new(
+            &format!(r"{RECV}{ADD}\(\s*([^,()]+),\s*([^,()]+),\s*(?:self\.)?([A-Za-z_]\w*)\s*([,)])")
+        ).unwrap();
+        let rm_re = regex::Regex::new(
+            &format!(r"{RECV}{RM}\(\s*(?:self\.)?([A-Za-z_]\w*)\s*\)")
+        ).unwrap();
+        let mut registered: std::collections::BTreeSet<String> = Default::default();
+        let mut cancelled: std::collections::BTreeSet<String> = Default::default();
+        for s in &scripts {
+            for c in add_re.captures_iter(&s.code) { registered.insert(c[5].to_string()); }
+            for c in rm_re.captures_iter(&s.code)  { cancelled.insert(c[3].to_string()); }
+            if std::env::var("PEPTIDE_TIMER_DEBUG").is_ok() {
+                for l in s.code.lines().filter(|l| l.contains("Timer")) {
+                    eprintln!("[timer-raw] {}", l.trim());
+                }
+            }
+        }
+        let slots: Vec<(String, String)> = registered.intersection(&cancelled)
+            .map(|n| (n.clone(), format!("{n}_timer")))
+            .filter(|(_, slot)| !ext_vars.contains(slot))
+            .collect();
+        for (callback, slot) in &slots {
+            log::info!("timer '{}' cancelled by callback -> capturing its uid in persistent '{}'",
+                callback, slot);
+            for s in scripts.iter_mut() {
+                // capture at registration. only the exact (interval, repeats, <callback>)
+                // shape is touched, so an inline `function () { … }` callback (which
+                // nothing can cancel by name anyway) is left as-is.
+                let cap = regex::Regex::new(&format!(
+                    r"{RECV}{ADD}\(\s*([^,()]+),\s*([^,()]+),\s*((?:self\.)?{})\s*([,)])",
+                    regex::escape(callback)
+                )).unwrap();
+                s.code = cap.replace_all(&s.code, format!(
+                    "self.{slot} = ${{1}}${{2}}(${{3}}, ${{4}}, ${{5}}${{6}}"
+                )).into_owned();
+                // and cancel through the slot
+                let can = regex::Regex::new(&format!(
+                    r"{RECV}{RM}\(\s*(?:self\.)?{}\s*\)", regex::escape(callback)
+                )).unwrap();
+                s.code = can.replace_all(&s.code, format!("${{1}}${{2}}(self.{slot})")).into_owned();
+            }
+            if !ext_var_inits.iter().any(|(n, _)| n == slot) {
+                ext_var_inits.push((slot.clone(), "-1".to_string()));
+            }
+            ext_vars.push(slot.clone());
+        }
+    }
+
     // SSF2 get/setGlobalVariable("name"[, v]) are string-keyed PERSISTENT per-character
     // variables. Collect each distinct key as a persistent-state ext var so a
     // `var name = self.makeInt(0)/makeBool(false)` declaration is emitted; the calls
