@@ -442,6 +442,17 @@ const OP_NOP: u8         = 0x02;
 const OP_THROW: u8       = 0x03;
 const OP_KILL: u8        = 0x08;
 const OP_LABEL: u8       = 0x09;
+// The NEGATED comparison branches. AS3 emits these for the common
+// `if (a < b) { … }` shape: the branch jumps PAST the then-block when the source
+// condition is false, so `ifnlt` means "take the branch when !(a < b)". They carry
+// the same 3-byte signed offset as their positive twins — miss one and every
+// instruction boundary after it is wrong, which drops the rest of the method.
+// Rendered with the plain inverted operator (ifnlt -> `>=`); AVM2 keeps them
+// separate only for NaN, which decompiled character code never relies on.
+const OP_IFNLT: u8       = 0x0C;
+const OP_IFNLE: u8       = 0x0D;
+const OP_IFNGT: u8       = 0x0E;
+const OP_IFNGE: u8       = 0x0F;
 const OP_JUMP: u8        = 0x10;
 const OP_IFTRUE: u8      = 0x11;
 const OP_IFFALSE: u8     = 0x12;
@@ -574,6 +585,26 @@ const OP_BKPTLINE: u8    = 0xF2;
 
 // ─── Pass 1: measure instruction sizes to find branch targets ─────────────────
 
+/// The comparison a two-operand branch tests, as the Haxe operator to render. `None`
+/// for a non-comparison opcode (including iftrue/iffalse, which take one operand).
+///
+/// The `ifn*` half is the NEGATED form AS3 emits for the ordinary `if (a < b) { … }`
+/// shape: the branch jumps PAST the then-block when the source condition is false, so
+/// `ifnlt` is taken when `!(a < b)` and renders as `>=`. AVM2 keeps the two families
+/// separate only to preserve NaN behaviour, which decompiled character code never
+/// relies on, so the plain inversion is the faithful rendering.
+fn cmp_branch_op(op: u8) -> Option<&'static str> {
+    Some(match op {
+        OP_IFEQ | OP_IFSTRICTEQ => "==",
+        OP_IFNE | OP_IFSTRICTNE => "!=",
+        OP_IFLT | OP_IFNGE       => "<",
+        OP_IFLE | OP_IFNGT       => "<=",
+        OP_IFGT | OP_IFNLE       => ">",
+        OP_IFGE | OP_IFNLT       => ">=",
+        _ => return None,
+    })
+}
+
 fn instr_size(bc: &[u8], pos: usize) -> usize {
     if pos >= bc.len() { return 1; }
     let op = bc[pos];
@@ -596,7 +627,8 @@ fn instr_size(bc: &[u8], pos: usize) -> usize {
         OP_PUSHBYTE | OP_KILL | OP_GETSCOPEOBJECT | OP_GETOUTERSCOPE | OP_NEWCATCH
             => 2,
         // 3-byte signed offset (branch instructions)
-        OP_JUMP | OP_IFTRUE | OP_IFFALSE | OP_IFEQ | OP_IFNE | OP_IFLT | OP_IFLE | OP_IFGT | OP_IFGE | OP_IFSTRICTEQ | OP_IFSTRICTNE
+        OP_JUMP | OP_IFTRUE | OP_IFFALSE | OP_IFEQ | OP_IFNE | OP_IFLT | OP_IFLE | OP_IFGT | OP_IFGE
+        | OP_IFNLT | OP_IFNLE | OP_IFNGT | OP_IFNGE | OP_IFSTRICTEQ | OP_IFSTRICTNE
             => 4,
         // variable-length u30 operand(s)
         OP_PUSHSTRING | OP_PUSHINT | OP_PUSHUINT | OP_PUSHDOUBLE | OP_PUSHSHORT
@@ -687,7 +719,8 @@ fn build_blocks(bc: &[u8]) -> Vec<Block> {
         let op = bc[pos];
         let sz = instr_size(bc, pos);
         match op {
-            OP_JUMP | OP_IFTRUE | OP_IFFALSE | OP_IFEQ | OP_IFNE | OP_IFLT | OP_IFLE | OP_IFGT | OP_IFGE | OP_IFSTRICTEQ | OP_IFSTRICTNE => {
+            OP_JUMP | OP_IFTRUE | OP_IFFALSE | OP_IFEQ | OP_IFNE | OP_IFLT | OP_IFLE | OP_IFGT | OP_IFGE
+        | OP_IFNLT | OP_IFNLE | OP_IFNGT | OP_IFNGE | OP_IFSTRICTEQ | OP_IFSTRICTNE => {
                 let mut p = pos + 1;
                 let offset = read_s24_at(bc, &mut p);
                 let after_branch = pos + sz;
@@ -739,35 +772,10 @@ fn build_blocks(bc: &[u8]) -> Vec<Block> {
                     let target = (next as i64 + off as i64) as usize;
                     term = Terminator::Branch { cond_inv: true, target, fallthrough: next };
                 }
-                OP_IFEQ | OP_IFSTRICTEQ => {
+                _ if cmp_branch_op(op).is_some() => {
                     let mut q = p + 1; let off = read_s24_at(bc, &mut q);
                     let target = (next as i64 + off as i64) as usize;
-                    term = Terminator::BranchCmp { op: "==", target, fallthrough: next };
-                }
-                OP_IFNE | OP_IFSTRICTNE => {
-                    let mut q = p + 1; let off = read_s24_at(bc, &mut q);
-                    let target = (next as i64 + off as i64) as usize;
-                    term = Terminator::BranchCmp { op: "!=", target, fallthrough: next };
-                }
-                OP_IFLT => {
-                    let mut q = p + 1; let off = read_s24_at(bc, &mut q);
-                    let target = (next as i64 + off as i64) as usize;
-                    term = Terminator::BranchCmp { op: "<", target, fallthrough: next };
-                }
-                OP_IFLE => {
-                    let mut q = p + 1; let off = read_s24_at(bc, &mut q);
-                    let target = (next as i64 + off as i64) as usize;
-                    term = Terminator::BranchCmp { op: "<=", target, fallthrough: next };
-                }
-                OP_IFGT => {
-                    let mut q = p + 1; let off = read_s24_at(bc, &mut q);
-                    let target = (next as i64 + off as i64) as usize;
-                    term = Terminator::BranchCmp { op: ">", target, fallthrough: next };
-                }
-                OP_IFGE => {
-                    let mut q = p + 1; let off = read_s24_at(bc, &mut q);
-                    let target = (next as i64 + off as i64) as usize;
-                    term = Terminator::BranchCmp { op: ">=", target, fallthrough: next };
+                    term = Terminator::BranchCmp { op: cmp_branch_op(op).unwrap(), target, fallthrough: next };
                 }
                 _ => {}
             }
@@ -1150,16 +1158,13 @@ impl<'a> BlockDecoder<'a> {
                 // StructuredDecoder; for iffalse: cond_inv=true means the
                 // condition is inverted — we DON'T negate here.
                 OP_IFTRUE | OP_IFFALSE | OP_IFEQ | OP_IFNE | OP_IFSTRICTEQ | OP_IFSTRICTNE
-                | OP_IFLT | OP_IFLE | OP_IFGT | OP_IFGE => {
-                    let cond = match op {
-                        OP_IFTRUE | OP_IFFALSE => self.pop(),
-                        OP_IFEQ | OP_IFSTRICTEQ => { let r = self.pop(); let l = self.pop(); Expr::BinOp("==", Box::new(l), Box::new(r)) }
-                        OP_IFNE | OP_IFSTRICTNE  => { let r = self.pop(); let l = self.pop(); Expr::BinOp("!=", Box::new(l), Box::new(r)) }
-                        OP_IFLT => { let r = self.pop(); let l = self.pop(); Expr::BinOp("<",  Box::new(l), Box::new(r)) }
-                        OP_IFLE => { let r = self.pop(); let l = self.pop(); Expr::BinOp("<=", Box::new(l), Box::new(r)) }
-                        OP_IFGT => { let r = self.pop(); let l = self.pop(); Expr::BinOp(">",  Box::new(l), Box::new(r)) }
-                        OP_IFGE => { let r = self.pop(); let l = self.pop(); Expr::BinOp(">=", Box::new(l), Box::new(r)) }
-                        _ => Expr::Unknown,
+                | OP_IFLT | OP_IFLE | OP_IFGT | OP_IFGE
+                | OP_IFNLT | OP_IFNLE | OP_IFNGT | OP_IFNGE => {
+                    let cond = match cmp_branch_op(op) {
+                        Some(cmp) => { let r = self.pop(); let l = self.pop(); Expr::BinOp(cmp, Box::new(l), Box::new(r)) }
+                        // iftrue/iffalse test the single value on the stack; the
+                        // Branch { cond_inv } flag handles the iffalse negation.
+                        None => self.pop(),
                     };
                     return Some(cond);
                 }
@@ -2182,5 +2187,46 @@ mod loop_guard_tests {
         let loop_ = Stmt::While(cond, vec![Stmt::Expr(Expr::GetLex("tick()".into()))]);
         let out = render(vec![loop_]);
         assert!(!out.contains("+ 1"), "property-conditioned loop should be untouched:\n{out}");
+    }
+
+}
+
+#[cfg(test)]
+mod branch_op_tests {
+    use super::{
+        cmp_branch_op, instr_size, OP_IFFALSE, OP_IFGE, OP_IFGT, OP_IFLE, OP_IFLT, OP_IFNGE,
+        OP_IFNGT, OP_IFNLE, OP_IFNLT, OP_IFTRUE, OP_RETURNVOID,
+    };
+
+    // The negated comparison branches carry a 3-byte signed offset like every other
+    // branch. Sizing one as a bare opcode desyncs every instruction boundary after it,
+    // and the method decodes as an empty body — which is how 45 of 46 corpus characters
+    // were quietly losing chunks of their translated logic.
+    #[test]
+    fn negated_comparison_branches_are_four_bytes() {
+        for op in [OP_IFNLT, OP_IFNLE, OP_IFNGT, OP_IFNGE] {
+            let bc = [op, 0x11, 0x22, 0x33, OP_RETURNVOID];
+            assert_eq!(
+                instr_size(&bc, 0), 4,
+                "opcode 0x{op:02x} must consume its s24 offset",
+            );
+        }
+    }
+
+    // Each negated branch is taken when its positive twin's condition is false, so it
+    // renders as the plain inversion of that twin.
+    #[test]
+    fn negated_comparison_branches_invert_their_twin() {
+        for (neg, inverse_of_neg) in
+            [(OP_IFNLT, OP_IFGE), (OP_IFNLE, OP_IFGT), (OP_IFNGT, OP_IFLE), (OP_IFNGE, OP_IFLT)]
+        {
+            assert_eq!(cmp_branch_op(neg), cmp_branch_op(inverse_of_neg));
+        }
+        // and the twin it negates is NOT what it renders as
+        assert_eq!(cmp_branch_op(OP_IFNLT), Some(">="));
+        assert_eq!(cmp_branch_op(OP_IFLT), Some("<"));
+        // iftrue/iffalse are single-operand, not comparisons
+        assert_eq!(cmp_branch_op(OP_IFTRUE), None);
+        assert_eq!(cmp_branch_op(OP_IFFALSE), None);
     }
 }
