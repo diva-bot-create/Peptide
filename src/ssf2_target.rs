@@ -788,7 +788,15 @@ impl Ssf2Target {
             let sane = |s: String| if s == "null" || s == "undefined" || s.is_empty() { None } else { Some(s) };
             let id   = self.eval_quiet(&format!("{base}.getLinkageID()")).ok().and_then(sane).unwrap_or_else(|| "?".into());
             let dmg  = self.eval_quiet(&format!("{base}.getDamage()")).ok().and_then(sane).unwrap_or_else(|| "0".into());
-            let anim = self.eval_quiet(&format!("{base}.CurrentAnimation.Name")).ok().and_then(sane).unwrap_or_else(|| "?".into());
+            // The FRAME LABEL is the animation name. `CurrentAnimation.Name` is the
+            // MovieClip symbol ("mario_stand"), which is a Flash symbol name and must never
+            // be surfaced as an animation identity (AGENT_CONTEXT: refer to SSF2 animations
+            // by xframe/label only). It also disagrees with Fraymakers, which reports the
+            // bare "stand", so a widget fed by both engines showed two names for one state.
+            // No fallback to the symbol name on purpose: an unknown label reads as "?",
+            // which is honest, where a symbol name is confidently wrong.
+            let anim = self.eval_quiet(&format!("{base}.MC.currentLabel")).ok().and_then(sane)
+                .unwrap_or_else(|| "?".into());
             out.push_str(&format!("{id}|{dmg}|{anim}"));
         }
         Ok(out)
