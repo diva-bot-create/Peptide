@@ -64,6 +64,10 @@ pub const COMMANDS: &[Cmd] = &[
           args: "[depth]",                       help: "dump the live object tree (name/class/position/size/frame per node) — the stage-triage ground truth. SSF2 walks the display list; depth defaults to 6" },
     Cmd { name: "await",   aliases: &["settle", "playout"],  wire: '\0',
           args: "[pN] [budgetFrames]",           help: "let the current animation PLAY OUT, watching the engine's own frame counter (never a wall-clock delay): returns when it completes / loops / changes / stalls. reports the outcome, frames actually seen, and end position. budget is a ceiling (a looping animation never finishes), default 240" },
+    Cmd { name: "record",  aliases: &["rec"],                   wire: '\0',
+          args: "[off]",                         help: "arm the engine's OWN per-frame recorder and clear its buffer (`record off` disarms). on SSF2 this is an injected ENTER_FRAME handler — the only way to observe it accurately, since polling samples slower than the animations run" },
+    Cmd { name: "trace",   aliases: &["frames"],                wire: '\0',
+          args: "",                              help: "read back the recorded frame history (`<label>|<frame>|<x>|<y>;` per frame) in ONE round trip and stop recording" },
     Cmd { name: "awaitmatch", aliases: &["ready", "awaitspawn"], wire: '\0',
           args: "[pN] [tries]",                  help: "block until a character is actually READABLE (the match is up, not just spawn-acknowledged) — the deterministic replacement for sleeping after spawn. default 60 tries" },
     Cmd { name: "addCharacter", aliases: &["addchar", "add"], wire: 'n',
@@ -363,6 +367,17 @@ pub enum Command {
     /// `spawn`-acknowledged. Replaces "sleep a few seconds after spawn", which loses
     /// the first observation when the engine is slow and wastes the wait when it isn't.
     AwaitMatch { idx: usize, tries: u32 },
+    /// Arm (or disarm) the engine's own per-frame recorder, clearing its buffer.
+    Record { on: bool },
+    /// Read back the recorded frame history and stop recording.
+    ///
+    /// The two engines answer this from opposite directions, which is the whole reason
+    /// it's a trait method rather than an eval: SSF2 has no script interpreter, so an
+    /// injected ENTER_FRAME handler accumulates `<label>|<frame>|<x>|<y>;` in memory and
+    /// this reads the lot in ONE round trip. Fraymakers already PUSHES per-frame `ANIM:`
+    /// telemetry over its socket and its eval is fast enough to poll, so it says so
+    /// rather than pretending to have a buffer.
+    Trace,
     /// Drop one more fighter into the live match (peptide todo #3).
     AddCharacter,
     /// Cleanly shut the engine down.
@@ -486,6 +501,14 @@ pub fn parse(line: &str) -> Command {
                 }
                 return Command::Await { idx, budget };
             }
+            // Frame trace: `record` opens a window (clears the engine's buffer and arms
+            // it), `trace` closes it and reads the whole thing back in one round trip.
+            // This is how SSF2 is observed accurately — see Command::Trace.
+            "record" | "rec" => {
+                let on = !matches!(rest.first().map(|s| s.to_ascii_lowercase()).as_deref(), Some("off"));
+                return Command::Record { on };
+            }
+            "trace" | "frames" => return Command::Trace,
             "awaitmatch" | "ready" | "awaitspawn" => {
                 let mut idx = 0usize;
                 let mut tries = 60u32;
@@ -622,8 +645,9 @@ pub fn command_to_wire(cmd: &Command) -> Translated {
         // `await` is a HOST-side polling loop over the engine's frame counter, not a wire
         // verb — there is nothing to send. It's executed by `run_command`, which owns the
         // loop; reaching here means a caller translated it to wire by mistake.
-        Command::Await { .. } | Command::AwaitMatch { .. } => Translated::Client(
-            "await/awaitmatch are executed host-side (run_command), not sent to the engine\n".into()),
+        Command::Await { .. } | Command::AwaitMatch { .. }
+        | Command::Record { .. } | Command::Trace => Translated::Client(
+            "await/awaitmatch/record/trace are executed host-side (run_command), not sent to the engine\n".into()),
         Command::Hold(m) => Translated::Wire(format!("i {m}")),
         Command::Seq(masks) => Translated::Wire(masks.iter().map(|m| format!("i {m}")).collect::<Vec<_>>().join("\n")),
         Command::Scenario { setup, masks } => {

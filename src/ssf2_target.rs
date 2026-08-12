@@ -605,6 +605,51 @@ impl DebugTarget for Ssf2Target {
         Ok(crate::debug_target::AnimState::parse(&self.compose_anim_feed(idx)?))
     }
 
+    /// Open a recording window by TRUNCATING the file the injected ENTER_FRAME recorder
+    /// appends to (`abc_inject::inject_frame_recorder`). The recorder always runs; the
+    /// host decides what counts as a window, which means no engine-side gate and no
+    /// engine round trip at all. `on: false` is a no-op — there's nothing to disarm.
+    fn record(&mut self, on: bool) -> Result<String> {
+        let p = crate::ssf2_bridge::frame_trace_path();
+        if on {
+            std::fs::write(&p, b"")?;
+            Ok("record: window opened (engine-side per-frame recorder)".into())
+        } else {
+            Ok("record: the SSF2 recorder always runs — `trace` reads the window".into())
+        }
+    }
+
+    /// Close the window: read every frame the engine recorded since `record`.
+    ///
+    /// This is the whole point. The engine is present at every frame and writes one line
+    /// per frame, so a 14-frame attack yields 14 lines no matter how slow the host is —
+    /// where polling for the same thing sampled about once per 14 frames and reported
+    /// `frames_seen=0`. Reading is a file read, not an engine round trip.
+    fn frame_trace(&mut self) -> Result<String> {
+        let p = crate::ssf2_bridge::frame_trace_path();
+        let body = std::fs::read_to_string(&p).unwrap_or_default();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        // collapse to one record per animation: which label, how many frames it held, and
+        // where the character was when it ended. That's the comparable unit against
+        // Fraymakers, not the raw per-frame dump.
+        let mut runs: Vec<(String, usize, String)> = Vec::new();
+        for l in &lines {
+            let mut f = l.split('|');
+            let (Some(label), Some(_frame), Some(x), Some(y)) = (f.next(), f.next(), f.next(), f.next())
+            else { continue };
+            let pos = format!("({x},{y})");
+            match runs.last_mut() {
+                Some((lab, n, p)) if lab == label => { *n += 1; *p = pos; }
+                _ => runs.push((label.to_string(), 1, pos)),
+            }
+        }
+        let mut out = format!("TRACE:{} frames, {} animations\n", lines.len(), runs.len());
+        for (lab, n, pos) in &runs {
+            out.push_str(&format!("  {lab} x{n} end={pos}\n"));
+        }
+        Ok(out)
+    }
+
     fn match_status(&mut self) -> Result<Option<String>> {
         if !self.match_live() { return Ok(None); }
         let feed = self.compose_match_status()?;

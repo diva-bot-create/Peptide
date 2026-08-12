@@ -135,8 +135,14 @@ const HOST_TO_SSF2_BITS: &[(u32, u32)] = &[
     (0x02, 1 << 10), // down  → DOWN
     (0x04, 1 << 9),  // left  → LEFT
     (0x08, 1 << 8),  // right → RIGHT
-    (0x10, 1 << 6),  // attack→ BUTTON1
-    (0x20, 1 << 5),  // special→BUTTON2
+    // BUTTON1/BUTTON2 are NOT A/B in that order. Verified live with the engine-side
+    // frame recorder: driving BUTTON1 (1<<6) plays mario's `b` animation and BUTTON2
+    // (1<<5) plays `a`, so BUTTON1 is the special button and BUTTON2 is attack. The bit
+    // positions themselves match ControlsObject's constants; it's the naming that reads
+    // backwards. Mapping them the other way silently pressed the wrong button on every
+    // SSF2 input test.
+    (0x10, 1 << 5),  // attack → BUTTON2 (SSF2's A)
+    (0x20, 1 << 6),  // special→ BUTTON1 (SSF2's B)
     (0x40, 1 << 4),  // action→ GRAB
     (0x80, 1 << 7),  // jump  → JUMP
 ];
@@ -206,9 +212,11 @@ mod tests {
         // single controls land on the SSF2 ControlsObject bit positions
         assert_eq!(fm_mask_to_ssf2(0x08), 1 << 8);  // right → RIGHT
         assert_eq!(fm_mask_to_ssf2(0x80), 1 << 7);  // jump  → JUMP
-        assert_eq!(fm_mask_to_ssf2(0x20), 1 << 5);  // special→BUTTON2
+        // BUTTON1 is SSF2's B and BUTTON2 its A — confirmed live via the frame recorder
+        assert_eq!(fm_mask_to_ssf2(0x20), 1 << 6);  // special→BUTTON1
+        assert_eq!(fm_mask_to_ssf2(0x10), 1 << 5);  // attack →BUTTON2
         // combos OR together (down+special)
-        assert_eq!(fm_mask_to_ssf2(0x22), (1 << 10) | (1 << 5));
+        assert_eq!(fm_mask_to_ssf2(0x22), (1 << 10) | (1 << 6));
         assert_eq!(fm_mask_to_ssf2(0), 0);
     }
 
