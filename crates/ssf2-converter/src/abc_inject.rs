@@ -1420,43 +1420,35 @@ pub fn inject_jump_probe(abc: &mut Abc, doc_class_local: &str, traj_path: &str, 
     Ok(())
 }
 
-/// Per-frame ANIMATION RECORDER — the engine keeps its own frame-by-frame history and
-/// the host reads the whole thing in ONE round trip.
+/// Per-frame ANIMATION RECORDER — the engine PUSHES its own frame-by-frame state over the
+/// bridge socket, exactly the way Fraymakers does.
 ///
-/// Polling can't observe SSF2 accurately. Every field of a sample is a separate
-/// reflection round trip over file-IPC, so a sample lands roughly every ~14 SSF2 frames:
-/// a 14-frame attack finishes between two samples, and worse, sometimes a sample happens
-/// to catch it, so the result looks like data instead of failing. No amount of faster
-/// polling fixes a sampler slower than the thing it samples. The engine, on the other
-/// hand, is already there every frame.
+/// This mirrors `main.rs::inject_anim_telemetry` on the Fraymakers side: there, a hook on
+/// `Character.toState` writes `ANIM:<state>` to the harness socket, the host's reader routes
+/// it by prefix, and nothing polls. SSF2's bridge was pure request/response with nothing
+/// engine-initiated, so the host had to poll for the same information — and polling loses,
+/// for two reasons that are easy to mistake for each other:
+///   * it races the move. A 7-frame attack is ~233ms and the round trip between "send input"
+///     and "start watching" is the same order, so the watcher arrives after it's over.
+///     Measured: the recorder captured `a x7` in a window where a concurrent poll saw only
+///     `stand`.
+///   * it can't see a frame it didn't sample, and no sample rate fixes the race above.
+/// The engine is present at every frame by definition, so it does the observing.
 ///
-/// So: an ENTER_FRAME handler appends `<label>|<frame>|<x>|<y>` for character
-/// `char_index` to `trace_path`, one line per engine frame, and the host reads the file.
-///
-/// It writes to a FILE rather than accumulating in an instance slot, which was the first
-/// attempt: the slot is added and the handler runs, but the reflection bridge reads the
-/// slot back as `NaN` and a write through it doesn't stick, so the host can neither arm
-/// nor drain it. The file needs no reflection at all — the host truncates it to open a
-/// window and reads it to close one — and per-frame FileStream IO is already proven safe
-/// DURING A MATCH by `inject_jump_probe`, which sustains it for the whole session.
-/// (`inject_load_test`'s warning is about per-frame IO during the resource PARSE, which
-/// is a different phase.)
-pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, trace_path: &str, char_index: u8) -> anyhow::Result<()> {
+/// Emits `FRAME:<label>|<frame>|<x>|<y>` for character `char_index` each ENTER_FRAME on the
+/// SAME socket the command protocol uses (`peptideSock`). That's safe because the host's
+/// response reader is seq-matched and already skips non-matching lines; it now routes them
+/// by prefix instead of dropping them, which is precisely what the Fraymakers stream pump
+/// does. Writing to the socket rather than a file also drops the per-frame FileStream IO
+/// this first used, and with it the temp file the host had to truncate to open a window.
+pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, char_index: u8) -> anyhow::Result<()> {
     let ci = abc.find_class_by_name(doc_class_local)
         .ok_or_else(|| anyhow::anyhow!("class {doc_class_local} not found"))?;
-    let fs_ns = { let s = abc.intern_string("flash.filesystem"); abc.intern_namespace(NS_PACKAGE, s) };
     let events_ns = { let s = abc.intern_string("flash.events"); abc.intern_namespace(NS_PACKAGE, s) };
     let ctrl_ns = { let s = abc.intern_string(SSF2_NS_CONTROLLERS); abc.intern_namespace(NS_PACKAGE, s) };
     let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
     let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
 
-    let mn_file = q(abc, fs_ns, "File");
-    let mn_fstream = q(abc, fs_ns, "FileStream");
-    let mn_fmode = q(abc, fs_ns, "FileMode");
-    let mn_append = q(abc, pub_ns, "APPEND");
-    let mn_open = q(abc, pub_ns, "open");
-    let mn_close = q(abc, pub_ns, "close");
-    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
     let mn_gc = q(abc, ctrl_ns, "GameController");
     let mn_stagedata = q(abc, pub_ns, "stageData");
     let mn_characters = q(abc, pub_ns, "Characters");
@@ -1468,19 +1460,24 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, trace_path: &
     let mn_event = q(abc, events_ns, "Event");
     let mn_enterframe = q(abc, pub_ns, "ENTER_FRAME");
     let mn_addel = q(abc, pub_ns, "addEventListener");
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
     let mn_rec = q(abc, pub_ns, "peptideFrameRec");
     let n_rec = abc.intern_string("peptideFrameRec");
     let pub_nsset = abc.intern_ns_set(vec![pub_ns]);
     let mnl = abc.intern_multinamel(pub_nsset);
-    let s_path = abc.intern_string(trace_path);
+    let s_tag = abc.intern_string("FRAME:");
     let s_bar = abc.intern_string("|");
     let s_nl = abc.intern_string("\n");
 
-    // locals: this=0 event=1 sd=2 c0=3 mc=4 fileObj=5 fs=6
-    let (l_sd, l_c0, l_mc, l_fo, l_fs) = (2u32, 3, 4, 5, 6);
+    // locals: this=0 event=1 sd=2 c0=3 mc=4
+    let (l_sd, l_c0, l_mc) = (2u32, 3, 4);
     let mut c = Code::default();
     let l_skip = c.new_label();
     c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    // if (this.peptideSock == null) return;  — not connected yet, nobody to push to
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
     // sd = GameController.stageData; if (sd == null) return;
     c.op_u30(OP_GETLEX, mn_gc); c.op_u30(OP_GETPROPERTY, mn_stagedata); c.op_u30(OP_SETLOCAL, l_sd);
     c.op_u30(OP_GETLOCAL, l_sd); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
@@ -1491,13 +1488,10 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, trace_path: &
     // mc = c0.MC; if (mc == null) return;
     c.op_u30(OP_GETLOCAL, l_c0); c.op_u30(OP_GETPROPERTY, mn_mc); c.op_u30(OP_SETLOCAL, l_mc);
     c.op_u30(OP_GETLOCAL, l_mc); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
-    // open trace (APPEND) — the host truncates this file to open a recording window
-    c.op_u30(OP_FINDPROPSTRICT, mn_file); c.op_u30(OP_PUSHSTRING, s_path); c.op_u30_u30(OP_CONSTRUCTPROP, mn_file, 1); c.op_u30(OP_SETLOCAL, l_fo);
-    c.op_u30(OP_FINDPROPSTRICT, mn_fstream); c.op_u30_u30(OP_CONSTRUCTPROP, mn_fstream, 0); c.op_u30(OP_SETLOCAL, l_fs);
-    c.op_u30(OP_GETLOCAL, l_fs); c.op_u30(OP_GETLOCAL, l_fo); c.op_u30(OP_GETLEX, mn_fmode); c.op_u30(OP_GETPROPERTY, mn_append); c.op_u30_u30(OP_CALLPROPVOID, mn_open, 2);
-    // fs.writeUTFBytes( mc.currentLabel +"|"+ mc.currentFrame +"|"+ c0.X +"|"+ c0.Y + "\n" )
-    c.op_u30(OP_GETLOCAL, l_fs);
-    c.op_u30(OP_GETLOCAL, l_mc); c.op_u30(OP_GETPROPERTY, mn_curlabel); c.op(OP_CONVERT_S);
+    // peptideSock.writeUTFBytes("FRAME:" + label +"|"+ frame +"|"+ X +"|"+ Y + "\n"); flush()
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock);
+    c.op_u30(OP_PUSHSTRING, s_tag);
+    c.op_u30(OP_GETLOCAL, l_mc); c.op_u30(OP_GETPROPERTY, mn_curlabel); c.op(OP_CONVERT_S); c.op(OP_ADD);
     c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
     c.op_u30(OP_GETLOCAL, l_mc); c.op_u30(OP_GETPROPERTY, mn_curframe); c.op(OP_CONVERT_S); c.op(OP_ADD);
     c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
@@ -1506,7 +1500,7 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, trace_path: &
     c.op_u30(OP_GETLOCAL, l_c0); c.op_u30(OP_GETPROPERTY, mn_y); c.op(OP_CONVERT_S); c.op(OP_ADD);
     c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
     c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
-    c.op_u30(OP_GETLOCAL, l_fs); c.op_u30_u30(OP_CALLPROPVOID, mn_close, 0);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
     c.place(l_skip);
     c.op(OP_RETURNVOID);
 
@@ -1514,7 +1508,7 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, trace_path: &
         param_types: vec![0], return_type: 0, name: n_rec, flags: 0, options: vec![], param_names: vec![],
     });
     abc.add_body(MethodBody {
-        method: rec, max_stack: 8, local_count: 7, init_scope_depth: 0, max_scope_depth: 2,
+        method: rec, max_stack: 8, local_count: 6, init_scope_depth: 0, max_scope_depth: 2,
         code: c.finish(), exceptions: vec![], traits: vec![],
     });
     abc.add_instance_method_trait(ci, mn_rec, rec);

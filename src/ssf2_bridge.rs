@@ -23,15 +23,33 @@ use std::time::{Duration, Instant};
 /// Path for the per-frame jump-probe trajectory CSV. Computed at call time so it
 /// resolves to the platform temp dir on both macOS (`/tmp/`) and Windows (`%TEMP%`).
 /// Uses forward slashes so Flash's `FileStream` accepts the path on Windows too.
-/// Where the injected per-frame animation recorder writes. The host truncates this to
-/// open a recording window and reads it to close one, so no engine-side gate (and no
-/// reflection, which can't reach the injected slots) is involved.
-pub fn frame_trace_path() -> String {
-    std::env::temp_dir()
-        .join("peptide_ssf2_frames.csv")
-        .to_string_lossy()
-        .replace('\\', "/")
+/// The frames the engine has PUSHED since the last `record`.
+///
+/// Mirrors the Fraymakers side, where the engine pushes `ANIM:` telemetry over the harness
+/// socket and the host's stream pump routes it by prefix. SSF2's injected recorder
+/// (`abc_inject::inject_frame_recorder`) pushes `FRAME:<label>|<frame>|<x>|<y>` on the same
+/// socket the command protocol uses; the response reader is seq-matched, so these arrive as
+/// non-matching lines and are routed here instead of dropped.
+static FRAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Route one engine-pushed line. Returns true if it was consumed as telemetry (and so must
+/// not be treated as a command response).
+fn route_pushed(line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("FRAME:") {
+        let mut f = FRAMES.lock().unwrap();
+        // Bounded: a session left recording must not grow without limit. 20k frames is
+        // ~11 minutes of SSF2 at 30fps, far more than any single measurement window.
+        if f.len() < 20_000 { f.push(rest.to_string()); }
+        return true;
+    }
+    false
 }
+
+/// Clear the buffer — opens a recording window.
+pub fn frames_clear() { FRAMES.lock().unwrap().clear(); }
+
+/// Take everything pushed since the last clear.
+pub fn frames_take() -> Vec<String> { FRAMES.lock().unwrap().clone() }
 
 pub fn traj_path() -> String {
     std::env::temp_dir()
@@ -145,7 +163,10 @@ pub fn request(command: &str, timeout: Duration) -> Result<String> {
                 if let Some(rest) = line.trim_end_matches(['\r', '\n']).strip_prefix(&prefix) {
                     return Ok(rest.to_string());
                 }
-                // a non-matching line (stale) — keep reading until the deadline
+                // Not our seq. It may be engine-PUSHED telemetry (the recorder's FRAME:
+                // lines), which is routed rather than dropped — the same job the
+                // Fraymakers stream pump does by prefix. Anything else is a stale reply.
+                route_pushed(line.trim_end_matches(['\r', '\n']));
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {

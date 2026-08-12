@@ -300,7 +300,6 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
     let dst_app = stage_patched_bundle(&app)?;
     let dst_swf = ssf2_swf_path(&dst_app);
     let traj = crate::ssf2_bridge::traj_path();
-    let frames = crate::ssf2_bridge::frame_trace_path();
     ssf2_converter::abc_inject::patch_file_with(&src_swf, &dst_swf, |abc| {
         // resilience preflight: abort loudly (naming what moved) if a critical SSF2 engine
         // symbol the injections depend on was renamed/repackaged by an SSF2 update, instead
@@ -323,11 +322,11 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         }
         // a second ENTER_FRAME listener that logs Characters[0] physics each frame
         ssf2_converter::abc_inject::inject_jump_probe(abc, SSF2_DOC_CLASS, &traj, 0)?;
-        // per-frame animation recorder: the engine keeps its own frame-by-frame history in
-        // memory and the host reads it whole. SSF2 can't be observed by polling — a sample
-        // costs several reflection round trips and lands about every ~14 SSF2 frames, so a
-        // short animation finishes between two samples. See inject_frame_recorder.
-        ssf2_converter::abc_inject::inject_frame_recorder(abc, SSF2_DOC_CLASS, &frames, 0)
+        // per-frame animation recorder: the engine PUSHES FRAME: lines over the same bridge
+        // socket, exactly as Fraymakers pushes ANIM: telemetry. Polling can't do this job —
+        // it races the move (a 7-frame attack is ~233ms, the same order as the round trip
+        // between sending input and starting to watch). See inject_frame_recorder.
+        ssf2_converter::abc_inject::inject_frame_recorder(abc, SSF2_DOC_CLASS, 0)
     })?;
     macos_resign(&dst_app);
     Ok(dst_app)
