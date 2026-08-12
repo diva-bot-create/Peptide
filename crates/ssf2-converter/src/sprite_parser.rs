@@ -614,8 +614,13 @@ pub fn parse_sprite_boxes_from_swf(
             // The emitted entity sums keyframe lengths across EVERY HIT_BOX layer, so
             // counting unique frames here compares two different units and reports a
             // two-box move as 4.00x when it is exactly right.
+            // Hitbox AND GrabBox: the emitted side counts HIT_BOX + GRAB_BOX (SSF2 grab
+            // boxes are re-typed to Fraymakers' GRAB_BOX), so the source side has to count
+            // the same set or a grab reads as wildly mismatched in whichever direction the
+            // asymmetry happens to fall.
             let per_frame: Vec<(u16, usize)> = d.frames.iter()
-                .map(|(f, boxes)| (*f, boxes.iter().filter(|b| b.box_type == BoxType::Hitbox).count()))
+                .map(|(f, boxes)| (*f, boxes.iter()
+                    .filter(|b| matches!(b.box_type, BoxType::Hitbox | BoxType::GrabBox)).count()))
                 .filter(|(_, n)| *n > 0)
                 .collect();
             if per_frame.is_empty() { continue; }
