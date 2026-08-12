@@ -40,8 +40,15 @@ def splits(char, outdir):
     it was sliced from, so the expected length is (range + appended head frames) * 2 —
     no guessing from name suffixes, and splits are handled by construction.
     """
-    env = dict(os.environ, PEPTIDE_DUMP_ANIM_SPLITS="1", PEPTIDE_DUMP_ANIM_LABELS="1")
-    r = subprocess.run([BIN, "convert", os.path.join(SSFS, f"{char}.ssf"), "-o", outdir, "-y"],
+    # `-n <char>` restricts a MULTI-CHARACTER .ssf (bowser = bowser+gigabowser, zelda =
+    # zelda+sheik) to the one character being checked. Without it the dump carries both
+    # characters' splits, and a dict keyed on the Fraymakers animation name lets the second
+    # silently overwrite the first — which is what made bowser report 105 "failures" whose
+    # expected lengths came from gigabowser.
+    env = dict(os.environ, PEPTIDE_DUMP_ANIM_SPLITS="1", PEPTIDE_DUMP_ANIM_LABELS="1",
+               PEPTIDE_DUMP_BOX_FRAMES="1")
+    r = subprocess.run([BIN, "convert", os.path.join(SSFS, f"{char}.ssf"), "-n", char,
+                        "-o", outdir, "-y"],
                        capture_output=True, text=True, env=env)
     text = r.stderr + r.stdout
     totals = {m.group(1): int(m.group(2))
@@ -53,6 +60,46 @@ def splits(char, outdir):
         end = totals.get(src, start) if end == "end" else int(end)
         head = int(re.search(r"\+head(\d+)", flags).group(1)) if "+head" in flags else 0
         out[fm] = {"src": src, "frames": max(0, end - start) + head, "loop": " loop" in flags}
+    return out, text
+
+
+def source_active(char, outdir_unused, text):
+    """SSF2 source ACTIVE hitbox frames per animation, from PEPTIDE_DUMP_BOX_FRAMES."""
+    out = {}
+    for m in re.finditer(r"\[box-frames\] (\S+) total=(\d+) active=(\d+) first=(\d+) last=(\d+)", text):
+        out[m.group(1)] = {"active": int(m.group(3)), "first": int(m.group(4)), "last": int(m.group(5))}
+    return out
+
+
+def entity_active(char, outdir):
+    """Emitted Fraymakers active HIT_BOX frames per animation.
+
+    Same definition parity_check.py uses: a hitbox is active on a keyframe whose symbol is
+    non-null. This is the OTHER half of frame data — animation lengths say how long a move
+    lasts, these say which frames of it can actually hit (startup / active / recovery).
+    """
+    ents = glob.glob(os.path.join(outdir, char, "library", "entities", "*.entity"))
+    ent = next((e for e in ents if os.path.basename(e).lower() == f"{char}.entity"), None)
+    if not ent:
+        return {}
+    d = json.load(open(ent, encoding="utf8"))
+    layers = {l["$id"]: l for l in d.get("layers", [])}
+    kfs = {k["$id"]: k for k in d.get("keyframes", [])}
+    out = {}
+    for a in d.get("animations", []):
+        total = 0
+        for lid in a.get("layers", []):
+            l = layers.get(lid)
+            if not l or l.get("type") != "COLLISION_BOX":
+                continue
+            meta = l.get("pluginMetadata", {}).get("com.fraymakers.FraymakersMetadata", {})
+            if meta.get("collisionBoxType") != "HIT_BOX":
+                continue
+            for kid in l.get("keyframes", []):
+                k = kfs.get(kid, {})
+                if k.get("symbol") is not None:
+                    total += k.get("length", 1)
+        out[a["name"]] = total
     return out
 
 
@@ -78,7 +125,7 @@ def entity_lengths(char, outdir):
 
 def check(char, verbose=False):
     outdir = os.path.join(ROOT, "build", "parity_timing")
-    sp = splits(char, outdir)
+    sp, text = splits(char, outdir)
     fm = entity_lengths(char, outdir)
     if not sp or not fm:
         print(f"{char}: no data (splits={len(sp)} fm={len(fm)})")
@@ -105,7 +152,24 @@ def check(char, verbose=False):
         tag = " (loop, not counted)" if info["loop"] else ""
         ratio = got / info["frames"] if info["frames"] else 0
         print(f"  {name:26} src={info['src']}[{info['frames']}]  fm={got:4}  expected={want:4}  {ratio:.2f}x{tag}")
-    return checked, off
+
+    # ── active hitbox frames (startup / active / recovery) ────────────────────
+    src_act, fm_act = source_active(char, outdir, text), entity_active(char, outdir)
+    b_checked = b_off = 0
+    b_rows = []
+    for name in sorted(src_act):
+        if name not in fm_act:
+            continue
+        want_a, got_a = src_act[name]["active"] * 2, fm_act[name]
+        b_checked += 1
+        if abs(got_a - want_a) > 1:
+            b_off += 1
+            b_rows.append((name, src_act[name]["active"], got_a, want_a))
+    print(f"    hitbox active frames: {b_checked} animations, {b_off} off 2.00x")
+    for name, s_a, got_a, want_a in b_rows[:12]:
+        r = got_a / s_a if s_a else 0
+        print(f"      {name:24} ssf2_active={s_a:3}  fm_active={got_a:3}  expected={want_a:3}  {r:.2f}x")
+    return checked, off + b_off
 
 
 if __name__ == "__main__":

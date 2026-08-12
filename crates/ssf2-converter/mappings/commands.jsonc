@@ -945,6 +945,15 @@
     { "category": "no_equivalent", "name": "stop", "note": "timeline navigation; no timeline in FM (AudioClip.stop() exists but requires a clip handle)" },
     { "category": "no_equivalent", "name": "killAttackboxes", "note": "no FM equivalent" },
     { "category": "no_equivalent", "name": "checkAtkilled", "note": "no FM equivalent" },
+    // Fraymakers has no item system, so the whole SSF2 item surface is commented out
+    // rather than mapped. This is a DELIBERATE non-goal, not an unfinished port: a custom
+    // item implementation is planned separately, and until it exists these calls have
+    // nothing to resolve to. Declaring them here keeps them out of the
+    // conversion_log `unknown` stream, which should only list things still worth chasing.
+    { "category": "no_equivalent", "name": "activateItem", "note": "no FM item system; custom implementation planned separately" },
+    { "category": "no_equivalent", "name": "deactivateItem", "note": "no FM item system; custom implementation planned separately" },
+    { "category": "no_equivalent", "name": "generateCharacterItem", "note": "no FM item system; custom implementation planned separately" },
+    { "category": "no_equivalent", "name": "dropItem", "note": "no FM item system; custom implementation planned separately" },
     { "category": "no_equivalent", "name": "pickupItem", "note": "no FM item system (FM has Assists)" },
     { "category": "no_equivalent", "name": "tossItem", "note": "no FM item system" },
     { "category": "no_equivalent", "name": "getItem", "note": "no FM item system" },
