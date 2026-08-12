@@ -206,6 +206,32 @@ once (boot→READY budget via `FRAY_READY_BUDGET`), fires the first command at R
 the rest by `gap_s` (fractional OK). example:
 `./tools/runseq.sh 6 "spawn sandbag" "match.getCharacters()[0].getStateName()" "match.getCharacters()[0].toState(CState.JAB)"`.
 
+### timing parity (is the 30->60fps doubling right?)
+
+`tools/tests/timing_parity.py <char>…` (or `--all`) checks the converter's core timing rule
+for EVERY animation, statically, with no engine running:
+
+```
+tools/tests/timing_parity.py mario          # 164 animations checked, 0 off 2.00x
+tools/tests/timing_parity.py --all          # the whole roster
+```
+
+SSF2 runs at 30fps and Fraymakers at 60, so a converted animation should be exactly twice
+its source. Expected length comes from the splitter itself (`PEPTIDE_DUMP_ANIM_SPLITS`),
+which reports for each emitted FM animation the SSF2 animation it came from and the
+`[start..end)` range it was sliced from; actual length is the emitted `.entity`'s IMAGE
+layer.
+
+**Pair from the splitter, never from names.** One SSF2 timeline becomes several FM
+animations (a Jab sprite -> jab1/jab2/jab3/jab4, see AGENT_CONTEXT "animations" and
+`src/anim_splitter.rs`), so name-matching either misses a split or sums pieces that
+shouldn't be summed. a first version that guessed from name suffixes reported 17 failures
+on mario that were all its own grouping. A looping split is reported but not counted: its
+emitted length is one cycle the engine repeats, not a duration.
+
+This is the cheap, total-coverage half of frame parity. The live half (below) is what
+confirms the emitted lengths actually PLAY that way.
+
 ### script-error scan (does the translated code actually RUN?)
 
 `tools/tests/script_error_scan.sh <id> …` converts, exports, then drives the character through
@@ -230,6 +256,31 @@ out of the blast zone and dies, and every later action then errors on frame 1) a
 characters** (the `scenario` park addresses p0 AND p1, so a solo roster half-fails on a null p1
 and floods the signature). `SCAN_EXPORT=0` reuses the published `.fra` when you only changed the
 driving.
+
+### frame recording (how long did that move actually take?)
+
+Both engines PUSH per-frame telemetry over their harness socket and the host buffers it;
+`record` opens a window and `trace` closes it, printing `<animation> xN` runs:
+
+```
+record                      # clear the buffer
+seq attack:2                # drive an input
+trace                       # TRACE:37 frames, 2 animations / stand x25 / jab1 x12
+```
+
+Fraymakers emits `FRAME:<animation>|<state>` from a `Character.updateGameInput` hook; SSF2
+emits `FRAME:<label>|<frame>|<x>|<y>` from an injected ENTER_FRAME handler. The
+run-length encoding is shared (`debug_target::rle_frames`) so neither side can format it
+differently and make a formatting difference look like a timing difference.
+
+**Compare animations, not states.** SSF2's frame LABEL and Fraymakers' ANIMATION are the
+same unit; a Fraymakers STATE is coarser and spans a whole split chain, so keying on it
+collapses jab1/jab2/jab3 into one run that can never line up with SSF2's per-label counts.
+
+**Don't poll for this.** Polling races the move: a 7-frame attack is ~233ms, the same order
+as the round trip between sending the input and starting to watch, so the watcher can
+arrive after it's over. measured: the SSF2 recorder captured `a x7` in a window where a
+concurrent poll saw only `stand`. The engine is present at every frame; the host isn't.
 
 the `peptide` binary also exposes **read-only engine-inspection subcommands** used when
 re-deriving the engine integration on a new build. their existence is noted in
