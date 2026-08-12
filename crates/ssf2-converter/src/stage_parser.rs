@@ -2546,8 +2546,13 @@ fn walk<'a>(
 
         if std::env::var("PEPTIDE_STAGE_TREE").is_ok() {
             let kind = if sprites.contains_key(&id) { "MC" } else if shape_bounds.contains_key(&id) { "shape" } else { "?" };
-            eprintln!("{}d{} {kind} inst={:?} sym={:?} plane={:?} @({:.0},{:.0})",
-                "  ".repeat(rec), po.depth, inst_name.as_deref().unwrap_or(""), sym, my_plane.unwrap_or(""), world.tx, world.ty);
+            // frames tells a MOVING object from a still one, which is the whole question
+            // when auditing a stage: stage art is rasterized into one composite sprite, so
+            // a 1-frame clip having no separate Fraymakers object is correct, while a
+            // multi-frame clip baked into that composite has silently lost its animation.
+            let frames = sprites.get(&id).map(|t| build_frames(t).len()).unwrap_or(1);
+            eprintln!("{}d{} {kind} inst={:?} sym={:?} plane={:?} @({:.0},{:.0}) frames={}",
+                "  ".repeat(rec), po.depth, inst_name.as_deref().unwrap_or(""), sym, my_plane.unwrap_or(""), world.tx, world.ty, frames);
         }
 
         // record the stage origin from the root stageMC instance
