@@ -610,12 +610,8 @@ impl DebugTarget for Ssf2Target {
     /// host decides what counts as a window, which means no engine-side gate and no
     /// engine round trip at all. `on: false` is a no-op — there's nothing to disarm.
     fn record(&mut self, on: bool) -> Result<String> {
-        if on {
-            crate::ssf2_bridge::frames_clear();
-            Ok("record: window opened (engine pushes FRAME: telemetry)".into())
-        } else {
-            Ok("record: the SSF2 recorder always pushes — `trace` reads the window".into())
-        }
+        if on { crate::ssf2_bridge::frames_clear(); }
+        Ok(crate::debug_target::fmt_record(on))
     }
 
     /// Close the window: read every frame the engine recorded since `record`.
@@ -636,13 +632,13 @@ impl DebugTarget for Ssf2Target {
             .and_then(|l| { let f: Vec<&str> = l.split('|').collect();
                 if f.len() >= 4 { Some(format!(" end=({},{})", f[2], f[3])) } else { None } })
             .unwrap_or_default();
-        let mut out = format!("TRACE:{} frames, {} animations\n", pushed.len(), runs.len());
         let mut seen = 0usize;
-        for (label, n) in &runs {
+        let ends: Vec<Option<String>> = runs.iter().map(|(_, n)| {
             seen += n;
-            out.push_str(&format!("  {label} x{n}{}\n", end_of(seen)));
-        }
-        Ok(out)
+            let e = end_of(seen);
+            if e.is_empty() { None } else { Some(e) }
+        }).collect();
+        Ok(crate::debug_target::fmt_trace(pushed.len(), &runs, &ends))
     }
 
     fn match_status(&mut self) -> Result<Option<String>> {

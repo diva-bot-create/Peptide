@@ -265,6 +265,42 @@ pub fn push_frame(state: &str) {
 pub fn fm_frames_clear() { FM_FRAMES.lock().unwrap().clear(); }
 pub fn fm_frames_take() -> Vec<String> { FM_FRAMES.lock().unwrap().clone() }
 
+/// The ONE rendering of each host-computed result, shared by every driver and both
+/// engines. These strings previously existed in three files (bridge.rs's serve loop, the
+/// Fraymakers target, the SSF2 target) and could drift apart — which is exactly how `tree`
+/// ended up answering "SSF2-only" through one path and working through another.
+pub fn fmt_record(on: bool) -> String {
+    if on { "record: window opened (engine pushes FRAME: telemetry)".into() }
+    else { "record: the recorder always pushes — `trace` reads the window".into() }
+}
+
+/// `TRACE:` header plus one `<animation> xN` row per run. `ends[i]`, when present, is the
+/// position the run finished at (SSF2 carries it in the stream; Fraymakers doesn't).
+pub fn fmt_trace(total: usize, runs: &[(String, usize)], ends: &[Option<String>]) -> String {
+    let mut out = format!("TRACE:{total} frames, {} animations\n", runs.len());
+    for (i, (label, n)) in runs.iter().enumerate() {
+        let end = ends.get(i).and_then(|e| e.as_deref()).unwrap_or("");
+        out.push_str(&format!("  {label} x{n}{end}\n"));
+    }
+    out
+}
+
+pub fn fmt_await(w: &AnimWatch, idx: usize) -> String {
+    match &w.last {
+        Some(s) => format!(
+            "AWAIT:{:?} anim={} frame={}/{} frames_seen={} pos=({:.1},{:.1})",
+            w.outcome, s.anim, s.frame, s.total, w.frames_seen, s.x, s.y),
+        None => format!("AWAIT:{:?} (no live character p{idx})", w.outcome),
+    }
+}
+
+pub fn fmt_ready(live: Option<&AnimState>, idx: usize, tries: u32) -> String {
+    match live {
+        Some(s) => format!("MATCHREADY:p{idx} anim={} pos=({:.1},{:.1})", s.anim, s.x, s.y),
+        None => format!("MATCHREADY:none (p{idx} never became readable in {tries} tries)"),
+    }
+}
+
 /// Run-length-encode a per-frame stream into `"<anim> xN"` records — the comparable unit
 /// across engines. Shared so Fraymakers and SSF2 can't report it differently.
 pub fn rle_frames(frames: &[String]) -> Vec<(String, usize)> {
@@ -315,19 +351,36 @@ pub fn run_command(target: &mut dyn DebugTarget, line: &str) -> Result<Option<St
         }
         Command::Await { idx, budget } => {
             let w = await_animation(target, idx, budget, 3)?;
-            Some(match &w.last {
-                Some(s) => format!(
-                    "AWAIT:{:?} anim={} frame={}/{} frames_seen={} pos=({:.1},{:.1}) state={}",
-                    w.outcome, s.anim, s.frame, s.total, w.frames_seen, s.x, s.y, s.state),
-                None => format!("AWAIT:{:?} (no live character p{idx})", w.outcome),
-            })
+            Some(fmt_await(&w, idx))
         }
         Command::AwaitMatch { idx, tries } => {
             let live = await_live(|| target.char_anim(idx), tries)?;
-            Some(match live {
-                Some(s) => format!("MATCHREADY:p{idx} anim={} pos=({:.1},{:.1})", s.anim, s.x, s.y),
-                None => format!("MATCHREADY:none (p{idx} never became readable in {tries} tries)"),
-            })
+            Some(fmt_ready(live.as_ref(), idx, tries))
+        }
+        Command::Info => {
+            // Enumerate the players that exist rather than assuming two. `char_anim`
+            // already reports animation/position/state and answers None for an absent
+            // slot, so this is correct for any roster size on either engine.
+            let mut out = String::new();
+            for idx in 0..4 {
+                let Some(s) = target.char_anim(idx)? else { continue };
+                let dmg = strip_eval(target.eval(&format!("p{idx}.damage._damage"))
+                    .unwrap_or_default());
+                let dmg = dmg.trim();
+                // The per-frame sampler drops `state` to keep a poll cheap; `info` is a
+                // one-shot readout, so it can afford the extra read rather than print "?".
+                let state = if s.state == "?" || s.state.is_empty() {
+                    let v = strip_eval(target.eval(&format!("p{idx}.getStateName()"))
+                        .unwrap_or_default());
+                    let v = v.trim().to_string();
+                    if v.is_empty() { "?".into() } else { v }
+                } else { s.state.clone() };
+                out.push_str(&format!(
+                    "p{idx}: anim={} frame={}/{} pos=({:.1},{:.1}) state={} damage={}\n",
+                    s.anim, s.frame, s.total, s.x, s.y, state,
+                    if dmg.is_empty() { "?" } else { dmg }));
+            }
+            Some(if out.is_empty() { "info: no live characters".into() } else { out })
         }
         Command::Record { on } => Some(target.record(on)?),
         Command::Trace => Some(target.frame_trace()?),
@@ -410,12 +463,8 @@ impl DebugTarget for FraymakersTarget {
     /// Symmetric with `Ssf2Target::record` — both engines push per-frame telemetry and the
     /// host decides what counts as a window.
     fn record(&mut self, on: bool) -> Result<String> {
-        if on {
-            fm_frames_clear();
-            Ok("record: window opened (engine pushes FRAME: telemetry)".into())
-        } else {
-            Ok("record: the Fraymakers recorder always pushes — `trace` reads the window".into())
-        }
+        if on { fm_frames_clear(); }
+        Ok(fmt_record(on))
     }
 
     /// Close the window: run-length-encode every frame the engine pushed since `record`.
@@ -424,9 +473,7 @@ impl DebugTarget for FraymakersTarget {
     fn frame_trace(&mut self) -> Result<String> {
         let frames = fm_frames_take();
         let runs = rle_frames(&frames);
-        let mut out = format!("TRACE:{} frames, {} animations\n", frames.len(), runs.len());
-        for (label, n) in &runs { out.push_str(&format!("  {label} x{n}\n")); }
-        Ok(out)
+        Ok(fmt_trace(frames.len(), &runs, &[]))
     }
 
     fn engine(&self) -> &'static str { "fraymakers" }

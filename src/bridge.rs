@@ -144,18 +144,45 @@ pub fn serve(port: u16, token: Option<&str>) {
         let parsed = crate::interpreter::parse(&raw);
         // `record`/`trace` are pure host-side buffer operations over the FRAME: telemetry
         // the engine pushes — no wire verb, nothing to ask the engine.
+        // record/trace are pure host-side buffer ops over the pushed FRAME: telemetry.
+        // Rendering goes through the SHARED formatters so this path can't drift from the
+        // trait path — the divergence that made `tree` answer differently per driver.
         if let crate::interpreter::Command::Record { on } = parsed {
             if on { crate::debug_target::fm_frames_clear(); }
-            println!("<< record: {}", if on { "window opened (engine pushes FRAME: telemetry)" }
-                                      else { "the Fraymakers recorder always pushes — `trace` reads the window" });
+            for l in crate::debug_target::fmt_record(on).lines() { println!("<< {l}"); }
+            first = false;
+            continue;
+        }
+        // `info` enumerates live players, which needs the reply channel — same host-side
+        // shape as record/trace.
+        if matches!(parsed, crate::interpreter::Command::Info) {
+            let w = &mut write_half;
+            for idx in 0..4 {
+                if !send_wire(w, &format!("e animFeed({idx})")) { break; }
+                let deadline = Instant::now() + Duration::from_millis(1200);
+                let mut sample = None;
+                while Instant::now() < deadline {
+                    match eval_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(v) => { if let Some(s) = crate::debug_target::AnimState::parse(&v) {
+                            sample = Some(s); break; } }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(_) => break,
+                    }
+                }
+                if let Some(s) = sample {
+                    println!("<< p{idx}: anim={} frame={}/{} pos=({:.1},{:.1}) state={}",
+                             s.anim, s.frame, s.total, s.x, s.y, s.state);
+                }
+            }
             first = false;
             continue;
         }
         if matches!(parsed, crate::interpreter::Command::Trace) {
             let frames = crate::debug_target::fm_frames_take();
             let runs = crate::debug_target::rle_frames(&frames);
-            println!("<< TRACE:{} frames, {} animations", frames.len(), runs.len());
-            for (label, n) in &runs { println!("<<   {label} x{n}"); }
+            for l in crate::debug_target::fmt_trace(frames.len(), &runs, &[]).lines() {
+                println!("<< {l}");
+            }
             first = false;
             continue;
         }
@@ -193,19 +220,13 @@ pub fn serve(port: u16, token: Option<&str>) {
             let msg = match parsed {
                 crate::interpreter::Command::AwaitMatch { tries, .. } => {
                     match crate::debug_target::await_live(sample, tries) {
-                        Ok(Some(s)) => format!("MATCHREADY:p{idx} anim={} pos=({:.1},{:.1})", s.anim, s.x, s.y),
-                        Ok(None) => format!("MATCHREADY:none (p{idx} never became readable in {tries} tries)"),
+                        Ok(live) => crate::debug_target::fmt_ready(live.as_ref(), idx, tries),
                         Err(e) => format!("MATCHREADY:error {e}"),
                     }
                 }
                 crate::interpreter::Command::Await { budget, .. } => {
                     match crate::debug_target::watch_animation(&mut sample, budget, 3) {
-                        Ok(w) => match &w.last {
-                            Some(s) => format!(
-                                "AWAIT:{:?} anim={} frame={}/{} frames_seen={} pos=({:.1},{:.1})",
-                                w.outcome, s.anim, s.frame, s.total, w.frames_seen, s.x, s.y),
-                            None => format!("AWAIT:{:?} (no live character p{idx})", w.outcome),
-                        },
+                        Ok(w) => crate::debug_target::fmt_await(&w, idx),
                         Err(e) => format!("AWAIT:error {e}"),
                     }
                 }
