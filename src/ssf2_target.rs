@@ -680,8 +680,35 @@ impl Ssf2Target {
     /// Run a sequence of navigation ops, then READ (or, for an assignment that
     /// already emitted SETP, just confirm).
     fn run_ops(&self, ops: &[String], read: bool) -> Result<String> {
+        // A MISSING MEMBER MUST NOT LOOK LIKE DATA. SSF2's reflection leaves the cursor
+        // where it was when a property doesn't exist, so `p0.nonexistent` READs back as
+        // `[object Character]` — the receiver — and reads exactly like a real value. That
+        // silently produced wrong answers repeatedly: an injected slot that reported NaN,
+        // `CurrentAnimation.currentFrame` echoing `[object HitBoxAnimation]`, and `info`
+        // rendering a missing p1 as four `[object Character]` fields.
+        //
+        // Detect it precisely rather than by guessing at the shape of the reply: READ once
+        // BEFORE the final GET and once after, and if the cursor didn't move while an
+        // object is on it, the member is absent. One extra round trip per eval (sub-ms),
+        // and only when the expression ends in a property get.
+        let ends_in_get = read && ops.last().is_some_and(|o| o.starts_with("GET\t"));
         let mut last = String::new();
-        for op in ops { last = self.op(op)?; }
+        for (i, op) in ops.iter().enumerate() {
+            if ends_in_get && i + 1 == ops.len() {
+                let before = self.op("READ").unwrap_or_default();
+                self.op(op)?;
+                let after = self.op("READ")?;
+                if after == before && after.starts_with("[object ") {
+                    let member = op.split('\t').nth(1).unwrap_or("?");
+                    return Err(anyhow!(
+                        "no member {member:?} on {after} (the cursor did not move — SSF2 \
+                         reflection leaves it in place for a missing property, so this \
+                         would otherwise read back as the receiver)"));
+                }
+                return Ok(after);
+            }
+            last = self.op(op)?;
+        }
         if read { self.op("READ") } else { Ok(last) }
     }
 
