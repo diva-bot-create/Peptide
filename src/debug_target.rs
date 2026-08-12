@@ -249,6 +249,37 @@ pub fn watch_animation(
     }
 }
 
+/// Frames the Fraymakers engine has PUSHED since the last `record`.
+///
+/// The exact counterpart of `ssf2_bridge::FRAMES`. Both engines now emit `FRAME:` per frame
+/// and the host buffers it, so `trace` reads the same shape from either one and a timing
+/// comparison isn't comparing two different measurements.
+static FM_FRAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Route one engine-pushed frame line into the buffer (bounded, so a session left
+/// recording can't grow without limit: 20k frames is ~5.5 minutes at 60fps).
+pub fn push_frame(state: &str) {
+    let mut f = FM_FRAMES.lock().unwrap();
+    if f.len() < 20_000 { f.push(state.to_string()); }
+}
+pub fn fm_frames_clear() { FM_FRAMES.lock().unwrap().clear(); }
+pub fn fm_frames_take() -> Vec<String> { FM_FRAMES.lock().unwrap().clone() }
+
+/// Run-length-encode a per-frame stream into `"<anim> xN"` records — the comparable unit
+/// across engines. Shared so Fraymakers and SSF2 can't report it differently.
+pub fn rle_frames(frames: &[String]) -> Vec<(String, usize)> {
+    let mut runs: Vec<(String, usize)> = Vec::new();
+    for f in frames {
+        let label = f.split('|').next().unwrap_or(f).trim().to_string();
+        if label.is_empty() { continue; }
+        match runs.last_mut() {
+            Some((l, n)) if *l == label => *n += 1,
+            _ => runs.push((label, 1)),
+        }
+    }
+    runs
+}
+
 /// Drop a leading `E:` (the Fraymakers eval-reply wrapper) so feed payloads are
 /// uniform regardless of which backend produced them.
 fn strip_eval(s: String) -> String {
@@ -375,6 +406,29 @@ impl FraymakersTarget {
 }
 
 impl DebugTarget for FraymakersTarget {
+    /// Open a recording window: drop whatever the engine has pushed so far.
+    /// Symmetric with `Ssf2Target::record` — both engines push per-frame telemetry and the
+    /// host decides what counts as a window.
+    fn record(&mut self, on: bool) -> Result<String> {
+        if on {
+            fm_frames_clear();
+            Ok("record: window opened (engine pushes FRAME: telemetry)".into())
+        } else {
+            Ok("record: the Fraymakers recorder always pushes — `trace` reads the window".into())
+        }
+    }
+
+    /// Close the window: run-length-encode every frame the engine pushed since `record`.
+    /// Identical output shape to the SSF2 side, via the shared `rle_frames`, so a timing
+    /// comparison is reading the same measurement from both engines.
+    fn frame_trace(&mut self) -> Result<String> {
+        let frames = fm_frames_take();
+        let runs = rle_frames(&frames);
+        let mut out = format!("TRACE:{} frames, {} animations\n", frames.len(), runs.len());
+        for (label, n) in &runs { out.push_str(&format!("  {label} x{n}\n")); }
+        Ok(out)
+    }
+
     fn engine(&self) -> &'static str { "fraymakers" }
     fn eval(&mut self, expr: &str) -> Result<String> { self.run(&Command::Eval(expr.to_string())) }
     fn spawn(&mut self, a: &SpawnArgs) -> Result<String> { self.run(&Command::Spawn(a.clone())) }

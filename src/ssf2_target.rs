@@ -630,24 +630,17 @@ impl DebugTarget for Ssf2Target {
         // has queued up since the last command.
         let _ = self.eval_quiet("match.characterCount()");
         let pushed = crate::ssf2_bridge::frames_take();
-        let lines: Vec<&str> = pushed.iter().map(|s| s.as_str()).filter(|l| !l.trim().is_empty()).collect();
-        // collapse to one record per animation: which label, how many frames it held, and
-        // where the character was when it ended. That's the comparable unit against
-        // Fraymakers, not the raw per-frame dump.
-        let mut runs: Vec<(String, usize, String)> = Vec::new();
-        for l in &lines {
-            let mut f = l.split('|');
-            let (Some(label), Some(_frame), Some(x), Some(y)) = (f.next(), f.next(), f.next(), f.next())
-            else { continue };
-            let pos = format!("({x},{y})");
-            match runs.last_mut() {
-                Some((lab, n, p)) if lab == label => { *n += 1; *p = pos; }
-                _ => runs.push((label.to_string(), 1, pos)),
-            }
-        }
-        let mut out = format!("TRACE:{} frames, {} animations\n", lines.len(), runs.len());
-        for (lab, n, pos) in &runs {
-            out.push_str(&format!("  {lab} x{n} end={pos}\n"));
+        let runs = crate::debug_target::rle_frames(&pushed);
+        // end position of each run, which the SSF2 stream carries and Fraymakers' doesn't
+        let end_of = |upto: usize| pushed.get(upto.saturating_sub(1))
+            .and_then(|l| { let f: Vec<&str> = l.split('|').collect();
+                if f.len() >= 4 { Some(format!(" end=({},{})", f[2], f[3])) } else { None } })
+            .unwrap_or_default();
+        let mut out = format!("TRACE:{} frames, {} animations\n", pushed.len(), runs.len());
+        let mut seen = 0usize;
+        for (label, n) in &runs {
+            seen += n;
+            out.push_str(&format!("  {label} x{n}{}\n", end_of(seen)));
         }
         Ok(out)
     }

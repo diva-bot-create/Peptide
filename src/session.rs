@@ -56,6 +56,11 @@ pub fn pump_fray_stream(mut reader: BufReader<TcpStream>, sink: &mut impl FraySt
                         sink.on_resdiag(&line);
                     } else if let Some((ch, payload)) = crate::interpreter::channel_payload(&line) {
                         sink.on_channel(ch, payload);
+                    } else if let Some(state) = line.strip_prefix("FRAME:") {
+                        // Per-frame timing telemetry. Routed OUT of the normal line path
+                        // (60/sec would swamp the log) into the frame buffer `trace` reads,
+                        // mirroring how the SSF2 reader routes its own FRAME: pushes.
+                        crate::debug_target::push_frame(state);
                     } else if let Some(state) = line.strip_prefix("ANIM:") {
                         sink.on_anim(state);
                     } else {

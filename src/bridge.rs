@@ -142,6 +142,23 @@ pub fn serve(port: u16, token: Option<&str>) {
         // the animation has actually played (or looped / stalled), whatever that took in
         // wall-clock terms.
         let parsed = crate::interpreter::parse(&raw);
+        // `record`/`trace` are pure host-side buffer operations over the FRAME: telemetry
+        // the engine pushes — no wire verb, nothing to ask the engine.
+        if let crate::interpreter::Command::Record { on } = parsed {
+            if on { crate::debug_target::fm_frames_clear(); }
+            println!("<< record: {}", if on { "window opened (engine pushes FRAME: telemetry)" }
+                                      else { "the Fraymakers recorder always pushes — `trace` reads the window" });
+            first = false;
+            continue;
+        }
+        if matches!(parsed, crate::interpreter::Command::Trace) {
+            let frames = crate::debug_target::fm_frames_take();
+            let runs = crate::debug_target::rle_frames(&frames);
+            println!("<< TRACE:{} frames, {} animations", frames.len(), runs.len());
+            for (label, n) in &runs { println!("<<   {label} x{n}"); }
+            first = false;
+            continue;
+        }
         if matches!(parsed, crate::interpreter::Command::Await { .. }
                           | crate::interpreter::Command::AwaitMatch { .. })
         {

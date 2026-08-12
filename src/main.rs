@@ -1492,6 +1492,7 @@ fn connect_edit(
     eprintln!("scrub: pauseAnimationPlayback.f={pause_field} playFrame={play_frame}");
     let t_prefix_g = add_string_const(code, "T:");
     let anim_prefix_g = add_string_const(code, "ANIM:"); // per-frame state-change telemetry
+    let frame_prefix_g = add_string_const(code, "FRAME:"); // per-frame telemetry (timing parity)
     let t_nomatch_g = add_string_const(code, "T:NOMATCH\n");
     eprintln!("move/telemetry: Character t={char_entity_t} toState={to_state} getStateName={get_state_name} CState t={cstate_statics_t} g={cstate_global} JAB.field={jab_field} characters.field={characters_field}");
     // ---- 'l' command: synchronous custom-.fra load (headless, no worker thread) ----
@@ -3989,6 +3990,14 @@ fn connect_edit(
     // on a change, no per-frame polling). Pinpoints which move was active at a crash.
     inject_anim_telemetry(code, to_state, g_sock, out_field, write_str, flush,
         get_state_name, str_add, anim_prefix_g, nl_g, sock_t, out_t, str_t, enc_t)?;
+    // PER-FRAME telemetry, the mirror of the SSF2 recorder. `ANIM:` above fires on a state
+    // CHANGE, which can't answer "how many frames did that move actually take" — the
+    // question the SSF2/Fraymakers timing comparison is built on. This emits
+    // "FRAME:<state>" every frame for the driven player, exactly as SSF2's injected
+    // ENTER_FRAME handler pushes FRAME: over its bridge socket, so both engines report the
+    // same quantity by the same mechanism and the host run-length-encodes either one.
+    inject_frame_telemetry(code, g_sock, out_field, write_str, flush,
+        get_state_name, str_add, frame_prefix_g, nl_g, sock_t, out_t, str_t, enc_t)?;
     // Engine-side script-error surfacing. The engine runs every character/assist/mode/stage
     // script through ApiScript.interpretScript, which builds a rich error (Std.string + line
     // via posInfos + origin) and calls Tildebugger.error — but ONLY when ApiUtilities.
@@ -4176,6 +4185,72 @@ fn inject_anim_telemetry(
     if let Opcode::JNull { offset, .. } = &mut ops[4] { *offset = skip - 4 - 1; }
     insert_ops_end(f, ops);
     eprintln!("connect_edit: anim telemetry hooked into Character.toState@{to_state}");
+    Ok(())
+}
+
+/// Append PER-FRAME `FRAME:<stateName>` telemetry to `Character.updateGameInput`.
+///
+/// The Fraymakers half of the timing-parity pair. SSF2 gets the same treatment from
+/// `abc_inject::inject_frame_recorder` (an ENTER_FRAME handler pushing FRAME: over its
+/// bridge socket); this is the HashLink equivalent, so both engines report frames the same
+/// way and the host can run-length-encode either stream into "<anim> xN".
+///
+/// Why per-frame rather than reusing the `ANIM:` hook on `toState`: that one is
+/// event-driven and fires on a state CHANGE, which tells you the order of moves but not how
+/// long each one lasted. Frame COUNT is the whole question — the converter's timing model is
+/// a 30→60fps doubling, and confirming it needs the number of frames a move actually
+/// occupied in each engine.
+///
+/// Why not poll from the host instead: polling races the move. A short attack lasts a few
+/// hundred milliseconds, the same order as the round trip between sending the input and
+/// starting to watch, so the watcher can arrive after it's over — measured on SSF2, where a
+/// concurrent poll saw only `stand` in a window where the engine recorded a 7-frame attack.
+///
+/// `updateGameInput` runs on EVERY character each frame, so this is gated to one player by
+/// team (the same gate `inject_input_override` uses, and the same default) — otherwise a
+/// 4-player match would emit four interleaved streams.
+#[allow(clippy::too_many_arguments)]
+fn inject_frame_telemetry(
+    code: &mut Bytecode, g_sock: usize, out_field: usize, write_str: usize,
+    flush: usize, get_state_name: usize, str_add: usize, frame_prefix_g: usize, nl_g: usize,
+    sock_t: usize, out_t: usize, str_t: usize, enc_t: usize,
+) -> anyhow::Result<()> {
+    use hlbc::types::{RefField, RefFun, RefGlobal, RefInt};
+    let upd = require_fn(code, "updateGameInput", Some("pxf.entity.Character"))?;
+    let getteam = require_fn(code, "getTeam", Some("pxf.entity.Character"))?;
+    let team = std::env::var("PEPTIDE_INPUT_TEAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let team_c = add_int(code, team);
+    let fidx = function_index_by_findex(code, upd)
+        .ok_or_else(|| anyhow::anyhow!("Character.updateGameInput@{upd} not found"))?;
+    let f = &mut code.functions[fidx];
+    let base = add_regs(f, &[3, 3, sock_t, out_t, str_t, str_t, enc_t, 0]);
+    let (r_team, r_zero, r_sock, r_out, r_name, r_msg, r_null, r_ret) =
+        (Reg(base), Reg(base + 1), Reg(base + 2), Reg(base + 3), Reg(base + 4),
+         Reg(base + 5), Reg(base + 6), Reg(base + 7));
+    let mut ops = vec![
+        Opcode::Call1 { dst: r_team, fun: RefFun(getteam), arg0: Reg(0) },      // 0
+        Opcode::Int { dst: r_zero, ptr: RefInt(team_c) },                       // 1
+        Opcode::JEq { a: r_team, b: r_zero, offset: 1 },                        // 2 -> run
+        Opcode::JAlways { offset: 0 },                                          // 3 -> end
+        Opcode::GetGlobal { dst: r_sock, global: RefGlobal(g_sock) },           // 4
+        Opcode::JNull { reg: r_sock, offset: 0 },                               // 5 -> end
+        Opcode::Field { dst: r_out, obj: r_sock, field: RefField(out_field) },  // 6
+        Opcode::Call1 { dst: r_name, fun: RefFun(get_state_name), arg0: Reg(0) },// 7
+        Opcode::JNull { reg: r_name, offset: 0 },                               // 8 -> end
+        Opcode::GetGlobal { dst: r_msg, global: RefGlobal(frame_prefix_g) },    // 9
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_name }, // 10
+        Opcode::GetGlobal { dst: r_name, global: RefGlobal(nl_g) },             // 11
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_name }, // 12
+        Opcode::Null { dst: r_null },                                           // 13
+        Opcode::Call3 { dst: r_ret, fun: RefFun(write_str), arg0: r_out, arg1: r_msg, arg2: r_null }, // 14
+        Opcode::Call1 { dst: r_ret, fun: RefFun(flush), arg0: r_out },          // 15
+    ];
+    let end = ops.len() as i32; // 16 — falls through to the function's Ret
+    if let Opcode::JAlways { offset } = &mut ops[3] { *offset = end - 3 - 1; }
+    if let Opcode::JNull { offset, .. } = &mut ops[5] { *offset = end - 5 - 1; }
+    if let Opcode::JNull { offset, .. } = &mut ops[8] { *offset = end - 8 - 1; }
+    insert_ops_end(f, ops);
+    eprintln!("connect_edit: per-frame FRAME: telemetry hooked into Character.updateGameInput@{upd} (team {team})");
     Ok(())
 }
 
