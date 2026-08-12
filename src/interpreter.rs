@@ -468,7 +468,7 @@ pub fn parse(line: &str) -> Command {
             }
             "reset" => {
                 return Command::Eval(
-                    "p0.setXVelocity(0); p0.setYVelocity(0); p1.setXVelocity(0); p1.setYVelocity(0); \
+                    "p0.setXSpeed(0); p0.setYSpeed(0); p1.setXSpeed(0); p1.setYSpeed(0); \
                      p0.toState(CState.STAND); p1.toState(CState.STAND)".into());
             }
             "kill" => {
@@ -540,7 +540,11 @@ fn parse_scenario(rest: &[&str]) -> Command {
     if rest.len() < 2 {
         return Command::Client(USAGE.into());
     }
-    // "x,y" or "x,y,vx,vy" -> the per-player setup hscript (setX/setY [+ setXVelocity/setYVelocity]).
+    // "x,y" or "x,y,vx,vy" -> the per-player setup hscript (setX/setY [+ setXSpeed/setYSpeed]).
+    // setXSpeed/setYSpeed, NOT setXVelocity/setYVelocity: the latter do not exist on a
+    // Fraymakers character and fail with "Invalid function null". SSF2 lowers both
+    // spellings to its XSpeed/YSpeed property (vocab::SETTERS), so this spelling is the one
+    // that works on BOTH engines.
     fn body(slot: &str, who: &str) -> Result<String, String> {
         let n: Vec<&str> = slot.split(',').map(str::trim).collect();
         if n.len() != 2 && n.len() != 4 {
@@ -551,7 +555,7 @@ fn parse_scenario(rest: &[&str]) -> Command {
         }
         let mut s = format!("{who}.setX({}); {who}.setY({})", n[0], n[1]);
         if n.len() == 4 {
-            s.push_str(&format!("; {who}.setXVelocity({}); {who}.setYVelocity({})", n[2], n[3]));
+            s.push_str(&format!("; {who}.setXSpeed({}); {who}.setYSpeed({})", n[2], n[3]));
         }
         Ok(s)
     }
@@ -1164,7 +1168,7 @@ mod tests {
             "e p0.setX(300); p0.setY(400); p1.setX(360); p1.setY(400); p0.toState(CState.STAND); p1.toState(CState.STAND)\ni 16\ni 16\ni 0"
         );
         // 4-tuple adds momentum (world-space velocity).
-        assert!(wire("scenario 300,400,5,0 360,400").contains("p0.setXVelocity(5); p0.setYVelocity(0)"));
+        assert!(wire("scenario 300,400,5,0 360,400").contains("p0.setXSpeed(5); p0.setYSpeed(0)"));
         // bad shapes are client-side errors (nothing sent to the engine).
         assert!(matches!(translate("scenario 300,400"), Translated::Client(_)));         // only one player
         assert!(matches!(translate("scenario 300 360,400"), Translated::Client(_)));     // p0 not x,y
@@ -1199,7 +1203,7 @@ mod tests {
 
     #[test]
     fn reset_and_kill_are_eval_wrappers() {
-        assert!(wire("reset").contains("p0.toState(CState.STAND)") && wire("reset").contains("setXVelocity(0)"));
+        assert!(wire("reset").contains("p0.toState(CState.STAND)") && wire("reset").contains("setXSpeed(0)"));
         assert_eq!(wire("kill p1"), "e p1.setY(p1.getY() + 3000)");
         assert!(matches!(translate("kill"), Translated::Client(_)));        // missing player
         assert!(matches!(translate("kill p1;evil"), Translated::Client(_))); // injection guard
