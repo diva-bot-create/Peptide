@@ -1530,6 +1530,83 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, char_index: u
     Ok(())
 }
 
+/// Global UNCAUGHT-ERROR reporting: mirror every engine-side error onto the bridge socket
+/// as a `SCRIPTERR:` line, the same channel Fraymakers has.
+///
+/// The asymmetry this closes is not cosmetic. Fraymakers mirrors every engine error to the
+/// harness socket, which is what `tools/tests/script_error_scan.sh` reads; SSF2 had no
+/// engine-error channel at all, so the same scan had nothing to see and a converted SSF2
+/// character could throw all day in silence. `ERR:` is NOT the equivalent — that is a
+/// command REPLY ("your request failed"), not unsolicited telemetry about the engine's own
+/// code.
+///
+/// AIR exposes `loaderInfo.uncaughtErrorEvents`, and the runtime provides it whether or not
+/// the SWF ever references it (SSF2's constant pool has none of these names — we intern
+/// them). Registering there catches errors thrown anywhere the engine didn't handle them,
+/// including inside loaded character content.
+pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Result<()> {
+    let ci = abc.find_class_by_name(doc_class_local)
+        .ok_or_else(|| anyhow::anyhow!("class {doc_class_local} not found"))?;
+    let events_ns = { let s = abc.intern_string("flash.events"); abc.intern_namespace(NS_PACKAGE, s) };
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+
+    let mn_uee = q(abc, events_ns, "UncaughtErrorEvent");
+    let mn_uncaught = q(abc, pub_ns, "UNCAUGHT_ERROR");
+    let mn_loaderinfo = q(abc, pub_ns, "loaderInfo");
+    let mn_ueevents = q(abc, pub_ns, "uncaughtErrorEvents");
+    let mn_addel = q(abc, pub_ns, "addEventListener");
+    let mn_text = q(abc, pub_ns, "text");
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    let mn_h = q(abc, pub_ns, "peptideOnError");
+    let n_h = abc.intern_string("peptideOnError");
+    let s_tag = abc.intern_string("SCRIPTERR: ");
+    let s_nl = abc.intern_string("\n");
+
+    // handler(e): if (peptideSock != null) peptideSock.writeUTFBytes("SCRIPTERR: " + e.text + "\n")
+    let mut c = Code::default();
+    let l_skip = c.new_label();
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock);
+    c.op_u30(OP_PUSHSTRING, s_tag);
+    c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_text); c.op(OP_CONVERT_S); c.op(OP_ADD);
+    c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    c.place(l_skip);
+    c.op(OP_RETURNVOID);
+
+    let h = abc.add_method(MethodInfo {
+        param_types: vec![0], return_type: 0, name: n_h, flags: 0, options: vec![], param_names: vec![],
+    });
+    abc.add_body(MethodBody {
+        method: h, max_stack: 6, local_count: 3, init_scope_depth: 0, max_scope_depth: 2,
+        code: c.finish(), exceptions: vec![], traits: vec![],
+    });
+    abc.add_instance_method_trait(ci, mn_h, h);
+
+    // ctor: this.loaderInfo.uncaughtErrorEvents.addEventListener(UNCAUGHT_ERROR, this.peptideOnError)
+    let mut ic = Code::default();
+    ic.op(OP_GETLOCAL0); ic.op(OP_PUSHSCOPE);
+    ic.op(OP_GETLOCAL0); ic.op_u30(OP_GETPROPERTY, mn_loaderinfo); ic.op_u30(OP_GETPROPERTY, mn_ueevents);
+    ic.op_u30(OP_GETLEX, mn_uee); ic.op_u30(OP_GETPROPERTY, mn_uncaught);
+    ic.op(OP_GETLOCAL0); ic.op_u30(OP_GETPROPERTY, mn_h);
+    ic.op_u30_u30(OP_CALLPROPVOID, mn_addel, 2);
+    ic.op(OP_POPSCOPE);
+    let payload = ic.finish();
+    let iinit = abc.instances[ci].iinit;
+    let body_idx = abc.bodies.iter().position(|b| b.method == iinit)
+        .ok_or_else(|| anyhow::anyhow!("no ctor body"))?;
+    let body = &mut abc.bodies[body_idx];
+    prepend_code(body, &payload);
+    body.max_stack = body.max_stack.max(4);
+    body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
+    Ok(())
+}
+
 /// Timer-driven load TEST (no per-frame handler): the constructor schedules
 /// `peptideLoadKick` (build Game + queue sandbag+stage + multimode load) once via
 /// setTimeout, and `peptideLoadCheck` every 1.5s via setInterval, which writes
