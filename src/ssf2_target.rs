@@ -38,32 +38,28 @@ impl Ssf2Target {
         Ok(())
     }
 
-    /// Read one property of the node at `path`. Re-navigates first (a GET moves
-    /// the cursor onto the property). `"?"` on any error so a node that lacks the
-    /// property (e.g. `currentFrame` on a Bitmap) doesn't abort the walk.
-    fn node_prop(&self, path: &[u32], prop: &str) -> String {
-        let r = (|| -> Result<String> {
-            self.nav_node(path)?;
-            self.op(&format!("GET\t{prop}"))?;
-            self.op("READ")
-        })();
-        r.unwrap_or_else(|_| "?".into())
+    /// Every property of the node at `path`, in ONE round trip (the `NODE` verb).
+    ///
+    /// Replaces a per-property read that re-navigated from ROOT each time, because a GET
+    /// moves the cursor: ten properties at `depth + 3` round trips each is about sixty per
+    /// node, which made a stage tree effectively un-runnable (a bowserscastle walk did not
+    /// finish). Fields are `<class>|<name>|<x>|<y>|<w>|<h>|<visible>|<numChildren>|
+    /// <frame>|<total>|<label>`, with `-1` where the node isn't a container or MovieClip.
+    fn node_fields(&self, path: &[u32]) -> Vec<String> {
+        let r = (|| -> Result<String> { self.nav_node(path)?; self.op("NODE") })();
+        match r {
+            Ok(line) => line.split('|').map(|s| s.trim().to_string()).collect(),
+            Err(_) => vec!["?".to_string(); 11],
+        }
     }
 
     /// Recursive node visit: print this node's line, then its children (bounded by
     /// `max_depth` and a per-container child cap so a huge particle pool can't run away).
     fn walk_node(&self, path: &mut Vec<u32>, max_depth: u32, out: &mut String) -> Result<()> {
-        self.nav_node(path)?;
-        let class = self.op("READ").unwrap_or_else(|_| "?".into());
-        let name = self.node_prop(path, "name");
-        let x = self.node_prop(path, "x");
-        let y = self.node_prop(path, "y");
-        let w = self.node_prop(path, "width");
-        let h = self.node_prop(path, "height");
-        let vis = self.node_prop(path, "visible");
-        let frame = self.node_prop(path, "currentFrame");
-        let total = self.node_prop(path, "totalFrames");
-        let label = self.node_prop(path, "currentFrameLabel");
+        let f = self.node_fields(path);
+        let g = |i: usize| f.get(i).cloned().unwrap_or_else(|| "?".into());
+        let (class, name, x, y, w, h, vis) = (g(0), g(1), g(2), g(3), g(4), g(5), g(6));
+        let (frame, total, label) = (g(8), g(9), g(10));
         let indent = "  ".repeat(path.len());
         let idx = path.last().map(|i| format!("[{i}] ")).unwrap_or_default();
         let anim = if frame != "?" && frame != "undefined" {
@@ -71,7 +67,7 @@ impl Ssf2Target {
         } else { String::new() };
         out.push_str(&format!("{indent}{idx}{class} \"{name}\" @({x},{y}) {w}x{h} vis={vis}{anim}\n"));
         if (path.len() as u32) < max_depth {
-            let n: u32 = self.node_prop(path, "numChildren").parse().unwrap_or(0);
+            let n: u32 = g(7).parse().unwrap_or(0);
             for i in 0..n.min(48) {
                 path.push(i);
                 self.walk_node(path, max_depth, out)?;
