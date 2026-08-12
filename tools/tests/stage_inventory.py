@@ -14,9 +14,23 @@ Fraymakers <- the emitted stage package: the main entity's layers (art, collisio
               each with its animation count and frame count.
 
 Reported per object: name, plane/layer, position, and on the FM side the animation and
-frame count it became. An SSF2 object with no FM counterpart is the finding — either a
-genuine porting gap or something deliberately dropped (collision masks and scaffolding
-are NOT art; see AGENT_CONTEXT's "SSF2 stage linkage vocabulary").
+frame count it became.
+
+READ "NO COUNTERPART" CAREFULLY. It does not mean "not ported". The stage's art is
+RASTERIZED AND COMPOSITED into one sprite (STATUS "stage porting"), so a STATIC object is
+correctly present as pixels in that sprite while having no named object of its own. What
+actually matters is the ANIMATED objects: those need their own layer/entity to keep
+playing, and one baked into the composite has silently lost its animation. So a
+no-counterpart row is a QUESTION — "does this thing move?" — not a defect.
+
+Objects that are never art (collision, masks, spawn/boundary scaffolding, container clips,
+HUD chrome, hazard attackBoxes) are classified out; see AGENT_CONTEXT's "SSF2 stage linkage
+vocabulary".
+
+Observed on a 4-stage sample: gaps cluster hard by PLANE — 6 on `cambg` (kingdom1's
+clouds / troopas / plant, i.e. the parallax elements) and 6 on `terrain`. A whole plane
+going unrepresented is a much stronger signal than any single object, and is the thing to
+chase first.
 
 Usage:
   tools/tests/stage_inventory.py <stage>            # e.g. bowserscastle
@@ -35,7 +49,11 @@ NON_ART = re.compile(
     r"warningbounds|warning|itemgen|mask|light_source|smashball|"
     # wrappers and hazard collision, not art: `stageMC`/`stance` are container clips and
     # `attackBox*` becomes the hazard's HITBOX, not a drawn object.
-    r"^stagemc$|^stance$|attackbox",
+    r"^stagemc$|^stance$|attackbox|hitbox|"
+    # HUD furniture is chrome, not stage art; `weightPlat*`-style moving platforms are
+    # kept as static COLLISION (see STATUS "auto-detected moving platforms"), not as a
+    # drawn object, so their absence from the art inventory is correct.
+    r"hud|weightplat",
     re.I)
 
 
