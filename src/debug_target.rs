@@ -193,10 +193,14 @@ pub fn await_live(
 /// inline, while `bridge::serve` hands its socket reader to a printing thread and has
 /// to pick replies off a channel. Only the sampling differs; the decision about when
 /// an animation is done must not.
+/// How long the clock may sit on the same frame before the watch calls it stalled.
+/// Generous enough to cover a slow frame on either engine (SSF2 33ms, Fraymakers 16ms).
+const STALL_AFTER: Duration = Duration::from_millis(400);
+
 pub fn watch_animation(
     mut sample: impl FnMut() -> Result<Option<AnimState>>,
     budget_frames: u32,
-    stall_polls: u32,
+    _stall_polls: u32,
 ) -> Result<AnimWatch> {
     let Some(first) = sample()? else {
         return Ok(AnimWatch { outcome: AnimOutcome::NoSample, last: None, frames_seen: 0 });
@@ -204,11 +208,19 @@ pub fn watch_animation(
     let start_anim = first.anim.clone();
     let mut prev = first;
     let mut frames_seen = 0u32;
-    let mut same_frame = 0u32;
+    // "Stalled" is measured as TIME SINCE THE CLOCK LAST MOVED, not as a count of
+    // identical samples. A poll count is the wrong unit: sampling faster than the engine
+    // renders naturally returns the same frame several times in a row, so a fixed count
+    // reports a perfectly healthy animation as stalled — and how often that happens
+    // depends on the sampler's speed, so the same code silently behaved differently on
+    // the two engines (Fraymakers polls at roughly one sample per frame and squeaked by;
+    // SSF2's evals are sub-millisecond against a 33ms frame, so it tripped instantly and
+    // every SSF2 watch came back Stalled with frames_seen=0).
+    let mut last_advance = Instant::now();
     let mut polls = 0u32;
-    // A poll costs a round trip, so the budget is counted in polls too — an engine that
-    // advances several frames between samples still terminates.
-    let max_polls = budget_frames.max(1) * 2;
+    // Backstop only. A fast sampler takes many polls per rendered frame, so this can't be
+    // budget*2 any more — it has to be loose enough not to cut a healthy animation short.
+    let max_polls = budget_frames.max(1) * 200;
     loop {
         polls += 1;
         if polls > max_polls {
@@ -225,13 +237,10 @@ pub fn watch_animation(
         }
         if cur.frame > prev.frame {
             frames_seen += cur.frame.saturating_sub(prev.frame).unsigned_abs();
-            same_frame = 0;
-        } else {
-            same_frame += 1;
-            if same_frame >= stall_polls.max(1) {
-                let outcome = if cur.at_end() { AnimOutcome::Completed } else { AnimOutcome::Stalled };
-                return Ok(AnimWatch { outcome, last: Some(cur), frames_seen });
-            }
+            last_advance = Instant::now();
+        } else if last_advance.elapsed() >= STALL_AFTER {
+            let outcome = if cur.at_end() { AnimOutcome::Completed } else { AnimOutcome::Stalled };
+            return Ok(AnimWatch { outcome, last: Some(cur), frames_seen });
         }
         if cur.at_end() {
             return Ok(AnimWatch { outcome: AnimOutcome::Completed, last: Some(cur), frames_seen });
