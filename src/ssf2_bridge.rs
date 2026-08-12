@@ -23,6 +23,16 @@ use std::time::{Duration, Instant};
 /// Path for the per-frame jump-probe trajectory CSV. Computed at call time so it
 /// resolves to the platform temp dir on both macOS (`/tmp/`) and Windows (`%TEMP%`).
 /// Uses forward slashes so Flash's `FileStream` accepts the path on Windows too.
+/// Where the injected per-frame animation recorder writes. The host truncates this to
+/// open a recording window and reads it to close one, so no engine-side gate (and no
+/// reflection, which can't reach the injected slots) is involved.
+pub fn frame_trace_path() -> String {
+    std::env::temp_dir()
+        .join("peptide_ssf2_frames.csv")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 pub fn traj_path() -> String {
     std::env::temp_dir()
         .join("peptide_ssf2_traj.csv")

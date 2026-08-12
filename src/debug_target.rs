@@ -68,6 +68,23 @@ pub trait DebugTarget {
         Ok(non_empty(strip_eval(self.eval(&format!("animFeed({idx})"))?))
             .and_then(|s| AnimState::parse(&s)))
     }
+
+    /// Arm/disarm the engine's own per-frame recorder, clearing its buffer.
+    ///
+    /// Default: declare the gap. Fraymakers doesn't need one — it PUSHES per-frame `ANIM:`
+    /// telemetry over its socket and its hscript eval is fast enough that `await` can poll
+    /// the clock directly. SSF2 has neither, so it implements this with injected bytecode.
+    fn record(&mut self, _on: bool) -> Result<String> {
+        Ok("record: this engine streams per-frame telemetry already — use `await` \
+            (no host-side recorder needed)".into())
+    }
+
+    /// Read back the recorded frame history and stop recording. See [`Self::record`].
+    fn frame_trace(&mut self) -> Result<String> {
+        Ok("trace: this engine has no host-side frame buffer — its per-frame ANIM \
+            telemetry is already in the session log, and `await` reports frame counts"
+            .into())
+    }
 }
 
 /// One sample of a character's animation clock: which animation, how far into it, how
@@ -272,6 +289,8 @@ pub fn run_command(target: &mut dyn DebugTarget, line: &str) -> Result<Option<St
                 None => format!("MATCHREADY:none (p{idx} never became readable in {tries} tries)"),
             })
         }
+        Command::Record { on } => Some(target.record(on)?),
+        Command::Trace => Some(target.frame_trace()?),
         Command::Console => Some(target.console()?),
         Command::Tree(depth) => Some(target.tree(depth)?),
         Command::AddCharacter => Some(target.add_character()?),
