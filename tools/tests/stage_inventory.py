@@ -131,6 +131,41 @@ def fm_objects(stage, outdir):
     return objs
 
 
+# SSF2 framework / Flash-generated classes are not stage content. `*_fla.*` are timeline
+# symbols the placement tree already covers; the rest are engine plumbing.
+FRAMEWORK = re.compile(r"^(SSF2|IState|EState|FrameTimer|ItemSettings|CState|PState|TState|"
+                       r"ControlBits|Main|Vec2|Point|Rect)", re.I)
+
+
+def actor_classes(stage):
+    """Hand-written AS3 classes in the stage file — its behavioural objects.
+
+    This is the blind spot the placement tree cannot cover: a weather system or spawned
+    actor is a CLASS, not a placed multi-frame clip, so it reads as 1-frame static art (or
+    doesn't appear at all). PORTING_STAGES phase 2 calls for exactly this inventory.
+    """
+    src = os.path.join(SSFS, "stages", f"{stage}.ssf")
+    r = subprocess.run(["cargo", "run", "-q", "-p", "ssf2_converter", "--features", "dev-tools",
+                        "--bin", "ssf2_objgraph", "--", src, "scripts"],
+                       capture_output=True, text=True, cwd=ROOT)
+    out = []
+    for m in re.finditer(r"^  class  (\S+)", r.stdout + r.stderr, re.M):
+        c = m.group(1)
+        if "_fla." in c or FRAMEWORK.match(c) or c.lower() == stage.lower():
+            continue
+        if c.lower() == f"{stage}_bg".lower():
+            continue
+        # Hand-written ACTORS are PascalCase (BowsersCastleLava, EmberWeather, Thwomp).
+        # snake_case entries (global_wind_wave, podoboo_jump, stage_bowserscastle) are
+        # exported LIBRARY SYMBOLS — timeline content the placement tree already accounts
+        # for, not behaviour classes. Listing them here reports the same object twice and
+        # buries the one finding that matters.
+        if not re.match(r"^[A-Z][A-Za-z0-9]*$", c):
+            continue
+        out.append(c)
+    return sorted(set(out))
+
+
 def norm(s):
     """Loose key for pairing: the emitted names carry the stage id and separators vary."""
     return re.sub(r"[^a-z0-9]", "", s.lower())
@@ -151,10 +186,17 @@ if __name__ == "__main__":
     sid = norm(stage + "ssf2")
 
     # index the FM side by normalized name with the stage id stripped
+    # Index by BOTH the layer name and the animation name: a main-entity object can be
+    # identified by either (the platform sprites are animations named platformSprite0..3
+    # whose layers are generically named), and indexing only one silently loses the match.
     fm_index = collections.defaultdict(list)
     for o in fm:
-        k = norm(o["name"]).replace(sid, "").replace(norm(stage), "")
-        fm_index[k].append(o)
+        for raw in {o["name"], o.get("anim", "")}:
+            if not raw:
+                continue
+            k = norm(raw).replace(sid, "").replace(norm(stage), "")
+            if k:
+                fm_index[k].append(o)
 
     named = [o for o in ssf2 if o["name"]]
     # one row per distinct SSF2 object name (the tree repeats a clip per frame placement)
@@ -193,6 +235,26 @@ if __name__ == "__main__":
             skipped += 1  # 1 frame: static art, correctly baked into the stage sprite
     print("-" * 112)
     print(f"ported={ported}  non-art or static-baked={skipped}  LOST ANIMATION={gaps}\n")
+
+    # ── behavioural classes (the placement tree's blind spot) ─────────────────
+    acts = actor_classes(stage)
+    if acts:
+        print(f"AS3 behaviour classes ({len(acts)}):")
+        act_missing = []
+        for c in acts:
+            k = norm(c)
+            hit = [h for kk, v in fm_index.items() if kk and (k in kk or kk in k) for h in v]
+            # a *Platform class is emitted as the platformSprite* family, not by name
+            if not hit and k.endswith("platform"):
+                hit = [h for kk, v in fm_index.items() if "platformsprite" in kk for h in v]
+            if hit:
+                print(f"  {c[:38]:40}-> {hit[0]['where']}:{hit[0]['name'][:34]}")
+            else:
+                act_missing.append(c)
+        for c in act_missing:
+            print(f"  {c[:38]:40}NO COUNTERPART")
+        print(f"  ({len(acts) - len(act_missing)} ported, {len(act_missing)} unported)\n")
+        gaps += len(act_missing)
     if missing:
         print("ANIMATED SSF2 objects with no emitted counterpart (baked in, so they no longer move):")
         for o in sorted(missing, key=lambda o: -o["frames"]):
