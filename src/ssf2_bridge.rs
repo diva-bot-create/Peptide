@@ -37,6 +37,13 @@ static FRAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new())
 /// request/response with nothing engine-initiated. The engine pushes a label every frame
 /// now, so a change is simply the previous line's label differing from this one.
 static ANIM_CHANGES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Engine-side errors pushed as `SCRIPTERR:` lines (see abc_inject::inject_error_reporter).
+static ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Drain the engine errors seen since the last call.
+pub fn errors_take() -> Vec<String> {
+    std::mem::take(&mut *ERRORS.lock().unwrap_or_else(|e| e.into_inner()))
+}
 static LAST_LABEL: Mutex<String> = Mutex::new(String::new());
 
 /// Drain the animation transitions seen since the last call.
@@ -47,6 +54,13 @@ pub fn anim_changes_take() -> Vec<String> {
 /// Route one engine-pushed line. Returns true if it was consumed as telemetry (and so must
 /// not be treated as a command response).
 fn route_pushed(line: &str) -> bool {
+    // Engine errors are unsolicited telemetry, exactly like Fraymakers' — they must not be
+    // mistaken for a command reply, and they belong in the log where the script-error scan
+    // reads them.
+    if line.starts_with("SCRIPTERR:") {
+        ERRORS.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+        return true;
+    }
     if let Some(rest) = line.strip_prefix("FRAME:") {
         // label is the first field; a change is an animation transition
         let label = rest.split('|').next().unwrap_or("").trim().to_string();
@@ -417,6 +431,7 @@ pub fn session(args: &[String]) -> Result<()> {
         for label in anim_changes_take() {
             slog(&format!("ANIM:{}", label.to_uppercase()));
         }
+        for e in errors_take() { slog(&e); }
         false
     };
 
