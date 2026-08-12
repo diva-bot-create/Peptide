@@ -610,12 +610,11 @@ impl DebugTarget for Ssf2Target {
     /// host decides what counts as a window, which means no engine-side gate and no
     /// engine round trip at all. `on: false` is a no-op — there's nothing to disarm.
     fn record(&mut self, on: bool) -> Result<String> {
-        let p = crate::ssf2_bridge::frame_trace_path();
         if on {
-            std::fs::write(&p, b"")?;
-            Ok("record: window opened (engine-side per-frame recorder)".into())
+            crate::ssf2_bridge::frames_clear();
+            Ok("record: window opened (engine pushes FRAME: telemetry)".into())
         } else {
-            Ok("record: the SSF2 recorder always runs — `trace` reads the window".into())
+            Ok("record: the SSF2 recorder always pushes — `trace` reads the window".into())
         }
     }
 
@@ -626,9 +625,12 @@ impl DebugTarget for Ssf2Target {
     /// where polling for the same thing sampled about once per 14 frames and reported
     /// `frames_seen=0`. Reading is a file read, not an engine round trip.
     fn frame_trace(&mut self) -> Result<String> {
-        let p = crate::ssf2_bridge::frame_trace_path();
-        let body = std::fs::read_to_string(&p).unwrap_or_default();
-        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        // A no-op round trip first: the engine's pushes only reach the host when the
+        // response reader is draining the socket, so ask it something to flush whatever
+        // has queued up since the last command.
+        let _ = self.eval_quiet("match.characterCount()");
+        let pushed = crate::ssf2_bridge::frames_take();
+        let lines: Vec<&str> = pushed.iter().map(|s| s.as_str()).filter(|l| !l.trim().is_empty()).collect();
         // collapse to one record per animation: which label, how many frames it held, and
         // where the character was when it ended. That's the comparable unit against
         // Fraymakers, not the raw per-frame dump.
