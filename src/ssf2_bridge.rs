@@ -64,9 +64,13 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// it goes away). All `request()`s share it; the Mutex also serializes them, so the
 /// matchStatus poll and a console command can't interleave on the one socket.
 struct SockConn {
-    reader: BufReader<TcpStream>,
     writer: TcpStream,
 }
+
+/// Command replies, forwarded by the reader thread. Requests are serialized by the
+/// `CONN` lock (one in flight at a time), so a single channel is enough — `request`
+/// drains it until it sees its own seq.
+static REPLIES: Mutex<Option<std::sync::mpsc::Receiver<String>>> = Mutex::new(None);
 static CONN: Mutex<Option<SockConn>> = Mutex::new(None);
 
 /// Bind the loopback listener BEFORE launching SSF2 (the engine connects from its
@@ -87,8 +91,28 @@ pub fn accept_engine(listener: &TcpListener, secs: u64) -> Result<()> {
                 stream.set_nonblocking(false)?;
                 let _ = stream.set_nodelay(true);
                 let writer = stream.try_clone()?;
-                *CONN.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(SockConn { reader: BufReader::new(stream), writer });
+                // A DEDICATED READER THREAD, the same shape as `bridge.rs`'s Fraymakers
+                // pump. Without it the socket is only drained while a command is in
+                // flight, so engine-pushed telemetry would sit in the kernel buffer until
+                // someone happened to ask something — and the animation feed had to be a
+                // 300ms poll instead of coming off the stream.
+                let (tx, rx) = std::sync::mpsc::channel::<String>();
+                *REPLIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        match r.read_line(&mut line) {
+                            Ok(0) | Err(_) => break, // EOF / error — engine gone
+                            Ok(_) => {
+                                let l = line.trim_end_matches(['\r', '\n']);
+                                // route engine-pushed telemetry; everything else is a reply
+                                if !route_pushed(l) && tx.send(l.to_string()).is_err() { break; }
+                            }
+                        }
+                    }
+                });
+                *CONN.lock().unwrap_or_else(|e| e.into_inner()) = Some(SockConn { writer });
                 return Ok(());
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -151,31 +175,24 @@ pub fn request(command: &str, timeout: Duration) -> Result<String> {
         bail!("SSF2 write failed (connection gone): {e}");
     }
 
-    // read reply lines until one matches our seq (or timeout / EOF).
-    let _ = conn.reader.get_ref().set_read_timeout(Some(timeout));
+    // Take replies off the reader thread until one matches our seq. Telemetry never
+    // reaches this channel — the thread routes it — so anything non-matching here is a
+    // stale reply from a timed-out earlier request.
     let prefix = format!("{seq} ");
     let deadline = Instant::now() + timeout;
+    let rx_guard = REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+    let rx = rx_guard.as_ref().ok_or_else(|| anyhow::anyhow!("no SSF2 reader"))?;
     loop {
-        let mut line = String::new();
-        match conn.reader.read_line(&mut line) {
-            Ok(0) => { *guard = None; bail!("SSF2 connection closed"); } // EOF — engine gone
-            Ok(_) => {
-                if let Some(rest) = line.trim_end_matches(['\r', '\n']).strip_prefix(&prefix) {
-                    return Ok(rest.to_string());
-                }
-                // Not our seq. It may be engine-PUSHED telemetry (the recorder's FRAME:
-                // lines), which is routed rather than dropped — the same job the
-                // Fraymakers stream pump does by prefix. Anything else is a stale reply.
-                route_pushed(line.trim_end_matches(['\r', '\n']));
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { bail!("no response for {command:?} within {timeout:?}"); }
+        match rx.recv_timeout(left) {
+            Ok(line) => {
+                if let Some(rest) = line.strip_prefix(&prefix) { return Ok(rest.to_string()); }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 bail!("no response for {command:?} within {timeout:?}");
             }
-            Err(e) => { *guard = None; bail!("SSF2 read failed (connection gone): {e}"); }
-        }
-        if Instant::now() >= deadline {
-            bail!("no response for {command:?} within {timeout:?}");
+            Err(_) => { *guard = None; bail!("SSF2 connection closed"); }
         }
     }
 }
@@ -231,30 +248,18 @@ fn probe_responsive() -> bool {
 /// Reads the persistent connection until a bare `READY` line arrives (accumulating across
 /// read timeouts so a split line isn't dropped) or `total` elapses. Returns true on READY.
 pub fn wait_for_ready(total: Duration) -> bool {
-    let mut guard = CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = match guard.as_mut() {
-        Some(c) => c,
-        None => return false,
-    };
-    let _ = conn.reader.get_ref().set_read_timeout(Some(Duration::from_millis(500)));
+    // READY arrives on the reader thread's channel like any other unsolicited line, so
+    // this drains replies looking for it rather than owning the socket itself.
     let deadline = Instant::now() + total;
-    let mut line = String::new();
+    let guard = REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(rx) = guard.as_ref() else { return false };
     loop {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        match conn.reader.read_line(&mut line) {
-            Ok(0) => return false, // EOF — engine gone
-            Ok(_) => {
-                if line.trim_end_matches(['\r', '\n']) == "READY" {
-                    return true;
-                }
-                line.clear(); // some other unsolicited line — discard, await READY
-            }
-            // timeout: any partial bytes stay in `line` to be completed next read
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => return false, // connection gone
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { return false; }
+        match rx.recv_timeout(left) {
+            Ok(line) => { if line.trim() == "READY" { return true; } }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
+            Err(_) => return false, // reader thread gone
         }
     }
 }
