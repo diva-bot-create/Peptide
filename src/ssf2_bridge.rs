@@ -32,10 +32,31 @@ use std::time::{Duration, Instant};
 /// non-matching lines and are routed here instead of dropped.
 static FRAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// Animation-label TRANSITIONS derived from the pushed frame stream. The session used to
+/// get this by polling the engine every 300ms, which existed only because the bridge was
+/// request/response with nothing engine-initiated. The engine pushes a label every frame
+/// now, so a change is simply the previous line's label differing from this one.
+static ANIM_CHANGES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static LAST_LABEL: Mutex<String> = Mutex::new(String::new());
+
+/// Drain the animation transitions seen since the last call.
+pub fn anim_changes_take() -> Vec<String> {
+    std::mem::take(&mut *ANIM_CHANGES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Route one engine-pushed line. Returns true if it was consumed as telemetry (and so must
 /// not be treated as a command response).
 fn route_pushed(line: &str) -> bool {
     if let Some(rest) = line.strip_prefix("FRAME:") {
+        // label is the first field; a change is an animation transition
+        let label = rest.split('|').next().unwrap_or("").trim().to_string();
+        if !label.is_empty() {
+            let mut last = LAST_LABEL.lock().unwrap_or_else(|e| e.into_inner());
+            if *last != label {
+                *last = label.clone();
+                ANIM_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).push(label);
+            }
+        }
         let mut f = FRAMES.lock().unwrap();
         // Bounded: a session left recording must not grow without limit. 20k frames is
         // ~11 minutes of SSF2 at 30fps, far more than any single measurement window.
@@ -386,27 +407,15 @@ pub fn session(args: &[String]) -> Result<()> {
         }
     }
 
-    // ANIM state tracking, parity with the Fraymakers session: FM's engine PUSHES
-    // per-frame ANIM telemetry over its socket; SSF2's bridge is synchronous RPC
-    // (nothing engine-initiated), so poll player 0's animation from the same
-    // single-writer loop the commands run on and log a deduped `ANIM:` line on
-    // every change. A failed read (no match yet, mid-load) backs the poll off so
-    // boot/load never stalls command dispatch.
-    let mut last_anim = String::new();
-    let mut next_poll = std::time::Instant::now();
+    // ANIM state tracking, now genuinely the same shape as the Fraymakers session: the
+    // engine PUSHES a label every frame and the reader thread routes it, so a transition is
+    // just consecutive labels differing. This replaced a 300ms reflection poll that existed
+    // only because the bridge used to be request/response with nothing engine-initiated —
+    // the poll both cost a round trip and could miss a state that came and went between
+    // samples.
     let anim_tick = move || {
-        let now = std::time::Instant::now();
-        if now < next_poll { return false; }
-        let target = crate::ssf2_target::Ssf2Target::new();
-        match target.current_anim(0) {
-            Some(anim) => {
-                next_poll = now + Duration::from_millis(300);
-                if anim != last_anim {
-                    last_anim = anim.clone();
-                    slog(&format!("ANIM:{}", anim.to_uppercase()));
-                }
-            }
-            None => { next_poll = now + Duration::from_secs(3); }
+        for label in anim_changes_take() {
+            slog(&format!("ANIM:{}", label.to_uppercase()));
         }
         false
     };
