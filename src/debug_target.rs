@@ -438,4 +438,10 @@ impl DebugTarget for FraymakersTarget {
     fn add_character(&mut self) -> Result<String> { self.run(&Command::AddCharacter) }
     fn exit(&mut self) -> Result<()> { let _ = self.run(&Command::Exit)?; Ok(()) }
     fn load(&mut self) -> Result<String> { self.run(&Command::Load) }
+    // Fraymakers DOES walk its live object tree (the `w` verb). Without this it inherited
+    // the trait default, which declares the feature SSF2-only — so `tree` answered
+    // "not supported" through the session/GUI path (run_command -> target.tree) while the
+    // same command worked through the serve path (command_to_wire -> "w"). Two drivers,
+    // opposite answers, same command.
+    fn tree(&mut self, depth: u32) -> Result<String> { self.run(&Command::Tree(depth)) }
 }
