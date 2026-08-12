@@ -27,10 +27,16 @@ Objects that are never art (collision, masks, spawn/boundary scaffolding, contai
 HUD chrome, hazard attackBoxes) are classified out; see AGENT_CONTEXT's "SSF2 stage linkage
 vocabulary".
 
-Observed on a 4-stage sample: gaps cluster hard by PLANE — 6 on `cambg` (kingdom1's
-clouds / troopas / plant, i.e. the parallax elements) and 6 on `terrain`. A whole plane
-going unrepresented is a much stronger signal than any single object, and is the thing to
-chase first.
+BLIND SPOT, and it is a real one: this only sees TIMELINE animation, i.e. a clip with more
+than one frame. An object animated by AS3 (weather systems, spawned actors) is a 1-frame
+clip and reads here as correctly-baked static art. bowserscastle's `bowsers_embers_bg` is
+exactly that — 1 frame, driven by an EmberWeather class, and a documented unported gap that
+this check cannot see. The actor/class axis is PORTING_STAGES phase 2, not this inventory;
+the two are complementary and neither alone is a clean bill of health.
+
+Observed on a 4-stage sample: kingdom1 loses 4 animations, all on the `cambg` parallax
+plane (clouds 500 frames, bouncy 360, lefttroopa/righttroopa 263 each). bowserscastle,
+casinonightzone and battlefield lose none.
 
 Usage:
   tools/tests/stage_inventory.py <stage>            # e.g. bowserscastle
@@ -65,15 +71,16 @@ def ssf2_objects(stage, include_unnamed=False):
                        capture_output=True, text=True, env=env)
     out = []
     for m in re.finditer(
-            r'^(\s*)d(\d+) (\S+) inst="([^"]*)" sym="([^"]*)" plane="([^"]*)" @\((-?\d+),(-?\d+)\)',
+            r'^(\s*)d(\d+) (\S+) inst="([^"]*)" sym="([^"]*)" plane="([^"]*)" '
+            r'@\((-?\d+),(-?\d+)\) frames=(\d+)',
             r.stderr + r.stdout, re.M):
-        indent, depth, kind, inst, sym, plane, x, y = m.groups()
+        indent, depth, kind, inst, sym, plane, x, y, frames = m.groups()
         name = inst or sym
         if not name and not include_unnamed:
             continue
         out.append({"depth": int(depth), "kind": kind, "name": name, "inst": inst,
                     "sym": sym, "plane": plane, "x": int(x), "y": int(y),
-                    "nest": len(indent) // 2})
+                    "frames": int(frames), "nest": len(indent) // 2})
     return out
 
 
@@ -168,13 +175,17 @@ if __name__ == "__main__":
             print(f"{o['name'][:33]:34}{o['plane'][:11]:12}{pos:>13}  ->  {tag:38}{h['frames']:>7}")
         elif NON_ART.search(o["name"]):
             skipped += 1   # collision geometry / scaffolding: never art, correctly absent
-        else:
+        elif o["frames"] > 1:
+            # ANIMATED and not emitted as its own object: baked into the composite sprite,
+            # so it renders but no longer moves. This is the actual defect.
             gaps += 1
             missing.append(o)
+        else:
+            skipped += 1  # 1 frame: static art, correctly baked into the stage sprite
     print("-" * 112)
-    print(f"ported={ported}  non-art (correctly absent)={skipped}  NO COUNTERPART={gaps}\n")
+    print(f"ported={ported}  non-art or static-baked={skipped}  LOST ANIMATION={gaps}\n")
     if missing:
-        print("SSF2 objects with no emitted counterpart:")
-        for o in missing:
-            print(f"  {o['name'][:40]:42}plane={o['plane'] or '?':12}@({o['x']},{o['y']})  {o['kind']}")
+        print("ANIMATED SSF2 objects with no emitted counterpart (baked in, so they no longer move):")
+        for o in sorted(missing, key=lambda o: -o["frames"]):
+            print(f"  {o['name'][:38]:40}plane={o['plane'] or '?':10}frames={o['frames']:>5}  @({o['x']},{o['y']})")
     sys.exit(1 if gaps else 0)
