@@ -93,7 +93,11 @@ def entity_active(char, outdir):
             if not l or l.get("type") != "COLLISION_BOX":
                 continue
             meta = l.get("pluginMetadata", {}).get("com.fraymakers.FraymakersMetadata", {})
-            if meta.get("collisionBoxType") != "HIT_BOX":
+            # GRAB_BOX counts too. SSF2 classifies a grab's box as a hitbox, and the
+            # converter re-types it to Fraymakers' GRAB_BOX — so counting only HIT_BOX
+            # reported "grab has no hitbox" for 44 of 45 characters when every one of them
+            # was converted correctly (mario: 1 source frame -> grabbox0 active 2 frames).
+            if meta.get("collisionBoxType") not in ("HIT_BOX", "GRAB_BOX"):
                 continue
             for kid in l.get("keyframes", []):
                 k = kfs.get(kid, {})
