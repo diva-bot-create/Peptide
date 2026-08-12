@@ -367,6 +367,13 @@ pub enum Command {
     /// `spawn`-acknowledged. Replaces "sleep a few seconds after spawn", which loses
     /// the first observation when the engine is slow and wastes the wait when it isn't.
     AwaitMatch { idx: usize, tries: u32 },
+    /// One-shot readout of every player that actually EXISTS.
+    ///
+    /// Was a fixed eval over p0 AND p1, which reads a match with one player as four
+    /// garbage fields (SSF2 rendered them as `[object Character]`) and, once a missing
+    /// member became an error, failed outright. Enumerating instead means the readout is
+    /// correct for 1-4 players on both engines.
+    Info,
     /// Arm (or disarm) the engine's own per-frame recorder, clearing its buffer.
     Record { on: bool },
     /// Read back the recorded frame history and stop recording.
@@ -461,11 +468,7 @@ pub fn parse(line: &str) -> Command {
                 }
                 return Command::Eval(format!("{player}.damage._damage = {val}"));
             }
-            "info" => {
-                return Command::Eval(
-                    "[p0.getX(), p0.getStateName(), p0.damage._damage, p0.getTeam(), \
-                     p1.getX(), p1.getStateName(), p1.damage._damage, p1.getTeam()]".into());
-            }
+            "info" => return Command::Info,
             "reset" => {
                 return Command::Eval(
                     "p0.setXSpeed(0); p0.setYSpeed(0); p1.setXSpeed(0); p1.setYSpeed(0); \
@@ -649,6 +652,8 @@ pub fn command_to_wire(cmd: &Command) -> Translated {
         // `await` is a HOST-side polling loop over the engine's frame counter, not a wire
         // verb — there is nothing to send. It's executed by `run_command`, which owns the
         // loop; reaching here means a caller translated it to wire by mistake.
+        Command::Info => Translated::Client(
+            "info is executed host-side (run_command), not sent to the engine\n".into()),
         Command::Await { .. } | Command::AwaitMatch { .. }
         | Command::Record { .. } | Command::Trace => Translated::Client(
             "await/awaitmatch/record/trace are executed host-side (run_command), not sent to the engine\n".into()),
@@ -1194,11 +1199,14 @@ mod tests {
     }
 
     #[test]
-    fn dmg_and_info_are_eval_wrappers() {
+    fn dmg_is_an_eval_wrapper_and_info_is_host_side() {
         assert_eq!(wire("dmg p1 80"), "e p1.damage._damage = 80");
-        assert!(wire("info").starts_with("e [p0.getX(), p0.getStateName()"));
         assert!(matches!(translate("dmg p1"), Translated::Client(_)));       // missing value
         assert!(matches!(translate("dmg p1 lots"), Translated::Client(_)));  // non-numeric
+        // `info` enumerates the players that exist, so it is computed host-side rather
+        // than sent as one fixed eval over p0 AND p1 (which misreports a 1-player match).
+        assert!(matches!(parse("info"), Command::Info));
+        assert!(matches!(translate("info"), Translated::Client(_)));
     }
 
     #[test]
