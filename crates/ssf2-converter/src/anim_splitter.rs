@@ -663,6 +663,19 @@ pub fn split_animations(
         }
     }
 
+    // debug (`PEPTIDE_DUMP_ANIM_SPLITS`): the EXACT source->Fraymakers mapping, so a
+    // timing check can pair them instead of guessing from name suffixes. `loop` marks a
+    // split whose tail cycles — its emitted length is a cycle, not added duration, so it
+    // must not be summed into a family total when comparing against the source.
+    if std::env::var("PEPTIDE_DUMP_ANIM_SPLITS").is_ok() {
+        for a in &out {
+            let end = if a.end_frame == u16::MAX { "end".to_string() } else { a.end_frame.to_string() };
+            eprintln!("[anim-split] {} <- {} [{}..{}){}{}",
+                a.fm_name, a.source_anim, a.start_frame, end,
+                if a.loop_tail { " loop" } else { "" },
+                if a.append_head_frames > 0 { format!(" +head{}", a.append_head_frames) } else { String::new() });
+        }
+    }
     out
 }
 
