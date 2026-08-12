@@ -63,17 +63,27 @@ NON_ART = re.compile(
     re.I)
 
 
-def ssf2_objects(stage, include_unnamed=False):
-    """Every placed instance from the SSF2 placement tree."""
+def convert_once(stage, outdir):
+    """ONE converter run that both emits the package and dumps the placement tree.
+
+    The first version ran the converter twice per stage (once with --info for the tree,
+    once with --out to emit), which doubled a 110-stage sweep for nothing.
+    """
     src = os.path.join(SSFS, "stages", f"{stage}.ssf")
     env = dict(os.environ, PEPTIDE_STAGE_TREE="1")
-    r = subprocess.run([BIN, "ssf2", "stage", src, "--info"],
+    r = subprocess.run([BIN, "ssf2", "stage", src, "--out", outdir],
                        capture_output=True, text=True, env=env)
+    return r.stderr + r.stdout
+
+
+def ssf2_objects(text, include_unnamed=False):
+    """Every placed instance from the SSF2 placement tree."""
+    r = None
     out = []
     for m in re.finditer(
             r'^(\s*)d(\d+) (\S+) inst="([^"]*)" sym="([^"]*)" plane="([^"]*)" '
             r'@\((-?\d+),(-?\d+)\) frames=(\d+)',
-            r.stderr + r.stdout, re.M):
+            text, re.M):
         indent, depth, kind, inst, sym, plane, x, y, frames = m.groups()
         name = inst or sym
         if not name and not include_unnamed:
@@ -86,9 +96,6 @@ def ssf2_objects(stage, include_unnamed=False):
 
 def fm_objects(stage, outdir):
     """Every emitted Fraymakers object: main-entity layers + separate entities."""
-    src = os.path.join(SSFS, "stages", f"{stage}.ssf")
-    subprocess.run([BIN, "ssf2", "stage", src, "--out", outdir],
-                   capture_output=True, text=True)
     sid = f"{stage}ssf2"
     base = os.path.join(outdir, sid, "library", "entities")
     objs = []
@@ -137,8 +144,10 @@ if __name__ == "__main__":
     stage = args[0]
     include_unnamed = "--all" in sys.argv
 
-    ssf2 = ssf2_objects(stage, include_unnamed)
-    fm = fm_objects(stage, os.path.join(ROOT, "build", "stage_inventory"))
+    outdir = os.path.join(ROOT, "build", "stage_inventory")
+    text = convert_once(stage, outdir)
+    ssf2 = ssf2_objects(text, include_unnamed)
+    fm = fm_objects(stage, outdir)
     sid = norm(stage + "ssf2")
 
     # index the FM side by normalized name with the stage id stripped
