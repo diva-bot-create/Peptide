@@ -837,17 +837,6 @@ impl Ssf2Target {
         Ok(format!("{anim}|{frame}|-1|{x}|{y}|?"))
     }
 
-    /// A character's current animation name, read live (None when there's no
-    /// match or the read fails). The Fraymakers session gets per-frame `ANIM:`
-    /// telemetry PUSHED by the engine; SSF2's bridge is synchronous RPC with
-    /// nothing engine-initiated, so the session POLLS this instead to surface
-    /// the same state-change feed in the log and overlay.
-    pub fn current_anim(&self, idx: usize) -> Option<String> {
-        let sane = |s: String| if s == "null" || s == "undefined" || s.is_empty() { None } else { Some(s) };
-        self.eval_quiet(&format!("match.getCharacter({idx}).CurrentAnimation.Name"))
-            .ok().and_then(sane)
-    }
-
     /// Like `eval`, but never recurses into the commands.hsx interceptor and is
     /// used only for the small reads `match_status` composes. (Plain navigation;
     /// reflection errors surface as `Err` so the caller can substitute a sentinel.)
