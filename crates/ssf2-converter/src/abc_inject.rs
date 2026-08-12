@@ -49,6 +49,11 @@ const OP_PUSHTRUE: u8 = 0x26;
 const OP_NEWARRAY: u8 = 0x56;
 const OP_NEWOBJECT: u8 = 0x55;
 const OP_PUSHSHORT: u8 = 0x25;
+/// `istypelate`: pops (value, type) and pushes whether value is an instance of type. Used
+/// to guard MovieClip-only / container-only properties in the NODE verb — reading
+/// `currentFrame` off a Bitmap throws (display classes are sealed), which would abort the
+/// whole command through the dispatcher's try and answer "ERR:" for an otherwise fine node.
+const OP_ISTYPELATE: u8 = 0xB3;
 
 // AVM2 namespace kinds
 const NS_PACKAGE: u8 = 0x16; // CONSTANT_PackageNamespace
@@ -653,6 +658,28 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
     let s_v_call = abc.intern_string("CALL");
     let s_v_call1 = abc.intern_string("CALL1");
     let s_v_read = abc.intern_string("READ");
+    // NODE: every property of the CURRENT node in ONE reply, pipe-joined:
+    //   <class>|<name>|<x>|<y>|<w>|<h>|<visible>|<numChildren>|<frame>|<total>|<label>
+    // The host's tree walk read ten properties per node, and because a GET moves the
+    // cursor it had to re-navigate from ROOT for each one — about sixty round trips per
+    // node, which made a stage tree effectively un-runnable. This makes it one.
+    let s_v_node = abc.intern_string("NODE");
+    let s_bar = abc.intern_string("|");
+    let s_dash = abc.intern_string("-1");
+    let s_empty2 = abc.intern_string("");
+    let disp_ns = { let ss = abc.intern_string("flash.display"); abc.intern_namespace(NS_PACKAGE, ss) };
+    let mn_movieclip = q(abc, disp_ns, "MovieClip");
+    let mn_container = q(abc, disp_ns, "DisplayObjectContainer");
+    let mn_n_name = q(abc, pub_ns, "name");
+    let mn_n_x = q(abc, pub_ns, "x");
+    let mn_n_y = q(abc, pub_ns, "y");
+    let mn_n_w = q(abc, pub_ns, "width");
+    let mn_n_h = q(abc, pub_ns, "height");
+    let mn_n_vis = q(abc, pub_ns, "visible");
+    let mn_n_nch = q(abc, pub_ns, "numChildren");
+    let mn_n_cf = q(abc, pub_ns, "currentFrame");
+    let mn_n_tf = q(abc, pub_ns, "totalFrames");
+    let mn_n_cl = q(abc, pub_ns, "currentLabel");
     // LOG <msg>: command-level parity with commands.hsx `log()` — replies
     // "logged: <msg>" (SSF2 has no on-screen console sink to mirror __td.log, so
     // the reply IS the observable, same as the E:logged:… line Fraymakers returns).
@@ -1005,6 +1032,48 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
     c.place(next); next = c.new_label();
     c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_log); c.branch(OP_IFSTRICTNE, next);
     c.op_u30(OP_PUSHSTRING, s_logged); c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_ADD); c.op_u30(OP_SETLOCAL, l_res); c.branch(OP_JUMP, l_done);
+    // NODE: the whole node in one reply (see s_v_node). Properties every DisplayObject
+    // has are read unguarded; MovieClip-only and container-only ones are behind an
+    // `istypelate` check, because these classes are SEALED and reading a missing property
+    // throws — which the dispatcher's try would turn into "ERR:" for the entire node.
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_node); c.branch(OP_IFSTRICTNE, next);
+    {
+        let cur = |c: &mut Code| { c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_cur); };
+        let bar = |c: &mut Code| { c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD); };
+        // class + the DisplayObject-safe fields
+        cur(&mut c); c.op(OP_CONVERT_S);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_name); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_x); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_y); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_w); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_h); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_vis); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        // numChildren, only if it is a container
+        bar(&mut c);
+        let l_nc_no = c.new_label(); let l_nc_end = c.new_label();
+        cur(&mut c); c.op_u30(OP_GETLEX, mn_container); c.op(OP_ISTYPELATE); c.branch(OP_IFFALSE, l_nc_no);
+        cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_nch); c.op(OP_CONVERT_S); c.branch(OP_JUMP, l_nc_end);
+        c.place(l_nc_no); c.op_u30(OP_PUSHSTRING, s_dash);
+        c.place(l_nc_end); c.op(OP_ADD);
+        // frame / total / label, only if it is a MovieClip
+        let l_mc_no = c.new_label(); let l_mc_end = c.new_label();
+        cur(&mut c); c.op_u30(OP_GETLEX, mn_movieclip); c.op(OP_ISTYPELATE); c.branch(OP_IFFALSE, l_mc_no);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_cf); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_tf); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_cl); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.branch(OP_JUMP, l_mc_end);
+        c.place(l_mc_no);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_dash); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_dash); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_empty2); c.op(OP_ADD);
+        c.place(l_mc_end);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+    c.branch(OP_JUMP, l_done);
     // READ: result = String(cur)
     c.place(next);
     c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_read); c.branch(OP_IFSTRICTNE, l_done);
