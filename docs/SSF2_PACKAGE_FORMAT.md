@@ -189,3 +189,22 @@ a missing one is a property-not-found from inside its own code.
 art. a platform draws with the clip named by its `linkage_id`, and the fixture answers with its
 terrain clip for everything, so the platform borrows the floor's appearance. collision is
 unaffected, and a fixture is about geometry rather than looks.
+
+## the fixture in Fraymakers
+
+the same file converts and runs on the other engine with no special handling:
+
+```
+peptide ssf2 stage <fixture>.ssf --out <dir>
+peptide export --project <dir>/peptidefixturessf2/peptidefixturessf2.fraytools
+peptide session --char sandbag --stage peptidefixturessf2
+```
+
+the converter reads the geometry straight out of the package (floor, drop-through platform, blast
+and camera boxes, four starts and four respawns) and emits it as fraymakers collision: LINE_SEGMENT
+layers for the surfaces and COLLISION_BOX layers for the boxes. fighters spawn at the converted
+entrance points and stand on the converted floor.
+
+that is the point of a fixture built this way. the geometry was chosen rather than measured, so
+the same numbers can be checked on both engines and a disagreement is a real difference rather than
+an artefact of whatever a shipped stage happens to be doing.
