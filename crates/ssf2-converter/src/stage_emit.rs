@@ -2645,22 +2645,43 @@ fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
          \t\t\t\tself.getBackgroundEffectsContainer().addChild(v.getViewRootContainer());\n\
          \t\t\t\tm_weather.push({{ v: v, x: Random.getInt(-{hw}, {hw}) * 1.0, y: Random.getInt(-{hh}, {hh}) * 1.0, k: {k_lo:.3} + Random.getInt(0, {k_span}) / 100.0, wind: {wind_lo:.3} + Random.getInt(0, {wind_span}) / 100.0 }});\n\
          \t\t\t}}\n");
-    // Weather is CAMERA-space in SSF2: the field is attached to the view, so it fills the screen
-    // wherever the camera goes and a particle that leaves one edge comes back at the other. Placed
-    // in world space instead it sits over one patch of the stage, thins out as the camera moves
-    // away, and is simply absent at the edges of a big stage. So each particle's position is an
-    // offset from the camera, resolved every frame.
+    // Weather is attached to the VIEW, not to the stage: it fills the screen wherever the camera
+    // goes, and a particle leaving one edge returns at the other. So a particle's stored position
+    // is an offset from the camera (which reports the CENTRE of the view), resolved every frame.
+    //
+    // The field is sized from the camera too, not from SSF2's rectangle scaled up. SSF2's authored
+    // area is that engine's screen; Fraymakers' screen is a different shape, so copying the numbers
+    // across gives a field that misses the sides and overshoots the top. Sizing off the viewport is
+    // what makes it the same field, and because both are "one screenful" the source's particle
+    // COUNT carries over unchanged and looks as thick as it did. Re-derived per frame so the field
+    // grows and shrinks with the camera's zoom instead of tearing at the edges when it pulls out.
+    //
+    // With no camera to ask, the SSF2 numbers are the fallback: a field over one patch of the stage
+    // is wrong, but it is the source's own wrongness rather than a field of zero size.
     let per_frame = format!(
         "\t\tvar cam = match.getCamera();\n\
-         \t\tvar camX = cam != null ? cam.getX() : 0;\n\
-         \t\tvar camY = cam != null ? cam.getY() : 0;\n\
+         \t\tvar camX = 0.0;\n\
+         \t\tvar camY = 0.0;\n\
+         \t\tvar hw = {hw}.0;\n\
+         \t\tvar hh = {hh}.0;\n\
+         \t\tif (cam != null) {{\n\
+         \t\t\tcamX = cam.getX();\n\
+         \t\t\tcamY = cam.getY();\n\
+         \t\t\tvar zx = cam.getZoomScaleX();\n\
+         \t\t\tvar zy = cam.getZoomScaleY();\n\
+         \t\t\t// scattered over 1.5 screens so particles arrive from off-view rather than\n\
+         \t\t\t// appearing at the frame edge\n\
+         \t\t\tif (zx > 0) hw = cam.getViewportWidth() / zx * 0.75;\n\
+         \t\t\tif (zy > 0) hh = cam.getViewportHeight() / zy * 0.75;\n\
+         \t\t}}\n\
          \t\tfor (p in m_weather) {{\n\
          \t\t\tp.y -= p.k;\n\
          \t\t\tp.x += p.wind;\n\
          \t\t\t// leaving the field puts it back on the far side, so the count never changes\n\
-         \t\t\tif (p.y < -{hh}) {{ p.y = {hh}; p.x = Random.getInt(-{hw}, {hw}) * 1.0; }}\n\
-         \t\t\tif (p.x < -{hw}) {{ p.x = {hw}; }}\n\
-         \t\t\tif (p.x > {hw}) {{ p.x = -{hw}; }}\n\
+         \t\t\tif (p.y < -hh) {{ p.y = hh; p.x = (Random.getInt(0, 200) / 100.0 - 1.0) * hw; }}\n\
+         \t\t\tif (p.y > hh) {{ p.y = hh; }}\n\
+         \t\t\tif (p.x < -hw) {{ p.x = hw; }}\n\
+         \t\t\tif (p.x > hw) {{ p.x = -hw; }}\n\
          \t\t\tp.v.setX(camX + p.x);\n\
          \t\t\tp.v.setY(camY + p.y);\n\
          \t\t}}\n");

@@ -58,6 +58,11 @@
     { "from": "SSF2API.getCamBounds()", "to": "match.getStage().getCameraBounds()" },   // returns RectCollisionArea, not a MovieClip
     { "from": "SSF2API.getDeathBounds()", "to": "match.getStage().getDeathBounds()" },
     { "from": "SSF2API.getGameSettings()", "to": "match.getMatchSettingsConfig()" },    // field shape differs — manual touch-up
+    // the hazards switch, same question on both engines: a stage asks whether the match wants its
+    // hazards. Fraymakers' own stages read the field this lowers to, so this is an exact route, not
+    // an approximation. WHAT a stage skips when it's off is the stage's own decision and is ported
+    // separately (abc_parser::extract_hazard_gate).
+    { "from": "SSF2API.isHazardsOn()", "to": "match.getMatchSettingsConfig().hazards" },
     //   Engine / AudioClip statics:
     { "from": "SSF2API.generateUID()", "to": "Engine.makeUid()" },
     { "from": "SSF2API.getUID()", "to": "Engine.makeUid()" },

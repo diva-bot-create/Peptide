@@ -167,17 +167,25 @@ dimensions below are the rest.
   verified live: 30 VFX in the match, positions scattered across the field and changing between
   samples.
 
-- **weather is not camera-tethered yet.** SSF2 attaches the field to the VIEW: it fills the screen
-  wherever the camera goes, and a particle leaving one edge returns at the other. The port places
-  particles in WORLD space, so the field sits over one patch of the stage -- correct-looking on a
-  screenshot, wrong as soon as the camera travels, and simply absent at the edges of a big stage.
+- **weather is tethered to the camera, and sized by it** (fixed). SSF2 attaches the field to the
+  VIEW: it fills the screen wherever the camera goes and a particle leaving one edge returns at the
+  other. each particle now stores an offset from `match.getCamera()` (which reports the CENTRE of
+  the view, confirmed live) resolved every frame.
 
-  the per-frame mover already offsets each particle by `match.getCamera().getX()/getY()`, which
-  RESOLVES (no script error in-engine) but contributes nothing: measured live, the vfx x range is
-  identical (-78..1392) with the fighter at x=200 and at x=2600, so the field does not move. either
-  those accessors report something other than a world position, or the container the particles are
-  reparented into is already view-relative and the offset is the wrong correction. worth one probe
-  of what the camera actually reports before changing the arithmetic again.
+  the field is sized from the camera too, not from SSF2's rectangle scaled up. SSF2's authored area
+  is that engine's screen; fraymakers' screen is a different shape (640x360 at zoom 1 vs the 498x492
+  the scaled numbers gave), so copying them across misses the sides and overshoots the top. sizing
+  off `getViewportWidth()/getZoomScaleX()` re-derived per frame is what makes it the same field, and
+  since both are one screenful the source's particle COUNT carries over unchanged. verified live:
+  the drifting field's centre moved 303 -> 1244 as the fighters moved 400 -> 1600.
+
+- **`e` cannot reach the script-API sandbox.** eval's `match` is a small hand-written facade
+  (`commands.hsx`), not the `MatchApi` a stage script gets, so `getCamera`/`getMatchSettingsConfig`
+  read as null there and anything a converted script sees costs a convert-export-boot cycle to
+  check. binding the real api object is not the fix: it binds fine (a correctly TYPED register
+  reads back a real `pxf.api.MatchApi`) but calling anything on it takes the engine down, and the
+  StageApi equivalent lands with a null receiver. the eval would have to RUN as a script object
+  with its own ambient bindings rather than reading a bound variable.
 
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and

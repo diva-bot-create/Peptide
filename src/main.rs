@@ -1508,11 +1508,17 @@ fn connect_edit(
     let stage_entity_t = require_type(code, "pxf.entity.Stage")?;
     let stage_field = find_field(code, match_t, "stageEntity")
         .ok_or_else(|| anyhow::anyhow!("Match.stageEntity field not found"))?;
-    // NOT bound: the stage's script-API object (pxf.api.StageApi), the sandbox an entity
-    // script sees as its ambient `stage`. It's the right conceptual surface and it can be
-    // constructed correctly here (`new StageApi(stageEntity)`, back-reference verified set),
-    // but its methods are not callable through the interpreter Peptide drives: every call
-    // lands in the engine with a null receiver. Entity methods (p0.getStateName()) work, API
+    // NOT bound: the script-API objects (pxf.api.StageApi, pxf.api.MatchApi), the sandbox an
+    // entity script sees as its ambient `stage` and `match`. They are the right conceptual
+    // surface -- the only surface a converted script can see, so the one to ask when debugging
+    // one -- and they bind fine: reading Match.matchApi into a correctly TYPED register (an
+    // arbitrary spare register reads back as whatever it was declared to hold) gives an object
+    // that reports itself as pxf.api.MatchApi. But CALLING anything on it through the
+    // interpreter Peptide drives does not work: StageApi lands with a null receiver, and
+    // MatchApi takes the engine down on the first call. Reaching this surface needs the eval to
+    // run as a real script object with its own ambient bindings, not a bound variable, so until
+    // then camera/match-settings questions cost a convert-export-boot cycle. Entity methods
+    // (p0.getStateName()) work, API
     // methods do not, so the sandbox has to be reached in bytecode the way `tree` is.
     let m_idx = add_int(code, 'm' as i32);
     let t_idx = add_int(code, 't' as i32);
