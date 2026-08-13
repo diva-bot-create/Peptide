@@ -219,10 +219,11 @@ pub fn build_fixture_swf() -> Vec<u8> {
     beacons.push((17, format!("fixture_fla.{FIXTURE_ID}_terrain_mc_17")));
     beacons.push((18, "fixture_fla.terrainGround_platform__18".to_string()));
     let mut terrain = vec![
-        // Named the way SSF2 stages name collision. The names are not decoration: solid ground and
-        // a drop-through platform are told apart BY name, so a clip called "floor" is neither.
-        place(17, Some("terrainGround"), 1),
-        place(18, Some("platform"), 2),
+        // Placed with NO instance name, which is how shipped stages place collision: the linkage
+        // says what it is, and the placement says only where. Boundaries are the exception and
+        // carry both, because all three are built from one linkage and told apart by name.
+        place(17, None, 1),
+        place(18, None, 2),
         place(15, Some("deathBoundary"), 3),
         place(16, Some("camBoundary"), 4),
     ];
