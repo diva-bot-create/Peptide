@@ -168,18 +168,15 @@ fn corpus_constructor_walk_matches_path2_enumeration() {
 }
 
 #[test]
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
 fn package_metadata_lands_in_conversion_log() {
     // Run the converter against sandbag.ssf and assert ssf2_source has
     // package_id / package_guid / source_method.
     let sandbag = ssfs_dir().join("sandbag.ssf");
     if !common::present(&sandbag) { return; }
-    let out = tempfile::tempdir().expect("tempdir");
+    let Some(out) = common::shared_conversion("sandbag") else { return };
 
-    let mut opts = ConvertOptions::new(&sandbag);
-    opts.output = out.path().to_path_buf();
-    run_conversion(opts).expect("run_conversion");
-
-    let log = std::fs::read_to_string(out.path().join("sandbag/conversion_log.json")).unwrap();
+    let log = std::fs::read_to_string(out.join("sandbag/conversion_log.json")).unwrap();
     assert!(log.contains("\"ssf2_source\""),
         "sandbag conversion_log.json must include ssf2_source");
     assert!(log.contains("\"package_id\": \"sandbag\""),

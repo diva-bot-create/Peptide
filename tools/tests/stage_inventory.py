@@ -94,10 +94,38 @@ def ssf2_objects(text, include_unnamed=False):
     return out
 
 
+def spawn_layers(stage, outdir):
+    """`<entity id>` -> the stage container its spawn line reparents it into.
+
+    A separately-emitted object (a backdrop vfx, a hazard) is placed by a line in the stage
+    Script, not by anything in its own `.entity`, so its DEPTH only exists in that script.
+    Fraymakers has eleven named containers; reading which one each object actually lands in
+    is what makes a wrong plane visible instead of invisible.
+    """
+    sid = f"{stage}ssf2"
+    script = os.path.join(outdir, sid, "library", "scripts", "stage", f"{sid}Script.hx")
+    out = {}
+    if not os.path.exists(script):
+        return out
+    text = open(script, encoding="utf8").read()
+    # var _bg3 = match.createVfx(... getContent("<id>") ...);
+    #   if (_bg3 != null) { self.getBackgroundBehindContainer().addChild(_bg3.getSprite()); }
+    for var, ent in re.findall(r'var (_\w+) = match\.create\w+\([^;]*?getContent\("([^"]+)"\)', text):
+        m = re.search(re.escape(var) + r'\s*!=\s*null\s*\)\s*\{\s*self\.get(\w+?)Container\(\)', text)
+        if m:
+            # getBackgroundBehindContainer -> BACKGROUND_BEHIND
+            name = re.sub(r'(?<!^)(?=[A-Z])', '_', m.group(1)).upper()
+            out[ent] = name
+        else:
+            out.setdefault(ent, "(game objects)")
+    return out
+
+
 def fm_objects(stage, outdir):
     """Every emitted Fraymakers object: main-entity layers + separate entities."""
     sid = f"{stage}ssf2"
     base = os.path.join(outdir, sid, "library", "entities")
+    spawned = spawn_layers(stage, outdir)
     objs = []
     main = os.path.join(base, f"{sid}.entity")
     if os.path.exists(main):
@@ -111,7 +139,8 @@ def fm_objects(stage, outdir):
                     continue
                 frames = sum(kfs[k].get("length", 1) for k in l.get("keyframes", []) if k in kfs)
                 objs.append({"where": "main", "anim": a["name"], "name": l.get("name") or "",
-                             "type": l.get("type"), "frames": frames})
+                             "type": l.get("type"), "frames": frames,
+                             "layer": "(baked in stack)"})
     for ent in sorted(glob.glob(os.path.join(base, "*.entity"))):
         if os.path.basename(ent) == f"{sid}.entity":
             continue
@@ -127,7 +156,8 @@ def fm_objects(stage, outdir):
                     frames = max(frames, sum(kfs[k].get("length", 1)
                                              for k in l.get("keyframes", []) if k in kfs))
         objs.append({"where": "entity", "anim": ",".join(a["name"] for a in d.get("animations", [])),
-                     "name": nm, "type": "ENTITY", "frames": frames})
+                     "name": nm, "type": "ENTITY", "frames": frames,
+                     "layer": spawned.get(nm, "(not spawned)")})
     return objs
 
 
@@ -208,7 +238,7 @@ if __name__ == "__main__":
         rows.append(o)
 
     print(f"\n=== {stage}: {len(rows)} distinct SSF2 objects, {len(fm)} emitted Fraymakers objects ===\n")
-    print(f"{'SSF2 object':34}{'plane':12}{'pos':>13}  {'->':3} {'Fraymakers':38}{'frames':>7}")
+    print(f"{'SSF2 object':30}{'plane':11}{'pos':>13}  {'->':3} {'Fraymakers':34}{'frames':>7}  {'fm layer':<22}")
     print("-" * 112)
     ported = gaps = skipped = 0
     missing = []
@@ -223,7 +253,13 @@ if __name__ == "__main__":
             ported += 1
             h = hits[0]
             tag = f"{h['where']}:{h['name'][:30]}"
-            print(f"{o['name'][:33]:34}{o['plane'][:11]:12}{pos:>13}  ->  {tag:38}{h['frames']:>7}")
+            fm_layer = h.get("layer", "")
+            # flag a background-plane object that landed in a foreground container, or the
+            # reverse: that's a depth error the counts alone can't show
+            sp, fl = (o['plane'] or '').lower(), fm_layer.lower()
+            mismatch = (("fore" in sp) != ("foreground" in fl)) and fl.startswith(("back", "fore", "char"))
+            flag = "  <-- PLANE/LAYER MISMATCH" if mismatch else ""
+            print(f"{o['name'][:29]:30}{o['plane'][:10]:11}{pos:>13}  ->  {tag:34}{h['frames']:>7}  {fm_layer:<22}{flag}")
         elif NON_ART.search(o["name"]):
             skipped += 1   # collision geometry / scaffolding: never art, correctly absent
         elif o["frames"] > 1:

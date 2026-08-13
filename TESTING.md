@@ -34,6 +34,42 @@ integration map isn't in the tracked repo (removed for compliance, see the bound
 
 ---
 
+## 0. two test tiers: the fast gate, and the corpus tests
+
+`cargo test` is a BUILD GATE, not a conversion run. it finishes in a few seconds and works the
+same on a fresh checkout with no corpus.
+
+exactly ONE test in the gate reads a real SSF2 file: `golden_sandbag`. it converts sandbag and
+diffs the output against committed hashes, which is the only thing that catches an unintended
+change to real converted output -- no synthetic fixture can stand in for that. it costs ~2s,
+and it skips itself when the corpus isn't on disk. every OTHER corpus test is `#[ignore]`d.
+
+```bash
+cargo test --workspace            # the gate: unit tests + from-scratch fixtures
+cargo test -- --ignored           # the corpus tests: real .ssf files, minutes
+```
+
+everything else that needs a real `.ssf` is marked `#[ignore]`. two reasons, and both matter:
+official SSF2 content can never live in this repo, and a full character conversion is seconds
+of work that has no place in a gate you run on every edit.
+
+when you add a test, prefer the gate. most assertions don't need a real character or stage:
+
+| fixture | file | what it covers |
+| --- | --- | --- |
+| hand-built `StageModel` | `tests/synthetic_stage.rs` | the stage emitter: depth containers, guids, determinism |
+| hand-written SWF | `tests/synthetic_swf.rs` | the parser on degenerate input: empty, truncated, non-swf |
+| hand-written SWF + `--name` | `tests/synthetic_character.rs` | the character pipeline: project layout, manifest ids, conversion log, determinism |
+
+the SWFs are real ones written by the `swf` crate, not fixture blobs -- `ssf::decompress`
+passes a raw `FWS` stream straight through, so the converter sees them exactly as it sees a
+real input, and nothing copyrighted is involved. passing `--name` skips character DETECTION,
+which is the only part of the character path that needs real AS3.
+
+reach for the corpus only when the thing under test IS what lives in AS3 -- character
+detection, `ssf2_source` provenance, stat extraction, transformation forms -- then mark it
+`#[ignore]` with a reason.
+
 ## 1. the end-to-end iteration loop
 
 ```

@@ -13,7 +13,6 @@
 //!
 //! Skipped silently if `../ssf2-ssfs/sandbag.ssf` isn't on disk.
 
-use ssf2_converter::{run_conversion, ConvertOptions};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -48,22 +47,13 @@ fn collect_guids(dir: &Path, out: &mut Vec<(String, String)>) {
 }
 
 #[test]
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
 fn sandbag_guids_are_unique() {
-    let ssf = common::ssf("sandbag");
-    if !common::present(&ssf) { return; }
-
-    let tempdir = std::env::temp_dir().join(format!("ssf2_guid_sandbag_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tempdir);
-    std::fs::create_dir_all(&tempdir).expect("mkdir tempdir");
-
-    // Convert in-process (was: spawn the release ssf2_converter binary).
-    let mut opts = ConvertOptions::new(&ssf);
-    opts.output = tempdir.clone();
-    run_conversion(opts).expect("run_conversion converting sandbag");
+    // shared with the other corpus tests — one conversion serves the whole suite
+    let Some(tempdir) = common::shared_conversion("sandbag") else { return };
 
     let mut guids: Vec<(String, String)> = Vec::new();
     collect_guids(&tempdir.join("sandbag"), &mut guids);
-    let _ = std::fs::remove_dir_all(&tempdir);
 
     assert!(!guids.is_empty(), "expected to find GUIDs in converted output");
 

@@ -89,7 +89,12 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
                     .map(|(j, a)| write_layer(&format!("{eid}_{j}"), a))
                     .collect::<Result<_>>()?
             };
-            Ok(BgLayerRef { name: bg_layer_name(&layer.name, i), eid: eid.clone(), frames })
+            Ok(BgLayerRef {
+                name: bg_layer_name(&layer.name, i), eid: eid.clone(), frames,
+                plane: BgPlane::Background,
+                segments: layer.segments.iter()
+                    .map(|s| (s.label.clone(), s.frames.len(), s.next.clone())).collect(),
+            })
         })
         .collect::<Result<_>>()?;
     // UNIVERSAL: promote every ANIMATED backdrop element (the weather embers, jumping podoboos,
@@ -103,8 +108,49 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // animated bg element on any stage is treated this way. `PEPTIDE_BG_INLINE` forces the old
     // all-baked behavior for debugging/diffing.
     let inline_bg = std::env::var("PEPTIDE_BG_INLINE").is_ok();
-    let (baked_bg, promoted_bg): (Vec<BgLayerRef>, Vec<BgLayerRef>) =
+    let (baked_bg, mut promoted_bg): (Vec<BgLayerRef>, Vec<BgLayerRef>) =
         bg_refs.into_iter().partition(|l| inline_bg || l.frames.len() <= 1);
+    // an ANIMATED foreground element hits the SAME shared-master-clock bug as an animated
+    // background one: baked into the stage entity it gets tiled/truncated to the master length
+    // instead of running its own loop. Promotion was background-only, so it never reached the
+    // foreground plane. Promote it on the same rule (more than one frame = it animates), routed
+    // by its plane into a foreground container so it keeps drawing in front of the fighters.
+    let fg_refs: Vec<ArtRef> = model.art.foreground.iter().enumerate()
+        .map(|(i, a)| write_layer(&format!("fg{i}"), a)).collect::<Result<_>>()?;
+    let promote_fg = !inline_bg && fg_refs.len() > 1;
+    if promote_fg {
+        promoted_bg.push(BgLayerRef {
+            name: "Foreground Art".to_string(), eid: "fg".to_string(),
+            frames: fg_refs.clone(), plane: BgPlane::Foreground, segments: Vec::new(),
+        });
+    }
+    // PER-ELEMENT foreground: the parser now splits the in-front plane the same way it splits the
+    // backdrop, so each prop is promoted on its own instead of being flattened with the rest. The
+    // old whole-plane composite above only ever promoted when the FLATTENED image animated, which
+    // is a different (and much rarer) condition than "this plane contains something that animates"
+    // — a plane of independently-moving props whose composite happens to be static stayed frozen.
+    let fg_elem_ids = element_ids(&model.art.foreground_elements);
+    if !inline_bg {
+        for (i, layer) in model.art.foreground_elements.iter().enumerate() {
+            // namespaced: ids come from the symbol name alone, and a plane's element can share a
+            // name with a backdrop one — same id means same filenames, and one silently overwrites
+            // the other's art.
+            let eid = &format!("fge_{}", fg_elem_ids[i]);
+            let frames: Vec<ArtRef> = if layer.frames.len() == 1 {
+                vec![write_layer(eid, &layer.frames[0])?]
+            } else {
+                layer.frames.iter().enumerate()
+                    .map(|(j, a)| write_layer(&format!("{eid}_{j}"), a))
+                    .collect::<Result<_>>()?
+            };
+            promoted_bg.push(BgLayerRef {
+                name: bg_layer_name(&layer.name, i), eid: eid.clone(), frames,
+                plane: BgPlane::Foreground,
+                segments: layer.segments.iter()
+                    .map(|s| (s.label.clone(), s.frames.len(), s.next.clone())).collect(),
+            });
+        }
+    }
     // declared platforms become MOVING STRUCTURES (like the official stage-template's moving
     // platform): one shared grey `platformSprite` (an IMAGE + a structure LINE_SEGMENT, in the
     // stage entity), and one structure CONTENT per platform that the stage spawns and that moves
@@ -117,8 +163,11 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
         background: baked_bg,
         parallax: parallax_refs,
         stage: stage_refs,
-        foreground: model.art.foreground.iter().enumerate()
-            .map(|(i, a)| write_layer(&format!("fg{i}"), a)).collect::<Result<_>>()?,
+        // emptied when the foreground was promoted to its own looping VFX above, so it isn't
+        // drawn twice (once on the master clock, once on its own).
+        foreground: if promote_fg { vec![] } else { fg_refs },
+        foreground_is_blend_overlay: model.art.foreground_is_blend_overlay,
+        foreground_alpha: model.art.foreground_alpha,
         foreground_occluders: model.art.foreground_occluders.iter().enumerate()
             .map(|(i, a)| write_layer(&format!("fgocc{i}"), a)).collect::<Result<_>>()?,
         platform_sprites,
@@ -138,9 +187,9 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // every animated backdrop element becomes its own looping VFX the stage spawns + reparents
     // into a background container. VFX carry no manifest entry (resolved by id via getContent),
     // so this only returns spawn lines.
-    let bg_spawns = emit_bg_elements(model, &promoted_bg, &lib)?;
+    let (bg_spawns, bg_entries) = emit_bg_elements(model, &promoted_bg, &lib)?;
 
-    write_json(&lib.join("manifest.json"), &build_manifest(model, &hazard_entries, &structure_contents))?;
+    write_json(&lib.join("manifest.json"), &build_manifest(model, &[hazard_entries.clone(), bg_entries.clone()].concat(), &structure_contents))?;
     write_meta(&lib.join("manifest.json.meta"), id, "manifest", "json", None, None)?;
 
     let scripts = lib.join("scripts").join("stage");
@@ -503,13 +552,44 @@ impl<'a> EntityBuilder<'a> {
 }
 
 /// A written art layer the entity references: the sprite `.meta` guid + placement + size.
+#[derive(Clone)]
 struct ArtRef { guid: String, x: f64, y: f64, w: u32, h: u32, hold: usize }
 
 /// A parallax camera-background layer: the written sprite + its scroll mode + pan rate.
 struct ParallaxRef { art: ArtRef, mode: ParallaxMode, x_pan: f64, y_pan: f64 }
 
 /// One backdrop element as its own layer: a display name + its frame sequence (1 = static).
-struct BgLayerRef { name: String, eid: String, frames: Vec<ArtRef> }
+struct BgLayerRef {
+    name: String, eid: String, frames: Vec<ArtRef>, plane: BgPlane,
+    /// The element's label-delimited segments as `(label, frame count, jump)`, when its SSF2 clip
+    /// branches between them instead of looping. Frame counts index into `frames`, which is the
+    /// segments concatenated in timeline order. Empty for an ordinary looping element.
+    segments: Vec<(String, usize, Option<crate::abc_parser::LabelJump>)>,
+}
+
+/// The source plane a promoted element came from. Decides which stage container it's
+/// reparented into and at what alpha, so a promoted element lands at the same depth the
+/// baked version occupied in the entity's layer stack (background art draws behind the
+/// stage art; foreground art draws in front of the fighters, semi-transparent).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BgPlane { Background, Foreground }
+
+impl BgPlane {
+    /// The Stage container API call that puts an element at this plane's depth.
+    fn container(self) -> &'static str {
+        match self {
+            // behind the baked `Stage Art` layer
+            BgPlane::Background => "getBackgroundBehindContainer",
+            // the lowest of the four foreground containers, i.e. directly above
+            // `Characters Front` — where the baked `Foreground Art` layer sat.
+            BgPlane::Foreground => "getForegroundStructuresContainer",
+        }
+    }
+    /// Matches the alpha the baked path used for this plane (add_image_frames_alpha).
+    fn alpha(self) -> f64 {
+        match self { BgPlane::Background => 1.0, BgPlane::Foreground => 0.5 }
+    }
+}
 
 /// A readable FM layer name for a backdrop element from its SSF2 symbol id. Strips the
 /// `_bg` suffix and any `<stage>_` prefix, title-cases the rest; falls back to a numbered
@@ -532,7 +612,11 @@ fn bg_layer_name(sym: &str, idx: usize) -> String {
 
 /// The depth layers the entity lays out. `stage` is the frame sequence (1 = static);
 /// `background` is the ordered per-element backdrop layers (each 1 = static).
-struct ArtRefs { background: Vec<BgLayerRef>, parallax: Vec<ParallaxRef>, stage: Vec<ArtRef>, foreground: Vec<ArtRef>, foreground_occluders: Vec<ArtRef>, platform_sprites: Vec<(String, f64, f64, u8)> }
+struct ArtRefs { background: Vec<BgLayerRef>, parallax: Vec<ParallaxRef>, stage: Vec<ArtRef>, foreground: Vec<ArtRef>, foreground_occluders: Vec<ArtRef>, platform_sprites: Vec<(String, f64, f64, u8)>,
+    /// see `StageArtSet::foreground_is_blend_overlay`
+    foreground_is_blend_overlay: bool,
+    /// see `StageArtSet::foreground_alpha`
+    foreground_alpha: f64 }
 
 /// Render the floor + soft platforms as filled rectangles on a transparent canvas
 /// covering their bounding box (1px = 1 stage unit). Gives the stage visible content
@@ -623,11 +707,18 @@ fn build_entity(model: &StageModel, art: &ArtRefs) -> Value {
             &art.foreground_occluders.iter().map(|a| (a.guid.clone(), a.x, a.y, a.hold)).collect::<Vec<_>>());
     }
     // the foreground (bowserscastle's lava-glow sheet + lightmask, classified foreground by the
-    // AS3 plane map) draws IN FRONT of fighters as a semi-transparent overlay at ~0.5 alpha — the
-    // REAL clip art, one keyframe per real frame (no synthesized flicker).
+    // AS3 plane map) draws IN FRONT of fighters — the REAL clip art, one keyframe per real frame
+    // (no synthesized flicker), at the opacity the SOURCE authored. SSF2 makes a plane translucent
+    // by setting alpha on a parent movieclip, so that value is read off the placement chain per
+    // stage; it is not a fixed convention and must not be hardcoded.
     if !art.foreground.is_empty() {
+        // a SOLVED blend overlay ships at FULL layer alpha: its per-pixel alpha already IS the
+        // blend, so any layer alpha on top of it scales the tint down (measured: the overlay
+        // reached the fighters at a fraction of the intended strength). Authored art keeps the
+        // source's own plane opacity.
+        let alpha = if art.foreground_is_blend_overlay { 1.0 } else { art.foreground_alpha };
         b.add_image_frames_alpha("Foreground Art",
-            &art.foreground.iter().map(|a| (a.guid.clone(), a.x, a.y, a.hold)).collect::<Vec<_>>(), 0.5);
+            &art.foreground.iter().map(|a| (a.guid.clone(), a.x, a.y, a.hold)).collect::<Vec<_>>(), alpha);
     }
     b.add_container("Foreground Structures", "FOREGROUND_STRUCTURES_CONTAINER");
     b.add_container("Foreground Shadows", "FOREGROUND_SHADOWS_CONTAINER");
@@ -2211,7 +2302,13 @@ fn thwomp_multi_script_hx(cols: &[(f64, f64)], spawn_y: f64, shake_amp: f64, fal
          \t\t// the column platform under it sinks; hold (SSF2 waitTimer 90f)\n\
          \t\tm_timer.inc();\n\
          \t\tif (m_timer.get() >= LAND_WAIT) {{\n\
+         \t\t\t// LANDED and RISE share an animation, and toLocalState REPLAYS the registered\n\
+         \t\t\t// animation from frame 0 — which restarted `idle` mid-playback the moment the\n\
+         \t\t\t// thwomp left the ground. SSF2 changes no attack here, so the clip just keeps\n\
+         \t\t\t// running; carry the frame across the phase change to match it.\n\
+         \t\t\tvar _f = self.getCurrentFrame();\n\
          \t\t\tCommon.toLocalState(LState.RISE);\n\
+         \t\t\tself.playFrame(_f);\n\
          \t\t}}\n\
          \t}} else if (Common.inLocalState(LState.RISE)) {{\n\
          \t\t// rise at SSF2 YSpeed -6 until past the spawn point, then rest\n\
@@ -2431,12 +2528,41 @@ fn hazard_animation_stats_hx() -> String {
 /// (looping driven by VfxStats.loop at spawn). objectType "VFX" so createVfx's spriteContent
 /// accepts it. references the bg sprite GUIDs already written by `write_layer` (no PNG re-write);
 /// keyframe lengths are the per-frame holds (already FM 60fps frames, like the baked bg path).
+/// The element's own origin: the top-left it is placed at on the stage.
+///
+/// Every frame of a static element carries the SAME stage coordinate, and an animated one
+/// carries near-identical coords per frame, so this is the element's position rather than a
+/// per-frame accident. Hoisting it out of the art is what gives the vfx a real position (see
+/// `bg_element_entity`).
+fn bg_element_origin(layer: &BgLayerRef) -> (f64, f64) {
+    // The element's placement, lifted out of the art and carried on the VFX ITSELF
+    // (`VfxStats.x/y`), which works because the stage reparents the vfx's VIEW ROOT CONTAINER
+    // rather than its sprite (see `emit_bg_elements`).
+    //
+    // Reparenting `getSprite()` is what made an earlier attempt at this render wrong: it lifts
+    // the sprite OUT of the entity's view hierarchy, so the entity's position stops moving it
+    // and every element collapses onto the layer container's origin -- measured live at
+    // absolute (-163,-277) for all of them, which on bowserscastle put the podoboos up in the
+    // chandeliers instead of in the lava. Moving the view ROOT keeps the entity intact, so its
+    // position means what it says and the element stays one coherent, movable object.
+    let x = layer.frames.iter().map(|f| f.x).fold(f64::MAX, f64::min);
+    let y = layer.frames.iter().map(|f| f.y).fold(f64::MAX, f64::min);
+    if x.is_finite() && y.is_finite() { (x, y) } else { (0.0, 0.0) }
+}
+
 fn bg_element_entity(eid: &str, layer: &BgLayerRef, scale: f64) -> Value {
+    let alpha = layer.plane.alpha();
+    // Art is element-LOCAL: the stage offset is hoisted onto the vfx itself (VfxStats x/y)
+    // instead of being baked into every symbol. Baking it in meant every element sat at the
+    // world origin with its picture drawn far away — so it had no position to read, none to
+    // move, and nothing to tell two elements apart by. Per-frame offsets are preserved as
+    // deltas from this origin, so an element whose frames crop differently still animates.
+    let (ox, oy) = bg_element_origin(layer);
     let g = |s: &str| det_uuid(&format!("bgelem::{eid}::{s}"));
     let symbols: Vec<Value> = layer.frames.iter().enumerate().map(|(j, f)| json!({
         "$id": g(&format!("sym{j}")), "type": "IMAGE", "imageAsset": f.guid,
-        "x": f.x, "y": f.y, "pivotX": 0.0, "pivotY": 0.0,
-        "scaleX": scale, "scaleY": scale, "rotation": 0.0, "alpha": 1.0, "pluginMetadata": {}
+        "x": f.x - ox, "y": f.y - oy, "pivotX": 0.0, "pivotY": 0.0,
+        "scaleX": scale, "scaleY": scale, "rotation": 0.0, "alpha": alpha, "pluginMetadata": {}
     })).collect();
     let mut keyframes: Vec<Value> = layer.frames.iter().enumerate().map(|(j, f)| json!({
         "$id": g(&format!("kf{j}")), "symbol": g(&format!("sym{j}")), "length": f.hold.max(1),
@@ -2459,26 +2585,206 @@ fn bg_element_entity(eid: &str, layer: &BgLayerRef, scale: f64) -> Value {
     })
 }
 
+/// Per-segment `(fm_animation_name, fm_frame_length)` for a segmented element, in timeline order.
+/// Lengths are FM (60fps) frames, so they match what the emitted keyframes actually play.
+fn bg_segment_spans(layer: &BgLayerRef) -> Vec<(String, usize, usize, usize)> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for (label, n, _) in &layer.segments {
+        let end = (off + n).min(layer.frames.len());
+        // the emitted keyframes are doubled 30->60fps, so the animation runs twice the source holds
+        let fm_len: usize = layer.frames[off..end].iter().map(|f| f.hold.max(1) * 2).sum();
+        out.push((sanitize_anim(label), off, end, fm_len));
+        off = end;
+    }
+    out
+}
+
+/// The CUSTOM_GAME_OBJECT entity for a label-segmented backdrop element: one FM animation per
+/// reachable segment, each carrying only that segment's frames. A VFX can hold exactly one
+/// animation and no script, so an element whose SSF2 timeline BRANCHES between labels cannot be
+/// one — it needs an object that can switch what it plays.
+fn bg_segment_entity(eid: &str, layer: &BgLayerRef, scale: f64) -> Value {
+    let alpha = layer.plane.alpha();
+    let (ox, oy) = bg_element_origin(layer);
+    let g = |s: &str| det_uuid(&format!("bgseg::{eid}::{s}"));
+    let symbols: Vec<Value> = layer.frames.iter().enumerate().map(|(j, f)| json!({
+        "$id": g(&format!("sym{j}")), "type": "IMAGE", "imageAsset": f.guid,
+        "x": f.x - ox, "y": f.y - oy, "pivotX": 0.0, "pivotY": 0.0,
+        "scaleX": scale, "scaleY": scale, "rotation": 0.0, "alpha": alpha, "pluginMetadata": {}
+    })).collect();
+    let mut keyframes: Vec<Value> = Vec::new();
+    let mut layers: Vec<Value> = Vec::new();
+    let mut animations: Vec<Value> = Vec::new();
+    for (name, start, end, _) in bg_segment_spans(layer) {
+        let mut kfs: Vec<Value> = (start..end).map(|j| json!({
+            "$id": g(&format!("kf{j}")), "symbol": g(&format!("sym{j}")),
+            "length": layer.frames[j].hold.max(1),
+            "tweened": false, "tweenType": "LINEAR", "type": "IMAGE", "pluginMetadata": {}
+        })).collect();
+        crate::entity_gen::double_keyframe_lengths(&mut kfs);
+        keyframes.extend(kfs);
+        let lid = g(&format!("layer_{name}"));
+        layers.push(json!({ "$id": lid, "name": format!("art_{name}"), "type": "IMAGE",
+            "hidden": false, "locked": false,
+            "keyframes": (start..end).map(|j| g(&format!("kf{j}"))).collect::<Vec<_>>(),
+            "pluginMetadata": {} }));
+        animations.push(json!({ "$id": g(&format!("anim_{name}")), "name": name,
+            "layers": [lid], "pluginMetadata": {} }));
+    }
+    json!({
+        "export": true, "guid": g("entity"), "id": eid, "version": 5,
+        "pluginMetadata": { "com.fraymakers.FraymakersMetadata": { "objectType": "CUSTOM_GAME_OBJECT", "version": "0.4.0" } },
+        "plugins": ["com.fraymakers.FraymakersTypes", "com.fraymakers.FraymakersMetadata"],
+        "tags": [], "paletteMap": {}, "tilesets": [], "terrains": [],
+        "symbols": symbols, "keyframes": keyframes, "layers": layers, "animations": animations
+    })
+}
+
+/// The state machine that replays a segmented clip's own branching, so the element shows what SSF2
+/// shows and in the same proportions.
+///
+/// Each segment's animation LOOPS on its own, so the script only has to act at the end of a lap:
+/// staying in the same segment is doing nothing, and a branch is one `toLocalState`. That keeps the
+/// common case seamless (no restart hitch on the segment that just repeats) and means the frame
+/// counter is the only state that has to survive between frames.
+fn bg_segment_script_hx(eid: &str, layer: &BgLayerRef) -> String {
+    use crate::abc_parser::LabelJump;
+    let spans = bg_segment_spans(layer);
+    let idx_of = |lbl: &str| spans.iter().position(|(n, ..)| *n == sanitize_anim(lbl));
+    let lens: Vec<String> = spans.iter().map(|(_, _, _, l)| l.to_string()).collect();
+    // one branch arm per segment, unrolled: which segment follows this one, and how often
+    let mut arms = String::new();
+    for (i, (_, _, _, _)) in spans.iter().enumerate() {
+        let fall = if i + 1 < spans.len() { i + 1 } else { 0 };
+        let body = match layer.segments.get(i).and_then(|(_, _, j)| j.clone()) {
+            Some(LabelJump::Always(t)) => format!("return {};", idx_of(&t).unwrap_or(fall)),
+            // the SSF2 frame script rolls the engine RNG here; a roll that misses simply lets the
+            // timeline run on into the next segment, which is what the fallthrough is
+            Some(LabelJump::Chance { pct, target }) => format!(
+                "if (Random.getInt(0, 99) < {pct}) {{ return {}; }}\n\t\treturn {fall};",
+                idx_of(&target).unwrap_or(fall)),
+            None => format!("return {fall};"),
+        };
+        arms.push_str(&format!("\tif (i == {i}) {{\n\t\t{body}\n\t}}\n"));
+    }
+    let states: Vec<String> = spans.iter()
+        .map(|(n, ..)| format!("\t{}: _prepLocalState(\"{n}\")", n.to_ascii_uppercase())).collect();
+    format!(
+        "// {eid}: a backdrop element whose SSF2 clip BRANCHES between frame labels rather than\n\
+         // looping one timeline. One FM animation per label; this replays the branching.\n\n\
+         function _prepLocalState(animation:String, ?index:Int=Math.NaN):Int {{\n\
+         \tif (!__hasInitLocalStateMachine) {{ Common.initLocalStateMachine(); __hasInitLocalStateMachine = true; }}\n\
+         \tif (index != Math.NaN) {{ index = __localStatePrepIndex++; }}\n\
+         \tCommon.registerLocalState(index, animation);\n\treturn index;\n}}\n\
+         var __hasInitLocalStateMachine = false;\nvar __localStatePrepIndex = -1;\n\
+         var LState = {{\n\tUNINITIALIZED: _prepLocalState(\"#n/a\", -1),\n{}\n}};\n\n\
+         // segment lengths in engine frames (the source's 30fps holds, doubled)\n\
+         var LENS = [{}];\n\
+         var STATES = [{}];\n\
+         // persistent: a plain var re-initialises every frame on a custom game object.\n\
+         var m_seg = self.makeInt(0);\nvar m_t = self.makeInt(0);\nvar m_init = self.makeBool(false);\n\n\
+         // which segment follows `i` — the clip's own frame scripts, unrolled.\n\
+         function _next(i:Int):Int {{\n{}\treturn 0;\n}}\n\n\
+         function initialize() {{\n\tself.setState(PState.ACTIVE);\n}}\n\n\
+         function update() {{\n\
+         \tif (!m_init.get()) {{ m_init.set(true); Common.toLocalState(STATES[0]); }}\n\
+         \tvar t = m_t.get() + 1;\n\
+         \tif (t >= LENS[m_seg.get()]) {{\n\
+         \t\tt = 0;\n\
+         \t\tvar nxt = _next(m_seg.get());\n\
+         \t\t// staying put needs no call: the animation already loops itself, and restarting it\n\
+         \t\t// would visibly re-seat the element every lap.\n\
+         \t\tif (nxt != m_seg.get()) {{ m_seg.set(nxt); Common.toLocalState(STATES[nxt]); }}\n\
+         \t}}\n\tm_t.set(t);\n}}\n",
+        states.join(",\n"), lens.join(", "),
+        spans.iter().map(|(n, ..)| format!("LState.{}", n.to_ascii_uppercase())).collect::<Vec<_>>().join(", "),
+        arms)
+}
+
 /// Emit each promoted backdrop element as a looping VFX content (a `.entity` of objectType "VFX",
 /// no scripts/stats/manifest entry — resolved by id via getContent, like the character port's
 /// effects) and return the stage-Script spawn lines: createVfx (loop forever, absolute position)
 /// then reparent its sprite into the stage background container for depth.
-fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path) -> Result<String> {
+fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
+    -> Result<(String, Vec<Value>)> {
     let mut spawns = String::new();
+    let mut entries: Vec<Value> = Vec::new();
     for (i, layer) in promoted.iter().enumerate() {
         let eid = format!("{}_{}", model.id, layer.eid);
+        // an element whose clip branches between labels can't be a VFX: a VFX holds one animation
+        // and carries no script, so there is nothing to switch and nothing to switch it.
+        if layer.segments.len() > 1 {
+            emit_bg_segmented(model, layer, &eid, i, lib, &mut spawns, &mut entries)?;
+            continue;
+        }
         write_json(&lib.join("entities").join(format!("{eid}.entity")), &bg_element_entity(&eid, layer, model.scale))?;
         write_meta(&lib.join("entities").join(format!("{eid}.entity.meta")), &eid, &eid, "", Some("VFX"), None)?;
         // createVfx loops the element forever at its baked-in position (relativeWith:false ->
         // absolute), then reparent its sprite into the background container so it draws in front
         // of the static background art and behind the fighters. no owner / no VfxLayer: the
         // container reparent is the authoritative depth control.
+        let (ox, oy) = bg_element_origin(layer);
         spawns.push_str(&format!(
             "\t\t\tvar _bg{i} = match.createVfx(new VfxStats({{ spriteContent: self.getResource().getContent(\"{eid}\"), \
-             animation: \"active\", x: 0, y: 0, loop: true, timeout: -1, relativeWith: false, resizeWith: false }}));\n\
-             \t\t\tif (_bg{i} != null) {{ self.getBackgroundBehindContainer().addChild(_bg{i}.getSprite()); }}\n"));
+             animation: \"active\", x: {ox}, y: {oy}, loop: true, timeout: -1, relativeWith: false, resizeWith: false }}));\n\
+             \t\t\tif (_bg{i} != null) {{ self.{container}().addChild(_bg{i}.getViewRootContainer()); }}\n",
+            container = layer.plane.container()));
     }
-    Ok(spawns)
+    Ok((spawns, entries))
+}
+
+/// One segmented backdrop element: a CUSTOM_GAME_OBJECT (entity + state-machine Script + stats),
+/// spawned and reparented into the SAME layer container the VFX form uses, so switching vehicles
+/// doesn't change where it draws.
+#[allow(clippy::too_many_arguments)]
+fn emit_bg_segmented(
+    model: &StageModel, layer: &BgLayerRef, eid: &str, i: usize, lib: &Path,
+    spawns: &mut String, entries: &mut Vec<Value>,
+) -> Result<()> {
+    let scripts = lib.join("scripts").join("entities");
+    std::fs::create_dir_all(&scripts)?;
+    write_json(&lib.join("entities").join(format!("{eid}.entity")), &bg_segment_entity(eid, layer, model.scale))?;
+    write_meta(&lib.join("entities").join(format!("{eid}.entity.meta")), eid, eid, "", Some("CUSTOM_GAME_OBJECT"), None)?;
+
+    let spans = bg_segment_spans(layer);
+    let anim_stats = spans.iter()
+        .map(|(n, ..)| format!("\t{n}: {{ endType: AnimationEndType.LOOP }}"))
+        .collect::<Vec<_>>().join(",\n");
+    let files = [
+        ("Script", bg_segment_script_hx(eid, layer)),
+        ("GameObjectStats", format!(
+            "// GameObjectStats for the segmented backdrop element {eid}.\n{{\n\
+             \tspriteContent: self.getResource().getContent(\"{eid}\"),\n\tinitialState: PState.ACTIVE,\n\
+             \tstateTransitionMapOverrides: [\n\t\tPState.ACTIVE => {{ animation: \"{}\" }}\n\t],\n\
+             \tbaseScaleX: 1,\n\tbaseScaleY: 1,\n\tweight: 100,\n\tgravity: 0,\n\tfriction: 0,\n\
+             \t// scenery: it is never pushed, and it never pushes anything.\n\timmovable: true,\n}}\n",
+            spans.first().map(|(n, ..)| n.clone()).unwrap_or_default())),
+        ("AnimationStats", format!(
+            "// AnimationStats for the segmented backdrop element {eid}. Every segment LOOPS; the\n\
+             // Script switches between them at a lap boundary.\n{{\n{anim_stats}\n}}\n")),
+    ];
+    for (kind, body) in files {
+        let fname = format!("{eid}{kind}");
+        write_script(&scripts.join(format!("{fname}.hx")), &body)?;
+        write_meta(&scripts.join(format!("{fname}.hx.meta")), eid, &fname,
+            if kind == "Script" { "" } else { "hscript" },
+            if kind == "Script" { Some("CUSTOM_GAME_OBJECT") } else { None }, None)?;
+    }
+    entries.push(json!({
+        "type": "customGameObject", "id": eid,
+        "scriptId": format!("{eid}Script"),
+        "objectStatsId": format!("{eid}GameObjectStats"),
+        "animationStatsId": format!("{eid}AnimationStats"),
+        "name": layer.name.clone(),
+    }));
+    let (ox, oy) = bg_element_origin(layer);
+    spawns.push_str(&format!(
+        "\t\t\tvar _bg{i} = match.createCustomGameObject(self.getResource().getContent(\"{eid}\"), owner);\n\
+         \t\t\tif (_bg{i} != null) {{ _bg{i}.setX({ox}); _bg{i}.setY({oy}); \
+         self.{container}().addChild(_bg{i}.getViewRootContainer()); }}\n",
+        container = layer.plane.container()));
+    Ok(())
 }
 
 /// hscript the stage Script runs to spawn its hazards (createCustomGameObject + position).

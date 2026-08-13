@@ -6,27 +6,27 @@ mod common;
 
 use ssf2_converter::{emit_stage, parse_stage, parse_stage_opts};
 
-/// Every stage in the corpus must parse (covers the terrain-naming variety across
-/// SSF2 stages, not just battlefield). Corpus-gated.
+/// A representative stage of each class must parse (covers the terrain-naming variety
+/// across SSF2 stages, not just battlefield). Corpus-gated; see `common::SAMPLE_STAGES`
+/// for what each sampled stage represents, and PEPTIDE_TEST_FULL_CORPUS for the sweep.
 #[test]
-fn all_corpus_stages_parse() {
-    let dir = common::ssfs_dir().join("stages");
-    if !common::present(&dir) {
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
+fn sampled_stages_parse() {
+    // A structurally diverse SAMPLE, not all 110 — one stage per class catches a change that
+    // breaks a class, without paying a full-corpus sweep on every `cargo test`. Set
+    // PEPTIDE_TEST_FULL_CORPUS=1 (or run `just sweep-stages`) for the exhaustive pass.
+    let stages = common::stage_sample();
+    if stages.is_empty() {
         return;
     }
-    let mut total = 0;
     let mut failed = Vec::new();
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let p = entry.unwrap().path();
-        if p.extension().and_then(|e| e.to_str()) != Some("ssf") {
-            continue;
-        }
-        total += 1;
-        if let Err(e) = parse_stage_opts(&p, false) {
+    for p in &stages {
+        if let Err(e) = parse_stage_opts(p, false) {
             failed.push(format!("{}: {e}", p.file_name().unwrap().to_string_lossy()));
         }
     }
-    assert!(failed.is_empty(), "{}/{} stages failed to parse:\n{}", failed.len(), total, failed.join("\n"));
+    assert!(failed.is_empty(), "{}/{} sampled stages failed to parse:\n{}",
+        failed.len(), stages.len(), failed.join("\n"));
 }
 
 /// Moving platforms: SSF2 stages with moving platforms (the `moving`-named containers)
@@ -34,6 +34,7 @@ fn all_corpus_stages_parse() {
 /// is kept as static collision and a warning surfaces it. Battlefield (no moving platforms)
 /// must NOT be flagged. Corpus-gated.
 #[test]
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
 fn moving_platforms_detected_and_flagged() {
     let dir = common::ssfs_dir().join("stages");
     if !common::present(&dir) {
@@ -43,7 +44,7 @@ fn moving_platforms_detected_and_flagged() {
     // is propagated to the collision child).
     let tos = dir.join("towerofsalvation.ssf");
     if common::present(&tos) {
-        let m = parse_stage(&tos).expect("parse towerofsalvation");
+        let m = common::parsed_stage("towerofsalvation").unwrap();
         let moving = m.platforms.iter().filter(|p| p.moving).count();
         assert!(moving > 0, "towerofsalvation has moving platforms");
         assert!(m.warnings.iter().any(|w| w.contains("moving platform")),
@@ -53,7 +54,7 @@ fn moving_platforms_detected_and_flagged() {
     // 3 soft) don't overlap, so the dedup pass leaves them intact.
     let bf = dir.join("battlefield.ssf");
     if common::present(&bf) {
-        let m = parse_stage(&bf).expect("parse battlefield");
+        let m = common::parsed_stage("battlefield").unwrap();
         assert!(m.platforms.iter().all(|p| !p.moving), "battlefield has no moving platforms");
         assert!(!m.warnings.iter().any(|w| w.contains("moving platform")), "no moving-platform warning");
         assert_eq!(m.platforms.len(), 4, "battlefield's 4 distinct platforms survive the dedup pass");
@@ -65,6 +66,7 @@ fn moving_platforms_detected_and_flagged() {
 /// emitted twice (overlapping rects). No two surviving platforms of the same kind may
 /// substantially overlap. Corpus-gated over the moving-platform stages.
 #[test]
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
 fn overlapping_platforms_are_deduped() {
     let dir = common::ssfs_dir().join("stages");
     if !common::present(&dir) {
@@ -94,6 +96,7 @@ fn overlapping_platforms_are_deduped() {
 /// the entire backdrop — FD (and ~half the corpus) rendered as a bare placeholder. Now FD must
 /// extract its real backdrop art. Corpus-gated.
 #[test]
+#[ignore = "full-conversion/art test: not part of the fast gate. Run with `cargo test -- --ignored`."]
 fn backdrop_only_stage_extracts_art() {
     let p = common::ssfs_dir().join("stages").join("finaldestination.ssf");
     if !common::present(&p) {
@@ -110,6 +113,7 @@ fn backdrop_only_stage_extracts_art() {
 /// x~2500) as the main floor, burying the real terrain. The plane exclusion fixes it: the
 /// floor must be the real terrain (reasonably sized, near the stage center). Corpus-gated.
 #[test]
+#[ignore = "full-conversion/art test: not part of the fast gate. Run with `cargo test -- --ignored`."]
 fn background_art_is_not_collision() {
     let p = common::ssfs_dir().join("stages").join("homeruncontest.ssf");
     if !common::present(&p) {
@@ -126,6 +130,7 @@ fn background_art_is_not_collision() {
 /// Battlefield is the iteration target: a 4-platform stage with death/camera
 /// boxes and 4 spawn points. Parse it and check the extracted geometry is sane.
 #[test]
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
 fn battlefield_parses_to_geometry() {
     let p = common::ssfs_dir().join("stages").join("battlefield.ssf");
     if !common::present(&p) {
@@ -191,6 +196,7 @@ fn battlefield_parses_to_geometry() {
 /// the fixed backdrop), and the emitter must produce a `parallax0` animation + camera
 /// background. Corpus-gated.
 #[test]
+#[ignore = "full-conversion/art test: not part of the fast gate. Run with `cargo test -- --ignored`."]
 fn junglehijinx_has_parallax() {
     let p = common::ssfs_dir().join("stages").join("junglehijinx.ssf");
     if !common::present(&p) {
@@ -245,6 +251,7 @@ fn junglehijinx_has_parallax() {
 /// Emit the FM stage package and assert the `.entity` graph is internally
 /// consistent: every animation layer resolves, every keyframe's symbol resolves.
 #[test]
+#[ignore = "full-conversion/art test: not part of the fast gate. Run with `cargo test -- --ignored`."]
 fn battlefield_emits_consistent_entity() {
     let p = common::ssfs_dir().join("stages").join("battlefield.ssf");
     if !common::present(&p) {
@@ -317,13 +324,14 @@ fn battlefield_emits_consistent_entity() {
 /// zone) and emit as FM custom game objects. A hand-declared metadata entry overrides detection.
 /// Corpus-gated.
 #[test]
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
 fn hazard_stages_emit_hazards() {
     let dir = common::ssfs_dir().join("stages");
     if !common::present(&dir) {
         return;
     }
     // casinonightzone: auto-detected pinball bumpers (a real stage, hazards inside the view).
-    let cnz = parse_stage(&dir.join("casinonightzone.ssf")).unwrap();
+    let cnz = common::parsed_stage("casinonightzone").unwrap();
     assert!(cnz.hazards.iter().any(|h| h.label == "Bumper"),
         "casinonightzone should auto-detect bumpers, got {:?}",
         cnz.hazards.iter().map(|h| &h.label).collect::<Vec<_>>());
@@ -334,7 +342,7 @@ fn hazard_stages_emit_hazards() {
     // (visible grey platforms from metadata) plus the central pedestal, which is real parsed
     // terrain (terrainGround_platform, a drop-through) — declaring it too would duplicate the
     // collision (see mappings/stage/metadata.jsonc).
-    let bc = parse_stage(&dir.join("bowserscastle.ssf")).unwrap();
+    let bc = common::parsed_stage("bowserscastle").unwrap();
     let thwomp = bc.hazards.iter().find(|h| h.label == "Thwomp");
     assert!(thwomp.is_some(), "bowserscastle should carry the AS3-spawned thwomp, got {:?}",
         bc.hazards.iter().map(|h| (&h.label, &h.motion)).collect::<Vec<_>>());
@@ -346,7 +354,7 @@ fn hazard_stages_emit_hazards() {
         "and the central pedestal stays as real parsed drop-through terrain");
 
     // battlefield: a clean flat stage with no hazards (auto-detection must not false-positive).
-    let bf = parse_stage(&dir.join("battlefield.ssf")).unwrap();
+    let bf = common::parsed_stage("battlefield").unwrap();
     assert!(bf.hazards.is_empty(), "battlefield must stay hazard-free, got {:?}",
         bf.hazards.iter().map(|h| &h.label).collect::<Vec<_>>());
 }

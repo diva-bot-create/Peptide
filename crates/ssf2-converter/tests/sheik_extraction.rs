@@ -6,7 +6,6 @@
 //! AnimationStats / HitboxStats / Script). Skipped silently if the
 //! corpus isn't on disk (matches `golden_sandbag.rs` pattern).
 
-use ssf2_converter::{run_conversion, ConvertOptions};
 use std::path::PathBuf;
 
 mod common;
@@ -16,24 +15,22 @@ fn zelda_ssf_path() -> PathBuf {
 }
 
 #[test]
+#[ignore = "full-conversion/art test: not part of the fast gate. Run with `cargo test -- --ignored`."]
 fn sheik_emits_full_package_from_zelda_ssf() {
     let ssf = zelda_ssf_path();
     if !common::present(&ssf) { return; }
 
-    let out = tempfile::tempdir().expect("tempdir");
-    // Default: full SSF conversion. Stage B emits zelda+sheik into ONE
-    // project at characters/zelda/. The --name override would route to
-    // single-character mode; we exercise the default multi-char path here.
-    let mut opts = ConvertOptions::new(&ssf);
-    opts.output = out.path().to_path_buf();
-    run_conversion(opts).expect("run_conversion for zelda.ssf");
+    // Default (no --name) full SSF conversion, shared with the other corpus tests: Stage B
+    // emits zelda+sheik into ONE project at characters/zelda/. The --name override would
+    // route to single-character mode; we exercise the default multi-char path here.
+    let Some(out) = common::shared_conversion("zelda") else { return };
 
     // Stage B: zelda.ssf → ONE characters/zelda/ project containing both
     // characters. characters/sheik/ does NOT exist.
-    let project = out.path().join("zelda");
+    let project = out.join("zelda");
     assert!(project.exists(), "characters/zelda must exist (multi-char project)");
     assert!(project.join("zelda.fraytools").exists(), "project .fraytools missing");
-    assert!(!out.path().join("sheik").exists(),
+    assert!(!out.join("sheik").exists(),
         "characters/sheik must NOT exist as a standalone project");
 
     // Sheik's scripts live at library/scripts/Sheik/ inside the project.

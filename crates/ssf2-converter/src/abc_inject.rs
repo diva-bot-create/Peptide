@@ -32,6 +32,7 @@ const OP_RETURNVOID: u8 = 0x47;
 const OP_JUMP: u8 = 0x10;
 #[allow(dead_code)] const OP_IFTRUE: u8 = 0x11;
 const OP_IFFALSE: u8 = 0x12;
+const OP_PUSHFALSE: u8 = 0x27;
 const OP_IFSTRICTEQ: u8 = 0x19;
 #[allow(dead_code)] const OP_IFSTRICTNE: u8 = 0x1A;
 const OP_DUP: u8 = 0x2A;
@@ -54,6 +55,7 @@ const OP_PUSHSHORT: u8 = 0x25;
 /// `currentFrame` off a Bitmap throws (display classes are sealed), which would abort the
 /// whole command through the dispatcher's try and answer "ERR:" for an otherwise fine node.
 const OP_ISTYPELATE: u8 = 0xB3;
+const OP_IFGE: u8 = 0x18;
 
 // AVM2 namespace kinds
 const NS_PACKAGE: u8 = 0x16; // CONSTANT_PackageNamespace
@@ -270,6 +272,14 @@ struct FsApi {
     open: u32,        // QName(public, "open")
     write_utf: u32,   // QName(public, "writeUTFBytes")
     close: u32,       // QName(public, "close")
+    write_bytes: u32, // QName(public, "writeBytes") — binary payloads (a captured frame)
+    bitmap_data: u32, // QName(flash.display, "BitmapData")
+    png_opts: u32,    // QName(flash.display, "PNGEncoderOptions")
+    rectangle: u32,   // QName(flash.geom, "Rectangle")
+    draw: u32,        // QName(public, "draw")
+    encode: u32,      // QName(public, "encode")
+    transform: u32,   // QName(public, "transform")
+    matrix: u32,      // QName(public, "matrix")
 }
 
 fn intern_fs_api(abc: &mut Abc) -> FsApi {
@@ -278,12 +288,24 @@ fn intern_fs_api(abc: &mut Abc) -> FsApi {
     let pub_ns_name = abc.intern_string("");
     let pub_ns = abc.intern_namespace(NS_PACKAGE, pub_ns_name);
     let n_file = abc.intern_string("File");
+    let disp_ns_name = abc.intern_string("flash.display");
+    let disp_ns = abc.intern_namespace(NS_PACKAGE, disp_ns_name);
+    let geom_ns_name = abc.intern_string("flash.geom");
+    let geom_ns = abc.intern_namespace(NS_PACKAGE, geom_ns_name);
     let n_fs = abc.intern_string("FileStream");
     let n_fm = abc.intern_string("FileMode");
     let n_write = abc.intern_string("WRITE");
     let n_open = abc.intern_string("open");
     let n_wub = abc.intern_string("writeUTFBytes");
     let n_close = abc.intern_string("close");
+    let n_wb = abc.intern_string("writeBytes");
+    let n_bd = abc.intern_string("BitmapData");
+    let n_po = abc.intern_string("PNGEncoderOptions");
+    let n_rect = abc.intern_string("Rectangle");
+    let n_draw = abc.intern_string("draw");
+    let n_enc = abc.intern_string("encode");
+    let n_tr = abc.intern_string("transform");
+    let n_mx = abc.intern_string("matrix");
     FsApi {
         file: abc.intern_qname(fs_ns, n_file),
         file_stream: abc.intern_qname(fs_ns, n_fs),
@@ -292,6 +314,14 @@ fn intern_fs_api(abc: &mut Abc) -> FsApi {
         open: abc.intern_qname(pub_ns, n_open),
         write_utf: abc.intern_qname(pub_ns, n_wub),
         close: abc.intern_qname(pub_ns, n_close),
+        write_bytes: abc.intern_qname(pub_ns, n_wb),
+        bitmap_data: abc.intern_qname(disp_ns, n_bd),
+        png_opts: abc.intern_qname(disp_ns, n_po),
+        rectangle: abc.intern_qname(geom_ns, n_rect),
+        draw: abc.intern_qname(pub_ns, n_draw),
+        encode: abc.intern_qname(pub_ns, n_enc),
+        transform: abc.intern_qname(pub_ns, n_tr),
+        matrix: abc.intern_qname(pub_ns, n_mx),
     }
 }
 
@@ -670,6 +700,44 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
     let disp_ns = { let ss = abc.intern_string("flash.display"); abc.intern_namespace(NS_PACKAGE, ss) };
     let mn_movieclip = q(abc, disp_ns, "MovieClip");
     let mn_container = q(abc, disp_ns, "DisplayObjectContainer");
+    // TREE: the WHOLE subtree in one reply, walked recursively inside the engine.
+    //
+    // Even with CHILDREN batching the reads, the host still had to move the cursor to each
+    // container, so a walk cost a few hundred round trips. Recursion does it in ONE. It also
+    // makes the walk ATOMIC: the previous walks took long enough that the live display list
+    // shifted underneath them, so the same object could be reported twice (podoboos appeared
+    // at 50/82, 6/82 and 64/82 in a single walk) and others missed entirely.
+    //
+    // Recursion is a METHOD CALL, which is exactly why it works where a loop did not: a
+    // backward branch fails AVM2 verification and takes the whole dispatcher down with it
+    // (bisected — see the CHILDREN comment). Each record is prefixed with its depth so the
+    // host can rebuild the shape without tracking position.
+    // getBounds(root) -> the node's WORLD bounding box. A node's own x/y is its registration
+    // point, which is not where its art starts, and the two engines pick different origins:
+    // Fraymakers rasterises each element into its own image and records that image's top-left.
+    // Comparing a registration point against an image corner produces a mapping that fits no
+    // element (measured: SSF2 x ascending 381/408/446 against Fraymakers 703/118/241 — not
+    // even monotonic). The bounding box is the shared reference both sides can be read in.
+    let mn_getbounds = q(abc, pub_ns, "getBounds");
+    let s_v_tree = abc.intern_string("TREE");
+    let s_v_shot = abc.intern_string("SHOT");
+    let s_shot_ok = abc.intern_string("SHOT:ok ");
+    let fsapi = intern_fs_api(abc);
+    let mn_pwalk = {
+        let empty = abc.intern_string("");
+        let ns = abc.intern_namespace(NS_PACKAGE, empty);
+        q(abc, ns, "peptideWalk")
+    };
+    // Records are separated by ";;", NOT by a newline: the wire is line-based, so a
+    // newline-joined reply is truncated to its first record and the walk silently sees one
+    // child per container.
+    let s_nl2 = abc.intern_string(";;");
+    let mn_getchildat = {
+        let empty = abc.intern_string("");
+        let ns = abc.intern_namespace(NS_PACKAGE, empty);
+        q(abc, ns, "getChildAt")
+    };
+
     let mn_n_name = q(abc, pub_ns, "name");
     let mn_n_x = q(abc, pub_ns, "x");
     let mn_n_y = q(abc, pub_ns, "y");
@@ -749,6 +817,8 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
     // locals: this=0 event=1 (2,3 unused) cmd=4 arr=5 seq=6 verb=7 a1=8 a2=9 result=10
     //         g=11 ps=12 a3=13 (optional 3rd command arg, e.g. SPAWN's player count)
     let (l_cmd, l_arr, l_seq, l_verb, l_a1, l_a2, l_res, l_a3) = (4u32,5,6,7,8,9,10,13);
+    // scratch for SHOT (bitmap, encoded bytes, file, stream)
+    let (l_shot_bd, l_shot_ba, l_shot_f, l_shot_fs) = (14u32, 15, 16, 17);
     let mut c = Code::default();
     c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
 
@@ -1032,6 +1102,74 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
     c.place(next); next = c.new_label();
     c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_log); c.branch(OP_IFSTRICTNE, next);
     c.op_u30(OP_PUSHSTRING, s_logged); c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_ADD); c.op_u30(OP_SETLOCAL, l_res); c.branch(OP_JUMP, l_done);
+    // SHOT <path>: the engine photographs ITSELF and writes the PNG straight to disk.
+    //
+    // The counterpart of Fraymakers' `shot`, and the reason the vocabulary can ask both
+    // engines the same question: an object walk proves an object EXISTS, is visible, sized
+    // and positioned, and none of that is evidence a pixel of it was drawn. Comparing the two
+    // engines' art needs their actual frames.
+    //
+    // The transports differ because the engines do. Fraymakers hex-encodes over its socket;
+    // here the frame is written directly, because hex-encoding a ByteArray needs a LOOP and a
+    // backward branch fails AVM2 verification, taking the whole dispatcher with it (the same
+    // constraint that made the tree walk recursive). AIR can write the file itself, so it does.
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_shot); c.branch(OP_IFSTRICTNE, next);
+    {
+        // bd = new BitmapData(<w>, <h>, false, 0) — the size comes over the WIRE rather than
+        // from `this.stage`: reading it off the dispatcher's receiver raises #1069 (the property
+        // is not on that object), and the host already knows the view dimensions.
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.bitmap_data);
+        c.op_u30(OP_GETLOCAL, l_a2); c.op(OP_CONVERT_I);
+        c.op_u30(OP_GETLOCAL, l_a3); c.op(OP_CONVERT_I);
+        c.op(OP_PUSHFALSE);
+        c.op_u30(OP_PUSHBYTE, 0);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.bitmap_data, 4);
+        c.op_u30(OP_SETLOCAL, l_shot_bd);
+        // bd.draw(this, this.transform.matrix) — the root WITH its own transform, so the capture
+        // carries the camera's pan/zoom. Drawing without the matrix ignores it and photographs the
+        // stage at its authored scale, which silently makes a cross-engine frame comparison
+        // measure FRAMING rather than art.
+        c.op_u30(OP_GETLOCAL, l_shot_bd);
+        c.op(OP_GETLOCAL0);
+        c.op(OP_GETLOCAL0);
+        c.op_u30(OP_GETPROPERTY, fsapi.transform);
+        c.op_u30(OP_GETPROPERTY, fsapi.matrix);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.draw, 2);
+        // ba = bd.encode(new Rectangle(0, 0, w, h), new PNGEncoderOptions())
+        c.op_u30(OP_GETLOCAL, l_shot_bd);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.rectangle);
+        c.op_u30(OP_PUSHBYTE, 0); c.op_u30(OP_PUSHBYTE, 0);
+        c.op_u30(OP_GETLOCAL, l_a2); c.op(OP_CONVERT_I);
+        c.op_u30(OP_GETLOCAL, l_a3); c.op(OP_CONVERT_I);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.rectangle, 4);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.png_opts);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.png_opts, 0);
+        c.op_u30_u30(OP_CALLPROPERTY, fsapi.encode, 2);
+        c.op_u30(OP_SETLOCAL, l_shot_ba);
+        // write it: new File(<path arg>), FileStream.open(WRITE), writeBytes, close
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.file);
+        c.op_u30(OP_GETLOCAL, l_a1);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.file, 1);
+        c.op_u30(OP_SETLOCAL, l_shot_f);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.file_stream);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.file_stream, 0);
+        c.op_u30(OP_SETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_f);
+        c.op_u30(OP_GETLEX, fsapi.file_mode);
+        c.op_u30(OP_GETPROPERTY, fsapi.write_prop);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.open, 2);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_ba);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.write_bytes, 1);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.close, 0);
+        c.op_u30(OP_PUSHSTRING, s_shot_ok);
+        c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_ADD);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
     // NODE: the whole node in one reply (see s_v_node). Properties every DisplayObject
     // has are read unguarded; MovieClip-only and container-only ones are behind an
     // `istypelate` check, because these classes are SEALED and reading a missing property
@@ -1073,6 +1211,406 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
         c.place(l_mc_end);
         c.op_u30(OP_SETLOCAL, l_res);
     }
+
+    // TREE <maxDepth>: the whole subtree from the root, in one reply (see s_v_tree).
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_tree); c.branch(OP_IFSTRICTNE, next);
+    {
+        c.op(OP_GETLOCAL0);                                   // receiver
+        c.op(OP_GETLOCAL0);                                   // node = this (the display root)
+        c.op_u30(OP_PUSHBYTE, 0);                             // depth
+        c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_CONVERT_I);      // maxDepth (wire arg)
+        c.op_u30_u30(OP_CALLPROPERTY, mn_pwalk, 3);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // SHOT <path>: the engine photographs ITSELF and writes the PNG straight to disk.
+    //
+    // The counterpart of Fraymakers' `shot`, and the reason the vocabulary can ask both
+    // engines the same question: an object walk proves an object EXISTS, is visible, sized
+    // and positioned, and none of that is evidence a pixel of it was drawn. Comparing the two
+    // engines' art needs their actual frames.
+    //
+    // The transports differ because the engines do. Fraymakers hex-encodes over its socket;
+    // here the frame is written directly, because hex-encoding a ByteArray needs a LOOP and a
+    // backward branch fails AVM2 verification, taking the whole dispatcher with it (the same
+    // constraint that made the tree walk recursive). AIR can write the file itself, so it does.
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_shot); c.branch(OP_IFSTRICTNE, next);
+    {
+        // bd = new BitmapData(<w>, <h>, false, 0) — the size comes over the WIRE rather than
+        // from `this.stage`: reading it off the dispatcher's receiver raises #1069 (the property
+        // is not on that object), and the host already knows the view dimensions.
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.bitmap_data);
+        c.op_u30(OP_GETLOCAL, l_a2); c.op(OP_CONVERT_I);
+        c.op_u30(OP_GETLOCAL, l_a3); c.op(OP_CONVERT_I);
+        c.op(OP_PUSHFALSE);
+        c.op_u30(OP_PUSHBYTE, 0);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.bitmap_data, 4);
+        c.op_u30(OP_SETLOCAL, l_shot_bd);
+        // bd.draw(this, this.transform.matrix) — the root WITH its own transform, so the capture
+        // carries the camera's pan/zoom. Drawing without the matrix ignores it and photographs the
+        // stage at its authored scale, which silently makes a cross-engine frame comparison
+        // measure FRAMING rather than art.
+        c.op_u30(OP_GETLOCAL, l_shot_bd);
+        c.op(OP_GETLOCAL0);
+        c.op(OP_GETLOCAL0);
+        c.op_u30(OP_GETPROPERTY, fsapi.transform);
+        c.op_u30(OP_GETPROPERTY, fsapi.matrix);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.draw, 2);
+        // ba = bd.encode(new Rectangle(0, 0, w, h), new PNGEncoderOptions())
+        c.op_u30(OP_GETLOCAL, l_shot_bd);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.rectangle);
+        c.op_u30(OP_PUSHBYTE, 0); c.op_u30(OP_PUSHBYTE, 0);
+        c.op_u30(OP_GETLOCAL, l_a2); c.op(OP_CONVERT_I);
+        c.op_u30(OP_GETLOCAL, l_a3); c.op(OP_CONVERT_I);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.rectangle, 4);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.png_opts);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.png_opts, 0);
+        c.op_u30_u30(OP_CALLPROPERTY, fsapi.encode, 2);
+        c.op_u30(OP_SETLOCAL, l_shot_ba);
+        // write it: new File(<path arg>), FileStream.open(WRITE), writeBytes, close
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.file);
+        c.op_u30(OP_GETLOCAL, l_a1);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.file, 1);
+        c.op_u30(OP_SETLOCAL, l_shot_f);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.file_stream);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.file_stream, 0);
+        c.op_u30(OP_SETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_f);
+        c.op_u30(OP_GETLEX, fsapi.file_mode);
+        c.op_u30(OP_GETPROPERTY, fsapi.write_prop);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.open, 2);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_ba);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.write_bytes, 1);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.close, 0);
+        c.op_u30(OP_PUSHSTRING, s_shot_ok);
+        c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_ADD);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // NODE: the whole node in one reply (see s_v_node). Properties every DisplayObject
+    // has are read unguarded; MovieClip-only and container-only ones are behind an
+    // `istypelate` check, because these classes are SEALED and reading a missing property
+    // throws — which the dispatcher's try would turn into "ERR:" for the entire node.
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_node); c.branch(OP_IFSTRICTNE, next);
+    {
+        let cur = |c: &mut Code| { c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_cur); };
+        let bar = |c: &mut Code| { c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD); };
+        // class + the DisplayObject-safe fields
+        cur(&mut c); c.op(OP_CONVERT_S);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_name); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_x); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_y); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_w); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_h); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_vis); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        // numChildren, only if it is a container
+        bar(&mut c);
+        let l_nc_no = c.new_label(); let l_nc_end = c.new_label();
+        cur(&mut c); c.op_u30(OP_GETLEX, mn_container); c.op(OP_ISTYPELATE); c.branch(OP_IFFALSE, l_nc_no);
+        cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_nch); c.op(OP_CONVERT_S); c.branch(OP_JUMP, l_nc_end);
+        c.place(l_nc_no); c.op_u30(OP_PUSHSTRING, s_dash);
+        c.place(l_nc_end); c.op(OP_ADD);
+        // frame / total / label, only if it is a MovieClip
+        let l_mc_no = c.new_label(); let l_mc_end = c.new_label();
+        cur(&mut c); c.op_u30(OP_GETLEX, mn_movieclip); c.op(OP_ISTYPELATE); c.branch(OP_IFFALSE, l_mc_no);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_cf); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_tf); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_cl); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.branch(OP_JUMP, l_mc_end);
+        c.place(l_mc_no);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_dash); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_dash); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_empty2); c.op(OP_ADD);
+        c.place(l_mc_end);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // TREE <maxDepth>: the whole subtree from the root, in one reply (see s_v_tree).
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_tree); c.branch(OP_IFSTRICTNE, next);
+    {
+        c.op(OP_GETLOCAL0);                                   // receiver
+        c.op(OP_GETLOCAL0);                                   // node = this (the display root)
+        c.op_u30(OP_PUSHBYTE, 0);                             // depth
+        c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_CONVERT_I);      // maxDepth (wire arg)
+        c.op_u30_u30(OP_CALLPROPERTY, mn_pwalk, 3);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // SHOT <path>: the engine photographs ITSELF and writes the PNG straight to disk.
+    //
+    // The counterpart of Fraymakers' `shot`, and the reason the vocabulary can ask both
+    // engines the same question: an object walk proves an object EXISTS, is visible, sized
+    // and positioned, and none of that is evidence a pixel of it was drawn. Comparing the two
+    // engines' art needs their actual frames.
+    //
+    // The transports differ because the engines do. Fraymakers hex-encodes over its socket;
+    // here the frame is written directly, because hex-encoding a ByteArray needs a LOOP and a
+    // backward branch fails AVM2 verification, taking the whole dispatcher with it (the same
+    // constraint that made the tree walk recursive). AIR can write the file itself, so it does.
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_shot); c.branch(OP_IFSTRICTNE, next);
+    {
+        // bd = new BitmapData(<w>, <h>, false, 0) — the size comes over the WIRE rather than
+        // from `this.stage`: reading it off the dispatcher's receiver raises #1069 (the property
+        // is not on that object), and the host already knows the view dimensions.
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.bitmap_data);
+        c.op_u30(OP_GETLOCAL, l_a2); c.op(OP_CONVERT_I);
+        c.op_u30(OP_GETLOCAL, l_a3); c.op(OP_CONVERT_I);
+        c.op(OP_PUSHFALSE);
+        c.op_u30(OP_PUSHBYTE, 0);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.bitmap_data, 4);
+        c.op_u30(OP_SETLOCAL, l_shot_bd);
+        // bd.draw(this, this.transform.matrix) — the root WITH its own transform, so the capture
+        // carries the camera's pan/zoom. Drawing without the matrix ignores it and photographs the
+        // stage at its authored scale, which silently makes a cross-engine frame comparison
+        // measure FRAMING rather than art.
+        c.op_u30(OP_GETLOCAL, l_shot_bd);
+        c.op(OP_GETLOCAL0);
+        c.op(OP_GETLOCAL0);
+        c.op_u30(OP_GETPROPERTY, fsapi.transform);
+        c.op_u30(OP_GETPROPERTY, fsapi.matrix);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.draw, 2);
+        // ba = bd.encode(new Rectangle(0, 0, w, h), new PNGEncoderOptions())
+        c.op_u30(OP_GETLOCAL, l_shot_bd);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.rectangle);
+        c.op_u30(OP_PUSHBYTE, 0); c.op_u30(OP_PUSHBYTE, 0);
+        c.op_u30(OP_GETLOCAL, l_a2); c.op(OP_CONVERT_I);
+        c.op_u30(OP_GETLOCAL, l_a3); c.op(OP_CONVERT_I);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.rectangle, 4);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.png_opts);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.png_opts, 0);
+        c.op_u30_u30(OP_CALLPROPERTY, fsapi.encode, 2);
+        c.op_u30(OP_SETLOCAL, l_shot_ba);
+        // write it: new File(<path arg>), FileStream.open(WRITE), writeBytes, close
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.file);
+        c.op_u30(OP_GETLOCAL, l_a1);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.file, 1);
+        c.op_u30(OP_SETLOCAL, l_shot_f);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.file_stream);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.file_stream, 0);
+        c.op_u30(OP_SETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_f);
+        c.op_u30(OP_GETLEX, fsapi.file_mode);
+        c.op_u30(OP_GETPROPERTY, fsapi.write_prop);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.open, 2);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_ba);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.write_bytes, 1);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.close, 0);
+        c.op_u30(OP_PUSHSTRING, s_shot_ok);
+        c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_ADD);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // NODE: the whole node in one reply (see s_v_node). Properties every DisplayObject
+    // has are read unguarded; MovieClip-only and container-only ones are behind an
+    // `istypelate` check, because these classes are SEALED and reading a missing property
+    // throws — which the dispatcher's try would turn into "ERR:" for the entire node.
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_node); c.branch(OP_IFSTRICTNE, next);
+    {
+        let cur = |c: &mut Code| { c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_cur); };
+        let bar = |c: &mut Code| { c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD); };
+        // class + the DisplayObject-safe fields
+        cur(&mut c); c.op(OP_CONVERT_S);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_name); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_x); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_y); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_w); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_h); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_vis); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        // numChildren, only if it is a container
+        bar(&mut c);
+        let l_nc_no = c.new_label(); let l_nc_end = c.new_label();
+        cur(&mut c); c.op_u30(OP_GETLEX, mn_container); c.op(OP_ISTYPELATE); c.branch(OP_IFFALSE, l_nc_no);
+        cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_nch); c.op(OP_CONVERT_S); c.branch(OP_JUMP, l_nc_end);
+        c.place(l_nc_no); c.op_u30(OP_PUSHSTRING, s_dash);
+        c.place(l_nc_end); c.op(OP_ADD);
+        // frame / total / label, only if it is a MovieClip
+        let l_mc_no = c.new_label(); let l_mc_end = c.new_label();
+        cur(&mut c); c.op_u30(OP_GETLEX, mn_movieclip); c.op(OP_ISTYPELATE); c.branch(OP_IFFALSE, l_mc_no);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_cf); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_tf); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_cl); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.branch(OP_JUMP, l_mc_end);
+        c.place(l_mc_no);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_dash); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_dash); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_empty2); c.op(OP_ADD);
+        c.place(l_mc_end);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // TREE <maxDepth>: the whole subtree from the root, in one reply (see s_v_tree).
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_tree); c.branch(OP_IFSTRICTNE, next);
+    {
+        c.op(OP_GETLOCAL0);                                   // receiver
+        c.op(OP_GETLOCAL0);                                   // node = this (the display root)
+        c.op_u30(OP_PUSHBYTE, 0);                             // depth
+        c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_CONVERT_I);      // maxDepth (wire arg)
+        c.op_u30_u30(OP_CALLPROPERTY, mn_pwalk, 3);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // SHOT <path>: the engine photographs ITSELF and writes the PNG straight to disk.
+    //
+    // The counterpart of Fraymakers' `shot`, and the reason the vocabulary can ask both
+    // engines the same question: an object walk proves an object EXISTS, is visible, sized
+    // and positioned, and none of that is evidence a pixel of it was drawn. Comparing the two
+    // engines' art needs their actual frames.
+    //
+    // The transports differ because the engines do. Fraymakers hex-encodes over its socket;
+    // here the frame is written directly, because hex-encoding a ByteArray needs a LOOP and a
+    // backward branch fails AVM2 verification, taking the whole dispatcher with it (the same
+    // constraint that made the tree walk recursive). AIR can write the file itself, so it does.
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_shot); c.branch(OP_IFSTRICTNE, next);
+    {
+        // bd = new BitmapData(<w>, <h>, false, 0) — the size comes over the WIRE rather than
+        // from `this.stage`: reading it off the dispatcher's receiver raises #1069 (the property
+        // is not on that object), and the host already knows the view dimensions.
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.bitmap_data);
+        c.op_u30(OP_GETLOCAL, l_a2); c.op(OP_CONVERT_I);
+        c.op_u30(OP_GETLOCAL, l_a3); c.op(OP_CONVERT_I);
+        c.op(OP_PUSHFALSE);
+        c.op_u30(OP_PUSHBYTE, 0);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.bitmap_data, 4);
+        c.op_u30(OP_SETLOCAL, l_shot_bd);
+        // bd.draw(this, this.transform.matrix) — the root WITH its own transform, so the capture
+        // carries the camera's pan/zoom. Drawing without the matrix ignores it and photographs the
+        // stage at its authored scale, which silently makes a cross-engine frame comparison
+        // measure FRAMING rather than art.
+        c.op_u30(OP_GETLOCAL, l_shot_bd);
+        c.op(OP_GETLOCAL0);
+        c.op(OP_GETLOCAL0);
+        c.op_u30(OP_GETPROPERTY, fsapi.transform);
+        c.op_u30(OP_GETPROPERTY, fsapi.matrix);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.draw, 2);
+        // ba = bd.encode(new Rectangle(0, 0, w, h), new PNGEncoderOptions())
+        c.op_u30(OP_GETLOCAL, l_shot_bd);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.rectangle);
+        c.op_u30(OP_PUSHBYTE, 0); c.op_u30(OP_PUSHBYTE, 0);
+        c.op_u30(OP_GETLOCAL, l_a2); c.op(OP_CONVERT_I);
+        c.op_u30(OP_GETLOCAL, l_a3); c.op(OP_CONVERT_I);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.rectangle, 4);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.png_opts);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.png_opts, 0);
+        c.op_u30_u30(OP_CALLPROPERTY, fsapi.encode, 2);
+        c.op_u30(OP_SETLOCAL, l_shot_ba);
+        // write it: new File(<path arg>), FileStream.open(WRITE), writeBytes, close
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.file);
+        c.op_u30(OP_GETLOCAL, l_a1);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.file, 1);
+        c.op_u30(OP_SETLOCAL, l_shot_f);
+        c.op_u30(OP_FINDPROPSTRICT, fsapi.file_stream);
+        c.op_u30_u30(OP_CONSTRUCTPROP, fsapi.file_stream, 0);
+        c.op_u30(OP_SETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_f);
+        c.op_u30(OP_GETLEX, fsapi.file_mode);
+        c.op_u30(OP_GETPROPERTY, fsapi.write_prop);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.open, 2);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30(OP_GETLOCAL, l_shot_ba);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.write_bytes, 1);
+        c.op_u30(OP_GETLOCAL, l_shot_fs);
+        c.op_u30_u30(OP_CALLPROPVOID, fsapi.close, 0);
+        c.op_u30(OP_PUSHSTRING, s_shot_ok);
+        c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_ADD);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // NODE: the whole node in one reply (see s_v_node). Properties every DisplayObject
+    // has are read unguarded; MovieClip-only and container-only ones are behind an
+    // `istypelate` check, because these classes are SEALED and reading a missing property
+    // throws — which the dispatcher's try would turn into "ERR:" for the entire node.
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_node); c.branch(OP_IFSTRICTNE, next);
+    {
+        let cur = |c: &mut Code| { c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_cur); };
+        let bar = |c: &mut Code| { c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD); };
+        // class + the DisplayObject-safe fields
+        cur(&mut c); c.op(OP_CONVERT_S);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_name); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_x); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_y); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_w); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_h); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_vis); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        // numChildren, only if it is a container
+        bar(&mut c);
+        let l_nc_no = c.new_label(); let l_nc_end = c.new_label();
+        cur(&mut c); c.op_u30(OP_GETLEX, mn_container); c.op(OP_ISTYPELATE); c.branch(OP_IFFALSE, l_nc_no);
+        cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_nch); c.op(OP_CONVERT_S); c.branch(OP_JUMP, l_nc_end);
+        c.place(l_nc_no); c.op_u30(OP_PUSHSTRING, s_dash);
+        c.place(l_nc_end); c.op(OP_ADD);
+        // frame / total / label, only if it is a MovieClip
+        let l_mc_no = c.new_label(); let l_mc_end = c.new_label();
+        cur(&mut c); c.op_u30(OP_GETLEX, mn_movieclip); c.op(OP_ISTYPELATE); c.branch(OP_IFFALSE, l_mc_no);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_cf); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_tf); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        bar(&mut c); cur(&mut c); c.op_u30(OP_GETPROPERTY, mn_n_cl); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.branch(OP_JUMP, l_mc_end);
+        c.place(l_mc_no);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_dash); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_dash); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_empty2); c.op(OP_ADD);
+        c.place(l_mc_end);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // TREE <maxDepth>: the whole subtree from the root, in one reply (see s_v_tree).
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_tree); c.branch(OP_IFSTRICTNE, next);
+    {
+        c.op(OP_GETLOCAL0);                                   // receiver
+        c.op(OP_GETLOCAL0);                                   // node = this (the display root)
+        c.op_u30(OP_PUSHBYTE, 0);                             // depth
+        c.op_u30(OP_GETLOCAL, l_a1); c.op(OP_CONVERT_I);      // maxDepth (wire arg)
+        c.op_u30_u30(OP_CALLPROPERTY, mn_pwalk, 3);
+        c.op_u30(OP_SETLOCAL, l_res);
+    }
+
+    // CHILDREN: every child of the current node, one NODE-shaped record each, newline-joined.
+    //
+    // The host walk re-navigates from ROOT for every node (ROOT + one getChildAt per level +
+    // NODE), so a stage tree costs on the order of (depth + 2) round trips PER NODE — about
+    // 1,800 for bowserscastle. That is not only slow: the walk is not atomic, so the live
+    // display list shifts underneath it and objects get reported twice or missed entirely.
+    // Reading a whole sibling set at once removes the per-child navigation and makes each
+    // container's children one consistent snapshot.
+    //
+    // UNROLLED over fixed child indices with FORWARD jumps only. A real loop here — counter
+    // local, `inclocal_i`, backward `jump` — fails AVM2 verification and takes the whole verb
+    // dispatcher down with it (the engine comes up with SCRIPTERR and every verb, NODE
+    // included, answers "?"). Bisected to the backward branch specifically: identical code
+    // with the jump removed verifies fine. The Fraymakers walk hit the same wall and uses the
+    // same shape; see `tree` in src/main.rs.
+
+    // NOTE: a CHILDREN verb (a whole sibling set in one reply) was tried here to collapse the
+    // walk's per-node round trips. The AVM2 body failed verification and took the entire verb
+    // dispatcher down with it -- the engine came up with SCRIPTERR and every verb, including
+    // NODE, returned "?". Reverted rather than left half-working; the walk is pruned host-side
+    // instead (see Ssf2Target::walk_node), which is the smaller win but keeps the engine sound.
     c.branch(OP_JUMP, l_done);
     // READ: result = String(cur)
     c.place(next);
@@ -1105,8 +1643,93 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
     // exception-table entry covering the whole dispatch (catch-all: exc_type 0). Capture
     // the byte offsets before finish() consumes the Code.
     let exc = Exception { from: c.pos(l_try_start), to: c.pos(l_try_end), target: c.pos(l_catch), exc_type: 0, var_name: 0 };
-    abc.add_body(MethodBody { method: handler, max_stack: 7, local_count: 14, init_scope_depth: 0, max_scope_depth: 2, code: c.finish(), exceptions: vec![exc], traits: vec![] });
+    // locals 14-17 and the deeper stack belong to SHOT (bitmap/bytes/file/stream, and the
+    // BitmapData + Rectangle constructions): a body that uses a local or stack slot it did
+    // not declare fails AVM2 verification at LOAD, which reads as "the engine never settled"
+    // rather than as a bytecode error.
+    abc.add_body(MethodBody { method: handler, max_stack: 12, local_count: 18, init_scope_depth: 0, max_scope_depth: 2, code: c.finish(), exceptions: vec![exc], traits: vec![] });
     abc.add_instance_method_trait(ci, mn_ondata, handler);
+
+    // ── peptideWalk(node, depth, maxDepth) : String ────────────────────────────────────
+    // The recursive half of the TREE verb. Emits `<depth>|<class>|<name>|<x>|<y>|<w>|<h>|
+    // <visible>|<numChildren>|<frame>|<total>|<label>` for `node`, then appends the same for
+    // each child, records separated by ";;" (NOT newline -- the wire is line-based, and a
+    // newline-joined reply is truncated to its first record).
+    //
+    // Children are UNROLLED with forward jumps only, for the same reason the CHILDREN verb is:
+    // a backward branch fails verification. Recursion supplies the repetition a loop would
+    // have, and costs one call per node instead of one round trip.
+    {
+        let mut w = Code::default();
+        let (l_node, l_depth, l_max, l_res, l_kid) = (1u32, 2u32, 3u32, 4u32, 5u32);
+        let node = |w: &mut Code| { w.op_u30(OP_GETLOCAL, l_node); };
+        let kid = |w: &mut Code| { w.op_u30(OP_GETLOCAL, l_kid); };
+        let bar = |w: &mut Code| { w.op_u30(OP_PUSHSTRING, s_bar); w.op(OP_ADD); };
+
+        w.op(OP_GETLOCAL0); w.op(OP_PUSHSCOPE);
+        // res = depth + "|" + <this node's record> + ";;"
+        w.op_u30(OP_GETLOCAL, l_depth); w.op(OP_CONVERT_S);
+        bar(&mut w); node(&mut w); w.op(OP_CONVERT_S); w.op(OP_ADD);
+        for mn in [mn_n_name, mn_n_x, mn_n_y, mn_n_w, mn_n_h, mn_n_vis] {
+            bar(&mut w); node(&mut w); w.op_u30(OP_GETPROPERTY, mn); w.op(OP_CONVERT_S); w.op(OP_ADD);
+        }
+        bar(&mut w);
+        let (n_no, n_done) = (w.new_label(), w.new_label());
+        node(&mut w); w.op_u30(OP_GETLEX, mn_container); w.op(OP_ISTYPELATE); w.branch(OP_IFFALSE, n_no);
+        node(&mut w); w.op_u30(OP_GETPROPERTY, mn_n_nch); w.op(OP_CONVERT_S); w.branch(OP_JUMP, n_done);
+        w.place(n_no); w.op_u30(OP_PUSHSTRING, s_dash);
+        w.place(n_done); w.op(OP_ADD);
+        let (c_no, c_done) = (w.new_label(), w.new_label());
+        node(&mut w); w.op_u30(OP_GETLEX, mn_movieclip); w.op(OP_ISTYPELATE); w.branch(OP_IFFALSE, c_no);
+        for mn in [mn_n_cf, mn_n_tf, mn_n_cl] {
+            bar(&mut w); node(&mut w); w.op_u30(OP_GETPROPERTY, mn); w.op(OP_CONVERT_S); w.op(OP_ADD);
+        }
+        w.branch(OP_JUMP, c_done);
+        w.place(c_no);
+        for _ in 0..2 { bar(&mut w); w.op_u30(OP_PUSHSTRING, s_dash); w.op(OP_ADD); }
+        bar(&mut w); w.op_u30(OP_PUSHSTRING, s_empty2); w.op(OP_ADD);
+        w.place(c_done);
+        // world bounding-box top-left: node.getBounds(root).x / .y
+        for mn in [mn_n_x, mn_n_y] {
+            bar(&mut w);
+            node(&mut w);
+            w.op(OP_GETLOCAL0);
+            w.op_u30_u30(OP_CALLPROPERTY, mn_getbounds, 1);
+            w.op_u30(OP_GETPROPERTY, mn);
+            w.op(OP_CONVERT_S); w.op(OP_ADD);
+        }
+        w.op_u30(OP_PUSHSTRING, s_nl2); w.op(OP_ADD);
+        w.op_u30(OP_SETLOCAL, l_res);
+
+        let l_ret = w.new_label();
+        // stop at maxDepth, and never descend into a non-container
+        w.op_u30(OP_GETLOCAL, l_depth); w.op_u30(OP_GETLOCAL, l_max); w.branch(OP_IFGE, l_ret);
+        node(&mut w); w.op_u30(OP_GETLEX, mn_container); w.op(OP_ISTYPELATE); w.branch(OP_IFFALSE, l_ret);
+
+        for i in 0..48u32 {
+            w.op_u30(OP_PUSHBYTE, i);
+            node(&mut w); w.op_u30(OP_GETPROPERTY, mn_n_nch);
+            w.branch(OP_IFGE, l_ret);
+            node(&mut w); w.op_u30(OP_PUSHBYTE, i);
+            w.op_u30_u30(OP_CALLPROPERTY, mn_getchildat, 1); w.op_u30(OP_SETLOCAL, l_kid);
+            // res += this.peptideWalk(kid, depth + 1, max)
+            w.op_u30(OP_GETLOCAL, l_res);
+            w.op(OP_GETLOCAL0);
+            kid(&mut w);
+            w.op_u30(OP_GETLOCAL, l_depth); w.op_u30(OP_PUSHBYTE, 1); w.op(OP_ADD);
+            w.op_u30(OP_GETLOCAL, l_max);
+            w.op_u30_u30(OP_CALLPROPERTY, mn_pwalk, 3);
+            w.op(OP_ADD);
+            w.op_u30(OP_SETLOCAL, l_res);
+        }
+        w.place(l_ret);
+        w.op_u30(OP_GETLOCAL, l_res); w.op(OP_RETURNVALUE);
+
+        let n_pw = abc.intern_string("peptideWalk");
+        let pw = abc.add_method(MethodInfo { param_types: vec![0, 0, 0], return_type: 0, name: n_pw, flags: 0, options: vec![], param_names: vec![] });
+        abc.add_body(MethodBody { method: pw, max_stack: 10, local_count: 6, init_scope_depth: 0, max_scope_depth: 2, code: w.finish(), exceptions: vec![], traits: vec![] });
+        abc.add_instance_method_trait(ci, mn_pwalk, pw);
+    }
 
     // ctor: this.peptideSock = new Socket(); addEventListener("socketData", this.peptideOnData);
     //       connect(host, port)  — dial into the host's loopback server. connect() coerces

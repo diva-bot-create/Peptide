@@ -17,7 +17,6 @@
 //! see which outputs changed.
 
 use sha2::{Digest, Sha256};
-use ssf2_converter::{run_conversion, ConvertOptions};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -91,6 +90,11 @@ fn rm_rf(p: &Path) {
     let _ = std::fs::remove_dir_all(p);
 }
 
+// The ONE test in the default gate allowed to touch a real SSF2 file. Everything else that
+// needs the corpus is `#[ignore]`d — see TESTING.md §0. This one earns its place because the
+// golden hashes are the only thing that catches an unintended change to real converted output,
+// and no synthetic fixture can stand in for that. It still skips cleanly with no corpus on
+// disk, so a fresh checkout is unaffected.
 #[test]
 fn sandbag_conversion_matches_golden_hashes() {
     let ssf = sandbag_ssf_path();
@@ -102,16 +106,9 @@ fn sandbag_conversion_matches_golden_hashes() {
     assert!(!golden.is_empty(),
         "golden hash file must contain at least one entry");
 
-    // Re-run the converter in a fresh tempdir.
-    let tempdir = std::env::temp_dir()
-        .join(format!("ssf2_golden_sandbag_{}", std::process::id()));
-    rm_rf(&tempdir);
-    std::fs::create_dir_all(&tempdir).expect("mkdir tempdir");
-
-    // Convert in-process (was: spawn the release ssf2_converter binary).
-    let mut opts = ConvertOptions::new(&ssf);
-    opts.output = tempdir.clone();
-    run_conversion(opts).expect("run_conversion converting sandbag");
+    // Shared with the other corpus tests: the conversion is deterministic for a given
+    // converter build, so it runs once for the whole suite instead of once per binary.
+    let Some(tempdir) = common::shared_conversion("sandbag") else { return };
 
     let out_root = tempdir.join("sandbag");
     let observed = hash_text_outputs(&out_root);

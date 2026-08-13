@@ -60,6 +60,8 @@ pub const COMMANDS: &[Cmd] = &[
           args: "",                              help: "synchronous custom-.fra load probe (diagnostic; spawn does this itself)" },
     Cmd { name: "console", aliases: &["c"],                 wire: 'c',
           args: "",                              help: "run the engine's debug console `help` command (RAN) — a side-effecting call hscript can't make, so it stays a wire byte" },
+    Cmd { name: "shot",    aliases: &["screenshot", "png"],  wire: '\0',
+          args: "[path]",                        help: "screenshot the LIVE frame from inside the engine to a PNG (default /tmp/peptide-shot.png). the object tree proves an object exists; this proves it was drawn. CAPTURES THE DISPLAY ROOT, NOT THE CAMERA -- on both engines it can show off-camera art and carries no camera zoom, so set the camera first before comparing frames or calling it \"what the player sees\"" },
     Cmd { name: "tree",    aliases: &["dump"],              wire: '\0',
           args: "[depth]",                       help: "dump the live object tree (name/class/position/size/frame per node) — the stage-triage ground truth. SSF2 walks the display list; depth defaults to 6" },
     Cmd { name: "await",   aliases: &["settle", "playout"],  wire: '\0',
@@ -67,7 +69,7 @@ pub const COMMANDS: &[Cmd] = &[
     Cmd { name: "record",  aliases: &["rec"],                   wire: '\0',
           args: "[off]",                         help: "arm the engine's OWN per-frame recorder and clear its buffer (`record off` disarms). on SSF2 this is an injected ENTER_FRAME handler — the only way to observe it accurately, since polling samples slower than the animations run" },
     Cmd { name: "trace",   aliases: &["frames"],                wire: '\0',
-          args: "",                              help: "read back the recorded frame history (`<label>|<frame>|<x>|<y>;` per frame) in ONE round trip and stop recording" },
+          args: "[raw]",                         help: "read back the recorded frame history (`trace raw` dumps one line per frame with position, for measuring per-frame displacement/speed) (`<label>|<frame>|<x>|<y>;` per frame) in ONE round trip and stop recording" },
     Cmd { name: "awaitmatch", aliases: &["ready", "awaitspawn"], wire: '\0',
           args: "[pN] [tries]",                  help: "block until a character is actually READABLE (the match is up, not just spawn-acknowledged) — the deterministic replacement for sleeping after spawn. default 60 tries" },
     Cmd { name: "addCharacter", aliases: &["addchar", "add"], wire: 'n',
@@ -356,6 +358,8 @@ pub enum Command {
     /// Dump the live object tree to the given depth — the stage-triage ground truth
     /// (every live game object with its name/class/position/size/frame).
     Tree(u32),
+    /// Screenshot the live frame to a PNG path, captured inside the engine.
+    Shot(std::path::PathBuf),
     /// Watch a character's animation until it finishes, loops, changes, or stalls,
     /// polling the ENGINE'S OWN frame counter. The frame-accurate replacement for
     /// "sleep and hope": a wall-clock wait either observes a half-played animation or
@@ -384,7 +388,7 @@ pub enum Command {
     /// this reads the lot in ONE round trip. Fraymakers already PUSHES per-frame `ANIM:`
     /// telemetry over its socket and its eval is fast enough to poll, so it says so
     /// rather than pretending to have a buffer.
-    Trace,
+    Trace { raw: bool },
     /// Drop one more fighter into the live match (peptide todo #3).
     AddCharacter,
     /// Cleanly shut the engine down.
@@ -487,6 +491,10 @@ pub fn parse(line: &str) -> Command {
                 let depth = rest.first().and_then(|d| d.parse().ok()).unwrap_or(6);
                 return Command::Tree(depth);
             }
+            "shot" | "screenshot" | "png" => {
+                return Command::Shot(rest.first().map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/peptide-shot.png")));
+            }
             "await" | "settle" | "playout" => {
                 // await [pN] [budgetFrames] — both optional, either order-independent
                 // enough that a bare `await` is the common case.
@@ -511,7 +519,7 @@ pub fn parse(line: &str) -> Command {
                 let on = !matches!(rest.first().map(|s| s.to_ascii_lowercase()).as_deref(), Some("off"));
                 return Command::Record { on };
             }
-            "trace" | "frames" => return Command::Trace,
+            "trace" | "frames" => return Command::Trace { raw: rest.first().is_some_and(|a| a.eq_ignore_ascii_case("raw")) },
             "awaitmatch" | "ready" | "awaitspawn" => {
                 let mut idx = 0usize;
                 let mut tries = 60u32;
@@ -655,7 +663,7 @@ pub fn command_to_wire(cmd: &Command) -> Translated {
         Command::Info => Translated::Client(
             "info is executed host-side (run_command), not sent to the engine\n".into()),
         Command::Await { .. } | Command::AwaitMatch { .. }
-        | Command::Record { .. } | Command::Trace => Translated::Client(
+        | Command::Record { .. } | Command::Trace { .. } => Translated::Client(
             "await/awaitmatch/record/trace are executed host-side (run_command), not sent to the engine\n".into()),
         Command::Hold(m) => Translated::Wire(format!("i {m}")),
         Command::Seq(masks) => Translated::Wire(masks.iter().map(|m| format!("i {m}")).collect::<Vec<_>>().join("\n")),
@@ -668,6 +676,7 @@ pub fn command_to_wire(cmd: &Command) -> Translated {
         // FM tree walk: the 'w' wire handler walks currentMatch.gameObjects in bytecode (hl ArrayObj
         // doesn't reflect length/index in hscript, so the walk can't be eval-side).
         Command::Tree(_) => Translated::Wire("w".into()),
+        Command::Shot(_) => Translated::Wire("y".into()),
         Command::AddCharacter => Translated::Wire("n".into()),
         Command::Exit => Translated::Wire("x".into()),
         Command::Load => Translated::Wire("l".into()),
