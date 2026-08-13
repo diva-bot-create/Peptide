@@ -16,6 +16,7 @@
 
 // Public modules — exposed for use by binaries in src/bin/
 pub mod ssf;
+pub mod test_fixture;
 pub mod uuid_gen;
 pub mod swf_parser;
 pub mod abc_parser;
