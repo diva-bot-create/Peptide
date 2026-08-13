@@ -163,27 +163,29 @@ which in turn means a stage class redeclaring `initialize`/`update` must mark th
 direction wrong and the class is refused, and one refused class refuses the package -- silently,
 as a load that never completes.
 
-## known gap: the collision scan overflows
+## collision, and the two methods that are not forwards
 
-with the api chain in place and clips typed, the game DOES scan the stage for collision: it
-reaches `StageData.as:532` (`STAGE.findObjects(...)`) and gets as far as `StageData.as:698`, which
-is `TERRAINS.unshift(new MovingPlatform(...))`. building that platform overflows the stack
-(`Error #1023`) and the stage does not come up at all, so clip typing is off by default and turned
-on with `PEPTIDE_CLIP_TYPES`. a stage that comes up without ground beats one that does not come up.
+collision works. a fighter stands on the drop-through platform, walks off it onto the solid floor,
+and falls only past the floor's edge.
 
-one cause of that overflow is understood and fixed: `getType` must return the NAME OF ITS OWN
-CLASS as a constant, not forward to the api like its neighbours do. the game asks its object what
-it is, that object asks the package's, and a package that asks straight back leaves two objects
-each waiting on the other. everything else on those classes IS a plain forward, checked
-method by method against a shipped package.
+the api layer is forwarders, with two exceptions that are the difference between working and not:
 
-what is known about the scan, for whoever picks this up:
+* **`getType` returns the NAME OF ITS OWN CLASS**, as a constant.
+* **`getOwnStats` returns a stored value**, not a call. a shipped one is five bytes and calls
+  nothing. the field read out of it while a platform is built is `linkage_id`, the clip to draw it
+  with.
 
-* it is iterative, not recursive, working from a worklist of the stage's children.
-* it reads `type`, `className` and `classAPI` off each child. supplying the latter two as empty
-  strings made things worse rather than better, which fits: an empty name is still a name, and the
-  game goes looking for the class it names. shipped clips declare only `type`.
-* the branch for `"platform"` reads a `ground` property off the clip, which shipped clips do not
-  appear to declare either.
-* the fixture's clip structure matches a shipped stage shape for shape, so the difference is in
-  what the clips DECLARE rather than how they are built.
+both are asked BY the game's own object OF the package's, so a package that asks straight back
+leaves two objects each waiting on the other. that surfaces as a stack overflow from deep inside
+the engine while it builds collision, which reads like anything but a one-line mistake. everything
+else on those classes is a plain forward, and forwards must pass their ARGUMENTS through: half the
+surface takes one, and a forwarder that drops them succeeds while doing the wrong thing.
+
+declare the whole surface, not just the calls that look useful. the game calls what it likes, and
+a missing one is a property-not-found from inside its own code.
+
+## known gap
+
+art. a platform draws with the clip named by its `linkage_id`, and the fixture answers with its
+terrain clip for everything, so the platform borrows the floor's appearance. collision is
+unaffected, and a fixture is about geometry rather than looks.

@@ -317,6 +317,7 @@ pub const FIXTURE_ID: &str = "peptidefixture";
 const OP_GETLOCAL0: u8 = 0xd0;
 const OP_GETLOCAL1: u8 = 0xd1;
 const OP_GETLOCAL2: u8 = 0xd2;
+const OP_GETLOCAL: u8 = 0x62;
 const OP_GETSCOPEOBJECT: u8 = 0x65;
 const OP_PUSHFALSE: u8 = 0x27;
 const OP_GETPROPERTY: u8 = 0x66;
@@ -387,11 +388,6 @@ const CLIP_TYPE_SLOT: &str = "type";
 /// ground is "terrain", a drop-through is "platform", ledges name their side, and a spawn beacon
 /// names its player and whether it is where a fighter starts or where it returns.
 fn clip_type(local: &str) -> Option<&'static str> {
-    // OFF while the scan it feeds is still being worked out. Declaring these makes the game
-    // actually walk the stage looking for collision, which it otherwise never does -- and then it
-    // overflows building the objects. A stage that comes up without ground beats one that does not
-    // come up, so the vocabulary is recorded and not yet emitted.
-    if std::env::var("PEPTIDE_CLIP_TYPES").is_err() { return None }
     let l = local.to_ascii_lowercase();
     if l.contains("terrain_mc") { return Some("terrain") }
     if l.contains("platform") { return Some("platform") }
@@ -402,7 +398,10 @@ fn clip_type(local: &str) -> Option<&'static str> {
 }
 
 /// What the package root answers, and therefore what the chain below it may override.
-const BASE_API_METHODS: [&str; 5] = ["getType", "initialize", "update", "isDisposed", "dispose"];
+const BASE_API_METHODS: [(&str, u32); 7] = [
+    ("getType", 0), ("initialize", 0), ("update", 0), ("isDisposed", 0), ("dispose", 0),
+    ("__dispose", 0), ("isEqual", 1),
+];
 
 /// The collision half of the api layer, under the game's own names for it.
 const PKG_BOUNDARY_CLASS: &str = "SSF2CollisionBoundary";
@@ -410,13 +409,22 @@ const PKG_PLATFORM_CLASS: &str = "SSF2Platform";
 
 /// What each answers, read off a shipped package. Only the calls taking no argument: a forwarder
 /// that drops arguments is worse than one that is not there.
-const COLLISION_BOUNDARY_METHODS: [&str; 6] =
-    ["getType", "getOwnStats", "getMC", "destroy", "getX", "getY"];
-const PLATFORM_METHODS: [&str; 17] = [
-    "getType", "faceRight", "faceLeft", "getFallthrough", "getNoDropThrough", "getAccelFriction",
-    "getDecelFriction", "getXInfluence", "getDanger", "getBounceSpeed", "getXSpeed", "getYSpeed",
-    "getStartPosition", "clearMovement", "getConserveHorizontalMomentum",
-    "getConserveUpwardMomentum", "getConserveDownwardMomentum",
+const COLLISION_BOUNDARY_METHODS: [(&str, u32); 10] = [
+    ("getType", 0), ("getOwnStats", 0), ("getMC", 0), ("destroy", 0), ("getX", 0), ("setX", 1),
+    ("getY", 0), ("setY", 1), ("hitTestPoint", 3), ("hitTestRect", 2),
+];
+const PLATFORM_METHODS: [(&str, u32); 37] = [
+    ("getType", 0), ("faceRight", 0), ("faceLeft", 0), ("setForeground", 1), ("getFallthrough", 0),
+    ("setFallthrough", 1), ("getNoDropThrough", 0), ("setNoDropThrough", 1), ("getAccelFriction", 0),
+    ("setAccelFriction", 1), ("getDecelFriction", 0), ("setDecelFriction", 1), ("getXInfluence", 0),
+    ("setXInfluence", 1), ("getDanger", 0), ("setDanger", 1), ("getBounceSpeed", 0),
+    ("setBounceSpeed", 1), ("setAlpha", 1), ("setCamFocus", 1), ("getXSpeed", 0), ("setXSpeed", 1),
+    ("getYSpeed", 0), ("setYSpeed", 1), ("getStartPosition", 0), ("addMovement", 1),
+    ("clearMovement", 0), ("extraHitTests", 3), ("addIgnoreObject", 1), ("removeIgnoreObject", 1),
+    ("setIgnoreObjectListInversed", 1), ("getConserveHorizontalMomentum", 0),
+    ("setConserveHorizontalMomentum", 1), ("getConserveUpwardMomentum", 0),
+    ("setConserveUpwardMomentum", 1), ("getConserveDownwardMomentum", 0),
+    ("setConserveDownwardMomentum", 1),
 ];
 
 /// Everything a stage can ask the game for. Each is one forwarding call; the fixture needs almost
@@ -582,11 +590,25 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     op1(&mut base_ctor, OP_INITPROPERTY, mn_api);
     base_ctor.push(OP_RETURNVOID);
     // Forwarders: one call through to the same name on the game's api object.
-    let forward = |abc: &mut Abc, owner: &'static str, names: &[&'static str], overriding: bool|
+    let forward = |abc: &mut Abc, owner: &'static str, names: &[(&'static str, u32)], overriding: bool|
         -> Vec<MethodSpec>
     {
-        names.iter().map(|m| {
-            let code = if *m == "getType" {
+        names.iter().map(|(m, argc)| {
+            let code = if *m == "getOwnStats" {
+                // Also NOT a forward, for the same reason `getType` is not: the game asks the
+                // package's object for its stats and the package asking straight back is two
+                // objects waiting on each other. Shipped packages answer from a stored value --
+                // theirs is five bytes and calls nothing. The one field read out of it while a
+                // platform is built is the linkage of the clip to draw it with.
+                let sk = abc.intern_string("linkage_id");
+                let sv = abc.intern_string(&format!("{FIXTURE_ID}_terrain_mc"));
+                let mut c = vec![OP_GETLOCAL0, OP_PUSHSCOPE];
+                op1(&mut c, OP_PUSHSTRING, sk);
+                op1(&mut c, OP_PUSHSTRING, sv);
+                op1(&mut c, OP_NEWOBJECT, 1);
+                c.push(OP_RETURNVALUE);
+                c
+            } else if *m == "getType" {
                 // NOT a forward. `getType` answers with the name of the class it is on, and that
                 // is load-bearing: the game asks its own object what it is, that object asks the
                 // package's, and a package that asks straight back is two objects each waiting on
@@ -598,15 +620,18 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
                 c.push(OP_RETURNVALUE);
                 c
             } else {
+                // Arguments are passed straight through. A forwarder that drops them is worse
+                // than one that is not there: the call succeeds and does the wrong thing.
                 let mn_m = { let n = abc.intern_string(m); abc.intern_qname(pub_ns, n) };
                 let mut c = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
                 op1(&mut c, OP_GETPROPERTY, mn_api);
-                op2(&mut c, OP_CALLPROPERTY, mn_m, 0);
+                for a in 1..=*argc { op1(&mut c, OP_GETLOCAL, a); }
+                op2(&mut c, OP_CALLPROPERTY, mn_m, *argc);
                 c.push(OP_RETURNVALUE);
                 c
             };
             MethodSpec {
-                name: m, param_count: 0, code, max_stack: 3, local_count: 1,
+                name: m, param_count: *argc, code, max_stack: 4 + *argc, local_count: 1 + *argc,
                 is_override: overriding && *m == "getType",
             }
         }).collect()
