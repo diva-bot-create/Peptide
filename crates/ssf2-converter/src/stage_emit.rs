@@ -621,8 +621,28 @@ struct ArtRefs { background: Vec<BgLayerRef>, parallax: Vec<ParallaxRef>, stage:
 /// Render the floor + soft platforms as filled rectangles on a transparent canvas
 /// covering their bounding box (1px = 1 stage unit). Gives the stage visible content
 /// (required for play) and shows the playable geometry.
+/// Draw a stand-in for a stage that converted with no art of its own: its collision surfaces, as
+/// coloured bands, so the stage is something you can see and stand on rather than an invisible
+/// plane. Solid ground and drop-through platforms are drawn in different colours.
+///
+/// The one rule this has to keep is that the picture sits exactly on the collision it was drawn
+/// from. Everything below is in service of that, and each part of it has been got wrong once.
 fn render_placeholder(model: &StageModel) -> StageArt {
     use image::{Rgba, RgbaImage};
+
+    // Nothing to draw from. A stage with neither art nor collision is degenerate, but it must not
+    // produce a bogus placement: the bounds below would come back inverted (from the empty folds)
+    // and land an image at 1e308, which is not a number any consumer of this recovers from.
+    if model.platforms.is_empty() {
+        let img = RgbaImage::new(1, 1);
+        let mut png = Vec::new();
+        use image::ImageEncoder;
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(img.as_raw(), 1, 1, image::ExtendedColorType::Rgba8)
+            .expect("encode placeholder png");
+        return StageArt { png, x: 0.0, y: 0.0, w: 1, h: 1, hold: 1 };
+    }
+
     // bounding box of all collision geometry, with a small margin.
     let rects: Vec<Rect> = model.platforms.iter().map(|p| p.rect).collect();
     let margin = 8.0;
@@ -630,22 +650,29 @@ fn render_placeholder(model: &StageModel) -> StageArt {
     let min_y = rects.iter().map(|r| r.top()).fold(f64::MAX, f64::min) - margin;
     let max_x = rects.iter().map(|r| r.right()).fold(f64::MIN, f64::max) + margin;
     let max_y = rects.iter().map(|r| r.bottom()).fold(f64::MIN, f64::max) + margin;
+
     // Drawn in SOURCE units, not FM units. Every stage image is placed at the stage scale, so a
     // raster already measured in FM units gets that scale applied a SECOND time: the art comes out
     // `scale` too wide and slides off its own collision, which reads as collision covering only
     // part of the shape and a floor line that does not sit on the floor. The collision geometry is
     // in FM units, so divide by the scale here and let the one placement put it back.
     let s = if model.scale > 0.0 { model.scale } else { 1.0 };
-    let w = (((max_x - min_x) / s).ceil() as u32).clamp(1, 4096);
-    let h = (((max_y - min_y) / s).ceil() as u32).clamp(1, 4096);
+    // Generous, because a raster that does not cover its own bounds is a raster drawn in the wrong
+    // place: the position and scale say it spans the whole stage, so anything cropped off the far
+    // edge is simply missing rather than merely smaller.
+    let w = (((max_x - min_x) / s).ceil() as u32).clamp(1, PLACEHOLDER_MAX_PX);
+    let h = (((max_y - min_y) / s).ceil() as u32).clamp(1, PLACEHOLDER_MAX_PX);
     let mut img = RgbaImage::new(w, h);
     for p in &model.platforms {
         let r = &p.rect;
         let color = if p.drop_through { Rgba([120, 160, 220, 235]) } else { Rgba([90, 100, 120, 255]) };
-        let x0 = (((r.left() - min_x) / s).max(0.0)) as u32;
-        let y0 = (((r.top() - min_y) / s).max(0.0)) as u32;
-        let x1 = (((r.right() - min_x) / s).min(w as f64)) as u32;
-        let y1 = (((r.bottom() - min_y) / s).min(h as f64)) as u32;
+        // Rounded OUTWARD, and never empty. A surface thinner than one pixel once divided by the
+        // scale would otherwise round to a zero-height span and vanish -- which is how a stage ends
+        // up with collision a fighter stands on and nothing drawn under their feet.
+        let x0 = (((r.left() - min_x) / s).floor().max(0.0) as u32).min(w - 1);
+        let y0 = (((r.top() - min_y) / s).floor().max(0.0) as u32).min(h - 1);
+        let x1 = (((r.right() - min_x) / s).ceil().max(0.0) as u32).clamp(x0 + 1, w);
+        let y1 = (((r.bottom() - min_y) / s).ceil().max(0.0) as u32).clamp(y0 + 1, h);
         for y in y0..y1 {
             for x in x0..x1 {
                 img.put_pixel(x, y, color);
@@ -663,6 +690,10 @@ fn render_placeholder(model: &StageModel) -> StageArt {
     // the image's PIXELS are scaled. Size is what had to change, not where it sits.
     StageArt { png, x: min_x, y: min_y, w, h, hold: 1 }
 }
+
+/// How large a placeholder raster may get. Big enough for every stage in the corpus at source
+/// resolution; the clamp exists so a corrupt model cannot ask for a terabyte of pixels.
+const PLACEHOLDER_MAX_PX: u32 = 8192;
 
 fn build_entity(model: &StageModel, art: &ArtRefs) -> Value {
     let id = &model.id;
@@ -3052,3 +3083,7 @@ mod hazard_tests {
         assert!(s.contains("createCustomGameObject"), "no spawn call: {s}");
     }
 }
+
+/// The art fallback, reachable from the stage tests. Exposed rather than duplicated so the tests
+/// pin the code that actually ships.
+pub fn render_placeholder_for_test(model: &StageModel) -> StageArt { render_placeholder(model) }

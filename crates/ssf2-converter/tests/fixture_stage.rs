@@ -68,3 +68,66 @@ fn fixture_ships_in_the_container_format_the_game_reads() {
     let inner = ssf2_converter::ssf::decompress(&packed).expect("the container must unwrap");
     assert_eq!(inner, build_fixture_swf(), "unwrapping must yield the fixture unchanged");
 }
+
+// ── the art fallback ─────────────────────────────────────────────────────────
+//
+// A stage that converts with no art of its own gets a placeholder drawn from its collision. The
+// only thing that makes such a picture worth drawing is that it lands ON the collision, so these
+// pin exactly that, plus the two ways it used to produce something unusable.
+
+/// The rectangle a placeholder occupies once the emitter has placed it, in FM coordinates. The
+/// emitter positions every stage image at `x, y` and scales its PIXELS by the stage scale, so this
+/// is what a player actually sees.
+fn placed_rect(art: &ssf2_converter::StageArt, scale: f64) -> (f64, f64, f64, f64) {
+    (art.x, art.y, art.x + art.w as f64 * scale, art.y + art.h as f64 * scale)
+}
+
+fn model_with(platforms: Vec<ssf2_converter::Platform>) -> ssf2_converter::StageModel {
+    let mut m = parse_fixture();
+    m.platforms = platforms;
+    m
+}
+
+fn flat(left: f64, top: f64, w: f64, h: f64, drop_through: bool) -> ssf2_converter::Platform {
+    ssf2_converter::Platform {
+        rect: ssf2_converter::Rect { x: left, y: top, w, h },
+        drop_through, profile: None, moving: false, visible: true, hazard_floor: false,
+    }
+}
+
+#[test]
+fn placeholder_art_lands_on_the_collision_it_was_drawn_from() {
+    // The failure this catches: the raster was measured in FM units while the emitter also scales
+    // it, so the picture came out `scale` too wide and slid off its own floor. On screen that
+    // reads as collision covering only part of the shape, which is a confusing way to be told
+    // about a units bug.
+    let m = model_with(vec![flat(-780.0, 520.0, 1560.0, 52.0, false)]);
+    let art = ssf2_converter::render_placeholder_for_test(&m);
+    let (l, t, r, b) = placed_rect(&art, m.scale);
+    let margin = 8.0;
+    assert!((l - (-780.0 - margin)).abs() < 2.0, "left edge {l} should sit on the collision");
+    assert!((r - (780.0 + margin)).abs() < 2.0, "right edge {r} should sit on the collision");
+    assert!((t - (520.0 - margin)).abs() < 2.0, "top edge {t} should sit on the collision");
+    assert!((b - (572.0 + margin)).abs() < 2.0, "bottom edge {b} should sit on the collision");
+}
+
+#[test]
+fn placeholder_draws_a_surface_thinner_than_one_pixel() {
+    // A thin platform divided by the stage scale used to round to a zero-height span and vanish,
+    // leaving collision a fighter stands on with nothing drawn under their feet.
+    let m = model_with(vec![flat(-100.0, 0.0, 200.0, 1.0, true)]);
+    let art = ssf2_converter::render_placeholder_for_test(&m);
+    let img = image::load_from_memory(&art.png).expect("decodes").to_rgba8();
+    let painted = img.pixels().filter(|p| p.0[3] > 0).count();
+    assert!(painted > 0, "a thin surface must still be drawn, got an empty image");
+}
+
+#[test]
+fn placeholder_with_no_collision_is_placed_somewhere_real() {
+    // With nothing to measure, the bounds come back inverted from the empty folds and the image
+    // lands at 1e308. Anything downstream that reads that is dealing with a number, not a stage.
+    let m = model_with(vec![]);
+    let art = ssf2_converter::render_placeholder_for_test(&m);
+    assert!(art.x.is_finite() && art.y.is_finite(), "placed at ({}, {})", art.x, art.y);
+    assert!(art.w >= 1 && art.h >= 1);
+}
