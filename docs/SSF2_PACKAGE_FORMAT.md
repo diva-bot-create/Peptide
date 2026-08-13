@@ -129,44 +129,49 @@ WHERE that runs is load-bearing. the resource table's own initialiser runs while
 null, and the queue call is verified before the definitions it names have run; both of those homes
 take the resource system down.
 
-## known gap: collision
+## collision
 
-geometry and linkage are necessary and not sufficient. a fighter still falls through the fixture's
-floor, and the reason is the api layer rather than the clips.
+a clip becomes collision by declaring WHAT IT IS on its own class. the game walks the stage's
+children and reads a `type` property off each one; the linkage only hints at it. the vocabulary,
+read off shipped stages:
 
-the package's api classes are a CHAIN, each level forwarding its own calls through to the game:
+| `type` | what it is |
+| --- | --- |
+| `terrain` | solid ground |
+| `platform` | drop-through |
+| `l_ledge` / `r_ledge` | ledge grab points |
+| `pN_start` / `pN_spawn` | where player N starts, and where they return |
+| `light_source`, `itemGen` | the rest of the furniture |
+
+a shipped clip class declares nothing else: one `type` slot, set by a frame script that also hides
+the clip. boundaries are the exception again and declare no type at all, being told apart by the
+name they are placed under.
+
+the api layer the game builds these THROUGH is a chain, each level forwarding its own calls:
 
 ```
 <package root>            holds the game's api object, constructed with it
   SSF2CollisionBoundary   getType getOwnStats getMC destroy getX getY
     SSF2Platform          getFallthrough getAccelFriction getXSpeed getStartPosition ...
-  SSF2GameObject          the base for characters, items, enemies, projectiles
-  SSF2Stage               getBackground getForeground getCameraBackgrounds getLedges ...
 ```
 
-every one of them is constructed with one argument, and the GAME constructs them: it takes the
-class out of the package's class map and builds it. a name present but empty is therefore an object
-the game can build and cannot use, which is exactly the fixture's floor. no error is raised, since
-nothing has gone wrong from the game's point of view.
+the rule that governs all of it, and that cost three failed attempts to find: **an override must be
+declared as one, and only when there is something to override.** `getType` is redeclared at every
+level and every level marks it (trait kind `0x21`). the package root declares `getType`,
+`initialize`, `update`, `isDisposed` and `dispose` so the levels below have something to override,
+which in turn means a stage class redeclaring `initialize`/`update` must mark them too. get either
+direction wrong and the class is refused, and one refused class refuses the package -- silently,
+as a load that never completes.
 
-no stage constructs its own platforms, and no platform class is linked to a clip, so
-`BowsersCastlePlatform extends SSF2Platform` and friends are shims the game instantiates, the same
-shape as a stage class. building that chain out is the remaining work, and what a shipped package does is now known
-precisely. read off `SSF2CollisionBoundary` and `SSF2Platform` in any stage:
+## known gap
 
-* `flags = 0x09`, ie SEALED and PROTECTEDNS, with a protected namespace named after the class
-  (kind `0x18`). the fixture's classes are declared with no flags and no protected namespace.
-* the constructor takes ONE argument and declares a return TYPE, not the any-type.
-* `getType` is redeclared at every level of the chain, and every level marks it with the OVERRIDE
-  attribute (trait kind `0x21` rather than `0x01`). that cuts both ways: redeclaring an inherited
-  method without the attribute is refused, and marking one as an override when the base does not
-  declare it is refused just as firmly. the package root declares `getType`, `initialize`,
-  `update`, `isDisposed` and `dispose` for the levels below it to override.
+with the chain in place and the clips typed, the game DOES scan the stage: it reaches
+`StageData.as:532`, which is `STAGE.findObjects(...)`, and that scan is what builds platforms. it
+then overflows (`Error #1023`) while building them, and the fixture comes up with no fighter at
+all rather than with no ground.
 
-three attempts have added this chain and all three stopped the package loading: four classes at
-once, then only the boundary and the platform, then the same with the override attributes and the
-root methods in place. each was reverted rather than left broken. probing narrows it usefully: the
-package no longer COMPLETES loading, which is the signature of the file being rejected while its
-code is verified rather than anything going wrong at runtime. so the remaining difference is in how
-these classes are DECLARED, and the two candidates left unmatched are the class flags and the
-protected namespace.
+so clip typing is off by default (`PEPTIDE_CLIP_TYPES` turns it on) -- a stage that comes up
+without ground beats one that does not come up. what is known: the scan is iterative rather than
+recursive, it works from a worklist of children, and it reads `type`, `className` and `classAPI`
+off each. supplying the latter two as empty rather than leaving them absent made it worse, which
+fits: an empty name is still a name, and the game goes looking for the class it names.

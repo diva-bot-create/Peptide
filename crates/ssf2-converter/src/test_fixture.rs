@@ -380,6 +380,45 @@ const API_SLOT: &str = "_api";
 // here is why the fixture's ground holds nobody up. Building that chain is the next piece; a first
 // attempt at it stopped the package loading entirely, so it is not in yet.
 
+/// Where a clip says what it is. The game reads this off each child of the stage.
+const CLIP_TYPE_SLOT: &str = "type";
+
+/// The `type` a clip declares, worked out from its linkage. The vocabulary is the game's: solid
+/// ground is "terrain", a drop-through is "platform", ledges name their side, and a spawn beacon
+/// names its player and whether it is where a fighter starts or where it returns.
+fn clip_type(local: &str) -> Option<&'static str> {
+    // OFF while the scan it feeds is still being worked out. Declaring these makes the game
+    // actually walk the stage looking for collision, which it otherwise never does -- and then it
+    // overflows building the objects. A stage that comes up without ground beats one that does not
+    // come up, so the vocabulary is recorded and not yet emitted.
+    if std::env::var("PEPTIDE_CLIP_TYPES").is_err() { return None }
+    let l = local.to_ascii_lowercase();
+    if l.contains("terrain_mc") { return Some("terrain") }
+    if l.contains("platform") { return Some("platform") }
+    // Ledges and spawn beacons declare their own types too ("l_ledge", "p1_start" and so on), but
+    // they are left off here while the collision half is being made to work: the fewer kinds of
+    // object the scan is asked to build at once, the easier it is to tell which one it choked on.
+    None
+}
+
+/// What the package root answers, and therefore what the chain below it may override.
+const BASE_API_METHODS: [&str; 5] = ["getType", "initialize", "update", "isDisposed", "dispose"];
+
+/// The collision half of the api layer, under the game's own names for it.
+const PKG_BOUNDARY_CLASS: &str = "SSF2CollisionBoundary";
+const PKG_PLATFORM_CLASS: &str = "SSF2Platform";
+
+/// What each answers, read off a shipped package. Only the calls taking no argument: a forwarder
+/// that drops arguments is worse than one that is not there.
+const COLLISION_BOUNDARY_METHODS: [&str; 6] =
+    ["getType", "getOwnStats", "getMC", "destroy", "getX", "getY"];
+const PLATFORM_METHODS: [&str; 17] = [
+    "getType", "faceRight", "faceLeft", "getFallthrough", "getNoDropThrough", "getAccelFriction",
+    "getDecelFriction", "getXInfluence", "getDanger", "getBounceSpeed", "getXSpeed", "getYSpeed",
+    "getStartPosition", "clearMovement", "getConserveHorizontalMomentum",
+    "getConserveUpwardMomentum", "getConserveDownwardMomentum",
+];
+
 /// Everything a stage can ask the game for. Each is one forwarding call; the fixture needs almost
 /// none of them itself, but the game calls them on a stage and a missing one is an error, not a
 /// no-op. Argument-taking members are deliberately absent -- a forwarder that drops arguments is
@@ -435,8 +474,16 @@ struct ClassSpec {
     static_slots: Vec<&'static str>,
     /// code for the class initialiser, which runs once and can fill those static slots
     cinit: Option<Vec<u8>>,
+    /// Instance flags. Shipped api classes are declared SEALED and with a protected namespace
+    /// (`0x09`), and how a class is declared turns out to matter as much as what is in it.
+    flags: u8,
     methods: Vec<MethodSpec>,
 }
+
+/// Sealed, plus "carries a protected namespace": how a shipped package declares its api classes.
+const CLASS_SEALED_PROTECTED: u8 = 0x09;
+/// A protected namespace, named after the class that owns it.
+const NS_PROTECTED: u8 = 0x18;
 
 /// One instance method on an authored class.
 struct MethodSpec {
@@ -445,6 +492,10 @@ struct MethodSpec {
     code: Vec<u8>,
     max_stack: u32,
     local_count: u32,
+    /// Set when this method also exists further up the chain. Redeclaring an inherited method
+    /// without saying so is an illegal override and the class is refused, which refuses the whole
+    /// package; so is claiming to override something the base never declared.
+    is_override: bool,
 }
 
 /// Build the fixture's ABC from scratch.
@@ -516,7 +567,7 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
 
     let declare = |specs: &mut Vec<ClassSpec>, name, package: &str, super_mn, param_count, ctor: Vec<u8>, max_stack, local_count| {
         specs.push(ClassSpec { name, package: package.to_string(), super_mn, param_count, ctor,
-            max_stack, local_count, slots: vec![], static_slots: vec![], cinit: None, methods: vec![] });
+            max_stack, local_count, slots: vec![], static_slots: vec![], cinit: None, flags: 0, methods: vec![] });
     };
 
     // The base holds the object the game constructs it with. That object IS the game's side of
@@ -530,11 +581,50 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     base_ctor.push(OP_GETLOCAL1);
     op1(&mut base_ctor, OP_INITPROPERTY, mn_api);
     base_ctor.push(OP_RETURNVOID);
+    // Forwarders: one call through to the same name on the game's api object.
+    let forward = |abc: &mut Abc, names: &[&'static str], overriding: bool| -> Vec<MethodSpec> {
+        names.iter().map(|m| {
+            let mn_m = { let n = abc.intern_string(m); abc.intern_qname(pub_ns, n) };
+            let mut code = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+            op1(&mut code, OP_GETPROPERTY, mn_api);
+            op2(&mut code, OP_CALLPROPERTY, mn_m, 0);
+            code.push(OP_RETURNVALUE);
+            MethodSpec {
+                name: m, param_count: 0, code, max_stack: 3, local_count: 1,
+                is_override: overriding && *m == "getType",
+            }
+        }).collect()
+    };
+
+    // The root answers the calls the levels below it override. An override needs something to
+    // override: marking one when the base does not declare it is refused just as firmly as
+    // redeclaring one without marking it.
+    let base_methods = forward(&mut abc, &BASE_API_METHODS, false);
     specs.push(ClassSpec {
         name: PKG_BASE_CLASS, package: String::new(), super_mn: mn_object, param_count: 1,
         ctor: base_ctor, max_stack: 3, local_count: 2,
-        slots: vec![API_SLOT], static_slots: vec![], cinit: None, methods: vec![],
+        slots: vec![API_SLOT], static_slots: vec![], cinit: None,
+        flags: 0, methods: base_methods,
     });
+
+    // The collision chain, declared the way a shipped package declares it: sealed, carrying a
+    // protected namespace, one constructor argument, and `getType` redeclared at each level as an
+    // override. The game builds a platform out of the package's OWN class, so an empty one here is
+    // an object it can construct and cannot use -- ground nobody stands on, and no error, because
+    // from the game's side nothing went wrong.
+    let mn_root_cls = { let n = abc.intern_string(PKG_BASE_CLASS); abc.intern_qname(pub_ns, n) };
+    let mn_boundary = { let n = abc.intern_string(PKG_BOUNDARY_CLASS); abc.intern_qname(pub_ns, n) };
+    for (name, sup, methods) in [
+        (PKG_BOUNDARY_CLASS, mn_root_cls, COLLISION_BOUNDARY_METHODS.as_slice()),
+        (PKG_PLATFORM_CLASS, mn_boundary, PLATFORM_METHODS.as_slice()),
+    ] {
+        let fwd = forward(&mut abc, methods, true);
+        specs.push(ClassSpec {
+            name, package: String::new(), super_mn: sup, param_count: 1,
+            ctor: plain_ctor(1), max_stack: 3, local_count: 2, slots: vec![],
+            static_slots: vec![], cinit: None, flags: CLASS_SEALED_PROTECTED, methods: fwd,
+        });
+    }
 
     // The asset base is NOT a stub. A package carries its own copy of the small API layer the
     // game talks to, in the top-level namespace, so the game's same-named classes never stand in
@@ -641,28 +731,49 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
         name: PKG_API_CLASS, package: String::new(), super_mn: mn_object, param_count: 0,
         ctor: plain_ctor(0), max_stack: 4, local_count: 1, slots: vec![],
         static_slots: vec!["BASE_CLASSES", "VERSION_MAJOR", "VERSION_MINOR", "VERSION_REVISION"],
-        cinit: Some(api_cinit), methods: vec![],
+        cinit: Some(api_cinit), flags: 0, methods: vec![],
     });
 
     specs.push(ClassSpec {
         name: PKG_ASSET_CLASS, package: String::new(), super_mn: mn_movieclip, param_count: 0,
         ctor: asset_ctor, max_stack: 48, local_count: 1,
         slots: vec![PROPS_SLOT, META_SLOT],
-        static_slots: vec![], cinit: None,
+        static_slots: vec![], cinit: None, flags: 0,
         methods: vec![
-            MethodSpec { name: "register", param_count: 2, code: reg, max_stack: 4, local_count: 3 },
-            MethodSpec { name: "getProp", param_count: 1, code: getp, max_stack: 3, local_count: 2 },
+            MethodSpec { name: "register", param_count: 2, code: reg, max_stack: 4, local_count: 3, is_override: false },
+            MethodSpec { name: "getProp", param_count: 1, code: getp, max_stack: 3, local_count: 2, is_override: false },
             // NOT a no-op, and not optional. The game calls this with its own api and uses what
             // comes back as the class carrying the package's class map -- it coerces the result
             // to a Class and reads BASE_CLASSES straight off it. Returning nothing means the
             // game reads that map off null, which is where validation died.
-            MethodSpec { name: "initAPI", param_count: 1, code: init_api, max_stack: 3, local_count: 2 },
-            MethodSpec { name: "deinitAPI", param_count: 0, code: noop.clone(), max_stack: 2, local_count: 1 },
-            MethodSpec { name: "getAPIVersion", param_count: 0, code: noop, max_stack: 2, local_count: 1 },
+            MethodSpec { name: "initAPI", param_count: 1, code: init_api, max_stack: 3, local_count: 2, is_override: false },
+            MethodSpec { name: "deinitAPI", param_count: 0, code: noop.clone(), max_stack: 2, local_count: 1, is_override: false },
+            MethodSpec { name: "getAPIVersion", param_count: 0, code: noop, max_stack: 2, local_count: 1, is_override: false },
         ],
     });
 
     // The stage's own display symbol, plus one class per beacon. All plain clips.
+    // Every clip the game picks out of a stage declares WHAT IT IS in a `type` property on its own
+    // class. That is the classification, and it is the piece the linkage only hints at: the engine
+    // walks the stage's children and reads `child.type`, matching "terrain", "platform", the ledge
+    // sides and the per-player spawn names. A clip without one is a clip it walks straight past,
+    // which is a stage with visible ground and nothing to stand on.
+    let s_type = str_(&mut abc, CLIP_TYPE_SLOT);
+    let mn_type = { let ns = abc.intern_namespace(NS_PACKAGE, s_empty); abc.intern_qname(ns, s_type) };
+    let typed_ctor = |abc: &mut Abc, kind: &str| -> Vec<u8> {
+        let sk = abc.intern_string(kind);
+        let mut c = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+        op1(&mut c, OP_CONSTRUCTSUPER, 0);
+        c.push(OP_GETLOCAL0);
+        op1(&mut c, OP_PUSHSTRING, sk);
+        op1(&mut c, OP_INITPROPERTY, mn_type);
+        // ONLY `type`. Shipped clips declare nothing else, and the neighbouring properties the
+        // scan reads are meant to be absent rather than empty: an empty name is a name, and the
+        // game goes looking for the class it names.
+        c.push(OP_RETURNVOID);
+        c
+    };
+
     let stage_symbol: &'static str = Box::leak(format!("stage_{FIXTURE_ID}").into_boxed_str());
     declare(&mut specs, stage_symbol, "", mn_movieclip, 0, plain_ctor(0), 2, 1);
     for (_, sym) in symbols {
@@ -673,7 +784,17 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
             None => (String::new(), sym.clone()),
         };
         let local: &'static str = Box::leak(local.into_boxed_str());
-        declare(&mut specs, local, &package, mn_movieclip, 0, plain_ctor(0), 2, 1);
+        match clip_type(local) {
+            Some(kind) => {
+                let ctor = typed_ctor(&mut abc, kind);
+                specs.push(ClassSpec {
+                    name: local, package: package.clone(), super_mn: mn_movieclip, param_count: 0,
+                    ctor, max_stack: 3, local_count: 1, slots: vec![CLIP_TYPE_SLOT],
+                    static_slots: vec![], cinit: None, flags: 0, methods: vec![],
+                });
+            }
+            None => declare(&mut specs, local, &package, mn_movieclip, 0, plain_ctor(0), 2, 1),
+        }
     }
 
     // These two need forward references, so reserve their multinames before the loop that
@@ -690,6 +811,7 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     let mn_fixture_cls = { let n = abc.intern_string(FIXTURE_ID); abc.intern_qname(pub_ns, n) };
 
     for name in API_CLASSES {
+        if name == PKG_BOUNDARY_CLASS || name == PKG_PLATFORM_CLASS { continue }
         if name == PKG_STAGE_BASE {
             // The stage base is not a stub: it is a FORWARDER. Every method on it is one call
             // through to the same name on the game's own api object, which is exactly what a
@@ -702,11 +824,14 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
                 op1(&mut code, OP_GETPROPERTY, mn_api);
                 op2(&mut code, OP_CALLPROPERTY, mn_m, 0);
                 code.push(OP_RETURNVALUE);
-                MethodSpec { name: m, param_count: 0, code, max_stack: 3, local_count: 1 }
+                MethodSpec {
+                    name: m, param_count: 0, code, max_stack: 3, local_count: 1,
+                    is_override: *m == "getType",
+                }
             }).collect();
             specs.push(ClassSpec {
                 name, package: String::new(), super_mn: mn_base, param_count: 1,
-                ctor: plain_ctor(1), max_stack: 3, local_count: 2, slots: vec![], static_slots: vec![], cinit: None, methods: fwd,
+                ctor: plain_ctor(1), max_stack: 3, local_count: 2, slots: vec![], static_slots: vec![], cinit: None, flags: 0, methods: fwd,
             });
         } else {
             declare(&mut specs, name, "", mn_object, 0, plain_ctor(0), 2, 1);
@@ -726,9 +851,13 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     specs.push(ClassSpec {
         name: FIXTURE_ID, package: String::new(), super_mn: mn_ssf2stage, param_count: 1,
         ctor: plain_ctor(1), max_stack: 3, local_count: 2, slots: vec![],
-        static_slots: vec![], cinit: None,
+        static_slots: vec![], cinit: None, flags: 0,
+        // Overrides, because the package root declares these. A stage class that redeclares them
+        // without saying so is an illegal override, and one refused class refuses the package --
+        // which is what adding the root's own methods quietly did the first time.
         methods: STAGE_CALLBACKS.iter().map(|n| MethodSpec {
             name: n, param_count: 0, code: noop_m.clone(), max_stack: 2, local_count: 1,
+            is_override: true,
         }).collect(),
     });
 
@@ -857,13 +986,20 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
                 code: ms.code.clone(), exceptions: vec![], traits: vec![],
             });
             inst_traits.push(Trait {
-                name: mmn, kind_byte: 0x01, // Method
+                // Method, plus the override attribute when it replaces one from the base.
+                name: mmn, kind_byte: if ms.is_override { 0x21 } else { 0x01 },
                 data: TraitKindData::Method { disp_id: 0, method: m },
                 metadata: vec![],
             });
         }
+        // A protected namespace is named after the class that owns it, and is only written when
+        // the flags say it is there.
+        let protected_ns = if spec.flags & 0x08 != 0 {
+            let n = abc.intern_string(spec.name);
+            abc.intern_namespace(NS_PROTECTED, n)
+        } else { 0 };
         abc.instances.push(InstanceInfo {
-            name: mn, super_name: spec.super_mn, flags: 0, protected_ns: 0,
+            name: mn, super_name: spec.super_mn, flags: spec.flags, protected_ns,
             interfaces: vec![], iinit, traits: inst_traits,
         });
         // Static slots live on the CLASS, not on an instance, which is what lets the game read a

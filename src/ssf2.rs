@@ -350,20 +350,20 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         // information out of errors, so without this an author gets a bare code and no idea
         // which file to open; each of these reports against its own compiled-in source location
         // and rethrows, leaving behaviour untouched.
-        for (class, method, is_static) in [
+        for (class, method, is_static) in if std::env::var("PEPTIDE_NO_LOCATOR").is_ok() { vec![] } else { vec![
             ("GameController", "actuallyStartMatch", true),
             ("GameController", "startMatch", true),
             ("StageData", "<ctor>", false),
             ("StageData", "startGame", false),
             ("Resource", "getProp", false),
             ("ResourceManager", "validateResource", true),
-        ] {
+        ] } {
             ssf2_converter::abc_inject::inject_error_locator(abc, SSF2_DOC_CLASS, class, method, is_static)?;
         }
         if std::env::var("PEPTIDE_PROBE_LOAD").is_ok() {
             for (class, method, is_static, subject) in [
-                ("StageData", "<ctor>", false, None),
-                ("SSF2Stage", "<ctor>", false, None),
+                ("Resource", "load", false, Some("ID")),
+                ("Resource", "loadComplete", false, Some("ID")),
             ] {
                 ssf2_converter::abc_inject::inject_method_probe(
                     abc, SSF2_DOC_CLASS, class, method, is_static, subject)?;
