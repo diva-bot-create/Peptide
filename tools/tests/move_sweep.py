@@ -24,10 +24,11 @@ The positioning is the fiddly part and it is why this is a harness rather than a
                the same distance up.
 
 Usage:
-  tools/tests/move_sweep.py fm            # sweep the running Fraymakers session
-  tools/tests/move_sweep.py ssf2          # sweep the running SSF2 session
+  tools/tests/move_sweep.py both          # boot each engine in turn, sweep both, compare
+  tools/tests/move_sweep.py fm            # sweep an already-running Fraymakers session
+  tools/tests/move_sweep.py ssf2          # sweep an already-running SSF2 session
   tools/tests/move_sweep.py compare       # compare the two saved sweeps
-  tools/tests/move_sweep.py fm --only jab,aerial_forward
+  tools/tests/move_sweep.py both --only jab,aerial_forward
 
 Each engine's sweep is saved to /tmp/peptide_sweep_<engine>.json so the two halves can be run
 against separate sessions and compared afterwards.
@@ -99,13 +100,15 @@ ENGINES = {
 MOVES = [
     # grounded attacks
     ("jab",              "ground", "attack:2"),
-    ("tilt_forward",     "ground", "right+attack:2"),
-    ("tilt_up",          "ground", "up+attack:2"),
-    ("tilt_down",        "ground", "down+attack:2"),
+    # A tilt is the direction ALREADY held when attack arrives; a smash is the two together. SSF2
+    # reads it that way and the conversion does not, so each is asked in its own idiom.
+    ("tilt_forward",     "ground", {"fm": "right+attack:2", "ssf2": "right:6 right+attack:2"}),
+    ("tilt_up",          "ground", {"fm": "up+attack:2",    "ssf2": "up:6 up+attack:2"}),
+    ("tilt_down",        "ground", {"fm": "down+attack:2",  "ssf2": "down:6 down+attack:2"}),
     ("dash_attack",      "ground", "dash+right:8 right+attack:2"),
-    ("strong_forward",   "ground", "right:1 right+attack:3"),
-    ("strong_up",        "ground", "up:1 up+attack:3"),
-    ("strong_down",      "ground", "down:1 down+attack:3"),
+    ("strong_forward",   "ground", {"fm": "right:1 right+attack:3", "ssf2": "right+attack:2"}),
+    ("strong_up",        "ground", {"fm": "up:1 up+attack:3",        "ssf2": "up+attack:2"}),
+    ("strong_down",      "ground", {"fm": "down:1 down+attack:3",    "ssf2": "down+attack:2"}),
     ("getup_attack",     "ground", "down:2 attack:2"),
     # aerials -- parked high so the whole move plays before the floor arrives
     ("aerial_neutral",   "air",    "attack:2"),
@@ -167,8 +170,18 @@ def read_log(engine):
         return ""
 
 
+def timeline_for(engine, timeline):
+    """The input for THIS engine. A move can need a different idiom on each side: SSF2 reads a
+    simultaneous direction+attack as a smash where the conversion reads it as a tilt, so asking
+    both for `up+attack` asks them for two different moves."""
+    if isinstance(timeline, dict):
+        return timeline.get(engine, "")
+    return timeline
+
+
 def run_move(engine, name, kind, timeline):
     """Park the character, play the move, and return the captured trace."""
+    timeline = timeline_for(engine, timeline)
     _, floor_top, below = ENGINES[engine]
     # +y is DOWN, so an aerial parks BELOW the floor and falls away from it into open space.
     y = floor_top if kind == "ground" else floor_top + below
@@ -379,6 +392,7 @@ def compare():
     print("-" * 88)
 
     checked = bad = skipped = 0
+    mismatched = []
     for name, _, _ in MOVES:
         a, b = ss.get(name), fm.get(name)
         if not a or not b:
@@ -390,39 +404,105 @@ def compare():
         if not a["resolved"] or not b["resolved"] or agree is None:
             skipped += 1
             continue
+        if not agree:
+            # The two engines performed DIFFERENT moves, so there is nothing to compare. Holding
+            # up+attack is an up smash in SSF2 and an up tilt in the conversion, and calling that a
+            # conversion defect would bury the real ones. It is an input gap: the sweep needs to ask
+            # each engine for the move in its own idiom.
+            mismatched.append((name, a["animation"], b["animation"],
+                               expected_fm_name(a["animation"])))
+            continue
 
         checked += 1
         dur = b["frames"] / a["frames"] if a["frames"] else 0.0
         trav = b["travel_x"] / a["travel_x"] if a["travel_x"] > 1.0 else None
         durbad = a["frames"] and abs(dur - DURATION_RATIO) / DURATION_RATIO > 0.08
         travbad = trav is not None and abs(trav - TRAVEL_RATIO) / TRAVEL_RATIO > 0.12
-        namebad = not agree
-        mark = "  <-" if (durbad or travbad or namebad) else ""
+        mark = "  <-" if (durbad or travbad) else ""
         if mark:
             bad += 1
         note = ""
-        if namebad:
-            note = f"  expected {expected_fm_name(a['animation'])}, got {b['animation']}"
         print(f"{name:20} {a['frames']:>5} {b['frames']:>5} {dur:>6.2f} "
               f"{a['travel_x']:>8.1f} {b['travel_x']:>8.1f} "
               f"{(f'{trav:.2f}' if trav else '-'):>7}  "
               f"{a['animation']}/{b['animation']}{mark}{note}")
 
-    print(f"\n{checked} move(s) compared, {bad} outside tolerance, "
-          f"{skipped} not compared (the two engines did not perform the same move)")
+    print(f"\n{checked} compared, {bad} outside tolerance, "
+          f"{len(mismatched) + skipped} not compared")
+    if mismatched:
+        print("\nnot compared -- the two engines performed different moves (an input gap, not a"
+              "\nconversion defect; the sweep has to ask each engine in its own idiom):")
+        for name, sa, fa, want in mismatched:
+            print(f"  {name:20} ssf2 did {sa:18} -> expected {want or '?':18} but fm did {fa}")
     return 1 if bad else 0
 
 
+
+# ── driving the engines ──────────────────────────────────────────────────────
+# One command has to be able to run the whole thing, because a comparison assembled by hand from
+# two separate sittings is one where the two halves can quietly disagree about which build, which
+# stage or which character they were looking at.
+
+ENGINE_BOOT = {
+    "fm":   ["session", "--char", "sandbag", "--stage", "peptidefixturessf2"],
+    "ssf2": ["ssf2", "session", "--char", "sandbag", "--stage", "peptidefixture"],
+}
+BOOT_READY = {"fm": "auto-launching|READY|CRASH", "ssf2": "auto-launching|never settled"}
+
+
+def shutdown():
+    """Leave no engine running. Two at once fight over the bridge port."""
+    for pat in ("peptide session", "peptide ssf2 session"):
+        subprocess.run(["pkill", "-f", pat], capture_output=True)
+    for pat in ("Fraymakers", "SSF2-patched"):
+        subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
+    subprocess.run(["rm", "-rf", os.path.expanduser("~/.peptide/session")], capture_output=True)
+    time.sleep(3)
+
+
+def boot(engine, timeout=300):
+    """Start one engine on the fixture and wait until it is taking commands."""
+    log = log_path(engine)
+    open(log, "w").close()
+    with open(log, "ab") as fh:
+        subprocess.Popen([BIN] + ENGINE_BOOT[engine], stdout=fh, stderr=fh,
+                         start_new_session=True)
+    ready = re.compile(BOOT_READY[engine])
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if ready.search(read_log(engine)):
+            time.sleep(10)      # let the match settle before the first move
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def sweep_both(only=None):
+    """Boot each engine in turn, sweep it, and compare -- the whole thing in one command."""
+    for engine in ("fm", "ssf2"):
+        shutdown()
+        print(f"\n=== booting {engine} ===")
+        if not boot(engine):
+            print(f"{engine} did not come up; see {log_path(engine)}")
+            return 2
+        print(f"sweeping {engine} on the fixture\n")
+        sweep(engine, only)
+    shutdown()
+    print()
+    return compare()
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("fm", "ssf2", "compare"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("fm", "ssf2", "compare", "both"):
         print(__doc__)
         return 2
     mode = sys.argv[1]
-    if mode == "compare":
-        return compare()
     only = None
     if "--only" in sys.argv:
         only = set(sys.argv[sys.argv.index("--only") + 1].split(","))
+    if mode == "compare":
+        return compare()
+    if mode == "both":
+        return sweep_both(only)
     print(f"sweeping {mode} on the fixture ({len(MOVES) if not only else len(only)} moves)\n")
     sweep(mode, only)
     return 0
