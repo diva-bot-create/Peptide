@@ -553,9 +553,14 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     }
 
     // A stage is constructed WITH an argument and hands it to super; a 0-arg version is rejected.
-    // It also has to answer the calls the game drives a stage with. A fixture has no behaviour of
-    // its own -- that is the point of it -- but "no behaviour" still has to be something callable,
-    // because a missing method is not treated as nothing to do, it is an error mid-match.
+    //
+    // The callbacks are where this stops. A shipped stage class is a ~70 byte shim: its
+    // `initialize` calls `getBackground()`, `getForeground()` and `getCameraBackgrounds()` on the
+    // base it inherits, and it is the BASE that wires the stage into the game. That base is the
+    // package-side api layer, which the official tooling compiles into every package and which
+    // this file has no copy of. So the fixture can be loaded, validated and cached -- all of which
+    // it now is -- and still not be drivable, because the callbacks it answers have nothing under
+    // them to answer with.
     let noop_m = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_RETURNVOID];
     specs.push(ClassSpec {
         name: FIXTURE_ID, package: String::new(), super_mn: mn_ssf2stage, param_count: 1,

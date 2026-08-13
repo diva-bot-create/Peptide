@@ -107,6 +107,9 @@ struct Code {
 }
 impl Code {
     fn op(&mut self, o: u8) { self.b.push(o); }
+    /// Bytes emitted so far, for callers that need an offset into their own payload (an
+    /// exception handler has to be pointed at, which means knowing where it lands).
+    fn len(&self) -> usize { self.b.len() }
     fn u30(&mut self, mut v: u32) {
         loop {
             let mut byte = (v & 0x7f) as u8;
@@ -2871,9 +2874,25 @@ pub fn inject_stage_shape_check(abc: &mut Abc, doc_class: &str) -> anyhow::Resul
     c.place(l_sent);
     c.op(OP_POPSCOPE);
 
+    // Everything above is wrapped in a catch-all, and that is what makes it safe to run at all.
+    // This code reads a resource WHILE the game is validating it, which is the one moment it must
+    // not misbehave: an error escaping here does not just lose the report, it takes the load
+    // itself down, and the queue stops with a loading screen spinning behind it. Every read is
+    // guarded already; the handler is for the ones that turn out not to be. Whatever happens, the
+    // game's own validation runs next exactly as it would have.
+    let l_end = c.new_label();
+    c.branch(OP_JUMP, l_end);
+    let handler_at = c.len();
+    c.op(OP_POP);                 // discard whatever was thrown and fall into the original body
+    c.place(l_end);
+
     let payload = c.finish();
     let body = &mut abc.bodies[body_idx];
     prepend_code(body, &payload);
+    body.exceptions.push(Exception {
+        from: 0, to: handler_at as u32, target: handler_at as u32,
+        exc_type: 0, var_name: 0,   // catch anything, bind it to nothing
+    });
     body.max_stack = body.max_stack.max(8);
     body.local_count = body.local_count.max(l_clip + 1);
     body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);

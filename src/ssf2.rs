@@ -336,10 +336,13 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         // loads goes to the loader, not the app, and unhandled there it ends the process
         ssf2_converter::abc_inject::inject_package_error_reporter(abc, SSF2_DOC_CLASS)?;
         // and the one an author can act on: which part of the stage clip tree is missing, by
-        // name, instead of an undefined-value error from somewhere inside the engine. OPT-IN
-        // while its own wiring is still being settled: it reads the resource as the game
-        // validates it, and getting that wrong stalls the load queue, which is a far worse
-        // failure than the one it explains.
+        // name, instead of an undefined-value error from somewhere inside the engine.
+        //
+        // OPT-IN (`PEPTIDE_STAGE_CHECK`), because of WHERE it has to run. It reads a resource
+        // while the game is validating it, and even wrapped in a catch-all it still perturbs the
+        // load: with it on, the queue gets a fraction of the way it otherwise does. A diagnostic
+        // that degrades the thing it is diagnosing is worse than no diagnostic, so it stays off
+        // by default until it can run somewhere off the load path.
         if std::env::var("PEPTIDE_STAGE_CHECK").is_ok() {
             ssf2_converter::abc_inject::inject_stage_shape_check(abc, SSF2_DOC_CLASS)?;
         }
