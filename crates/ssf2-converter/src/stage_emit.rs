@@ -26,6 +26,17 @@ use crate::uuid_gen::det_uuid;
 
 /// Emit the FM stage package for `model` under `out_root/<id>/`. Returns the
 /// project dir and the `.fraytools` path (for the FrayTools publish step).
+
+/// The one conversion for a per-frame SPEED, shared by everything that moves.
+///
+/// A speed is a distance per frame, and a conversion changes both: the world is `size_multiplier`
+/// bigger and a frame is half as long. Characters got this from the physics model; stages open-coded
+/// it as `scale * 0.5`, which agreed only for as long as nobody edited the frame rates in
+/// stats.jsonc. A thwomp falls by the same arithmetic a fighter does.
+fn velocity_scale() -> f64 {
+    crate::mappings::character_stats().scaling.velocity_scale()
+}
+
 pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathBuf)> {
     let id = &model.id;
     let dir = out_root.join(id);
@@ -926,8 +937,12 @@ fn emit_platform_structures(model: &StageModel, lib: &Path, sprites: &Path)
     // velocity), the hold × 2 (frame count), depth × scale. The previous hand-RE'd values stay as
     // the fallback for a stage whose platform class wasn't found.
     let pb = model.platform_behavior.clone().unwrap_or_default();
-    let sink_speed = pb.sink_speed.unwrap_or(30.0) * model.scale * 0.5;
-    let rise_speed = pb.rise_speed.unwrap_or(1.0) * model.scale * 0.5;
+    // A per-frame speed converts by the SAME derivation a character's does: the world scale times
+    // the frame-rate ratio. Spelled `scale * 0.5` in enough places that changing the frame rates in
+    // stats.jsonc would have moved characters and left every stage hazard behind.
+    let vscale = velocity_scale();
+    let sink_speed = pb.sink_speed.unwrap_or(30.0) * vscale;
+    let rise_speed = pb.rise_speed.unwrap_or(1.0) * vscale;
     let wait = pb.wait_frames.unwrap_or(390.0) * 2.0;
     let sink_depth = pb.sink_depth.unwrap_or(145.0) * model.scale;
     write_script(&scripts.join(format!("{script_id}.hx")), &platform_script_hx(half_w, sink_depth, sink_speed, rise_speed, wait))?;
@@ -1392,7 +1407,7 @@ fn emit_multi_anim_hazard(
                 spawn_y: model.death_box.as_ref().map(|b| b.y + 60.0)
                     .unwrap_or_else(|| cols.iter().map(|(_, y)| *y).fold(f64::MAX, f64::min) - 520.0),
                 spawn_period: fc.spawn_period.unwrap_or(600.0) * 2.0,
-                terminal: hz.max_y_speed.or(hz.behavior.fall_gravity).unwrap_or(30.0) * scale * 0.5,
+                terminal: hz.max_y_speed.or(hz.behavior.fall_gravity).unwrap_or(30.0) * velocity_scale(),
                 bob: hz.anims.iter().find(|a| sanitize_anim(&a.label) == entrance_name)
                     .map(|a| a.frame_velocities.clone()).unwrap_or_default(),
                 camera: hz.behavior.camera_target,
@@ -1420,8 +1435,8 @@ fn emit_multi_anim_hazard(
         // defaults only apply if the class declared no value.
         let b = &hz.behavior;
         let shake_amp = b.shake.unwrap_or(13.0) * scale;
-        let fall_v = b.fall_gravity.unwrap_or(30.0) * scale * 0.5;
-        let rise_v = b.rise_yspeed.map(f64::abs).unwrap_or(6.0) * scale * 0.5;
+        let fall_v = b.fall_gravity.unwrap_or(30.0) * velocity_scale();
+        let rise_v = b.rise_yspeed.map(f64::abs).unwrap_or(6.0) * velocity_scale();
         // the landing dust poof: the global-vfx shape from the mappings' global_vfx_map, at the
         // scale the hazard's own attachEffect call declared (× stage scale, a screen effect).
         let dust_scale = b.dust.as_ref().map(|(_, sx, _)| *sx).unwrap_or(2.0) * scale;
@@ -1438,7 +1453,7 @@ fn emit_multi_anim_hazard(
             .find(|a| sanitize_anim(&a.label) == entrance_name)
             .map(|a| a.frame_velocities.iter()
                 .map(|(f, v)| format!("\t\tif (m_timer.get() == {}) {{ m_vy.set({:.2}); }}\n",
-                    (f.saturating_sub(1)) * 2, v * scale * 0.5))
+                    (f.saturating_sub(1)) * 2, v * velocity_scale()))
                 .collect())
             .unwrap_or_default();
         let camera = hz.behavior.camera_target;
@@ -1836,7 +1851,7 @@ fn cgo_runnable(raw: &str, anims: &[String], scale: f64, wrap: Option<&ReconWrap
                 &c[1], g * scale * 0.25, term, g);
         } else if let Some(c) = yvel_re.captures(&s) {
             let v: f64 = c[2].parse().unwrap_or(0.0);
-            s = format!("{}self.setYVelocity({:.2}); // SSF2 setYSpeed {} @30fps", &c[1], v * scale * 0.5, v);
+            s = format!("{}self.setYVelocity({:.2}); // SSF2 setYSpeed {} @30fps", &c[1], v * velocity_scale(), v);
         }
         // screen-space args (camera shake amplitude, the dust vfx scale) x the stage scale.
         if let Some(c) = shake_re.captures(&s) {
@@ -2000,7 +2015,7 @@ fn cgo_runnable(raw: &str, anims: &[String], scale: f64, wrap: Option<&ReconWrap
         .map(|(v, _)| {
             let ladder: String = w.bob.iter()
                 .map(|(f, sp)| format!("\t\tif (_w_state_t.get() == {}) {{ self.setYVelocity({:.2}); }}\n",
-                    (f.saturating_sub(1)) * 2, sp * scale * 0.5))
+                    (f.saturating_sub(1)) * 2, sp * velocity_scale()))
                 .collect();
             format!("\t// entrance bob: the entrance sub-clip's frame scripts (setYSpeed timeline, 30->60fps)\n\
                      \tif (inLocalState({})) {{\n{ladder}\t}}\n", cname(v))

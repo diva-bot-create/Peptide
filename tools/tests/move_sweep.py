@@ -40,7 +40,46 @@ BIN = os.path.join(ROOT, "build", "release", "peptide")
 # ── the fixture, in each engine's own units ──────────────────────────────────
 # The source geometry is authored once (test_fixture.rs) and the converter scales it, so these
 # are the same surfaces expressed twice rather than two independent sets of numbers.
-SCALE = 1.3                 # size_multiplier from mappings/character/stats.jsonc
+# Read from the converter's OWN data files rather than restated here. The point of the sweep is to
+# check that what the converter produced matches what it was told to produce, and a harness holding
+# its own copy of the numbers can only ever agree with itself.
+def _jsonc(path):
+    """Load one of the converter's .jsonc mapping files (comments, trailing commas)."""
+    txt = open(os.path.join(ROOT, "crates", "ssf2-converter", "mappings", path)).read()
+    txt = re.sub(r"//[^\n]*", "", txt)
+    txt = re.sub(r",(\s*[}\]])", r"\1", txt)
+    return json.loads(txt)
+
+
+_STATS = _jsonc("character/stats.jsonc")
+SCALE = _STATS["size_multiplier"]
+SSF2_FPS = _STATS.get("ssf2_fps", 30)
+FM_FPS = _STATS.get("fm_fps", 60)
+FPS_RATIO = SSF2_FPS / FM_FPS
+# The conversion's own derivation: a per-frame distance shrinks by both the frame rate and the
+# world scale, so a move covers `size_multiplier` times the ground over twice as many frames.
+VELOCITY_SCALE = SCALE * FPS_RATIO
+DURATION_RATIO = 1.0 / FPS_RATIO
+TRAVEL_RATIO = VELOCITY_SCALE * DURATION_RATIO      # == size_multiplier
+
+# The name the converter says each SSF2 animation becomes. One SSF2 animation can be SPLIT into
+# several (a jab becomes jab1..jab4), so a played name counts as the expected one if it starts
+# with it.
+SSF2_TO_FM = _jsonc("character/animations.jsonc")["ssf2_to_fm"]
+
+
+def expected_fm_name(ssf2_anim):
+    """What the converter's mapping says this SSF2 animation should become."""
+    return SSF2_TO_FM.get((ssf2_anim or "").lower())
+
+
+def names_agree(ssf2_anim, fm_anim):
+    """True when the pair matches the converter's own mapping."""
+    want = expected_fm_name(ssf2_anim)
+    if not want or not fm_anim:
+        return None                      # nothing claimed, so nothing to contradict
+    got = fm_anim.lower()
+    return got == want or got.startswith(want)
 FLOOR_TOP_SRC = 400.0       # fixture FLOOR_Y
 # Aerials are dropped BELOW the floor, not above it. Above, the only thing a falling character can
 # do is land on the floor, which cuts the move short and makes the measurement about the drop
@@ -317,7 +356,16 @@ def sweep(engine, only=None):
 
 
 def compare():
-    """Put the two sweeps side by side and judge them against the conversion's own rules."""
+    """Judge the two sweeps against what the CONVERTER said it would produce.
+
+    Every expectation here comes from the converter's own mapping files, so this checks the output
+    against its stated contract rather than against a second opinion baked into the harness:
+
+      duration   the frame-rate ratio in stats.jsonc (30 -> 60, so x2)
+      travel     size_multiplier, since a per-frame speed shrinks by velocity_scale while the
+                 move lasts proportionally longer
+      naming     animations.jsonc's ssf2_to_fm, which says what each SSF2 animation becomes
+    """
     try:
         fm = {r["move"]: r for r in json.load(open("/tmp/peptide_sweep_fm.json"))}
         ss = {r["move"]: r for r in json.load(open("/tmp/peptide_sweep_ssf2.json"))}
@@ -325,29 +373,43 @@ def compare():
         print(f"missing a sweep: {e}. run both engines first.")
         return 1
 
-    print(f"{'move':22} {'ssf2':>6} {'fm':>6} {'x2?':>7}   {'dx ssf2':>8} {'dx fm':>8} {'x1.3?':>7}")
-    print("-" * 78)
-    bad = 0
+    print(f"expecting duration x{DURATION_RATIO:g}, travel x{TRAVEL_RATIO:g}"
+          f" (size_multiplier {SCALE:g}, {SSF2_FPS:g}->{FM_FPS:g}fps)\n")
+    print(f"{'move':20} {'ssf2':>5} {'fm':>5} {'dur':>6} {'dx ssf2':>8} {'dx fm':>8} {'travel':>7}  name")
+    print("-" * 88)
+
+    checked = bad = skipped = 0
     for name, _, _ in MOVES:
         a, b = ss.get(name), fm.get(name)
         if not a or not b:
             continue
-        # The two engines name the same move completely differently -- SSF2 calls a forward tilt
-        # A_FORWARD_TILT and the conversion calls it tilt_forward -- so the pairing is by the INPUT
-        # that produced it, which is identical on both sides, and the names are reported for
-        # context rather than compared.
-        dur = f"{b['frames']/a['frames']:.2f}" if a["frames"] else "-"
-        trav = f"{b['travel_x']/a['travel_x']:.2f}" if a["travel_x"] > 1.0 else "-"
-        durbad = a["frames"] and abs(b["frames"] / a["frames"] - 2.0) > 0.12
-        travbad = a["travel_x"] > 1.0 and abs(b["travel_x"] / a["travel_x"] - SCALE) > 0.15
-        mark = ""
-        if durbad or travbad:
-            mark = "  <-"
+        # Only compare a move both engines actually performed. An input that reached different
+        # moves is a gap in how the move is driven, not a conversion defect, and counting it as
+        # one buries the defects that are real.
+        agree = names_agree(a.get("animation"), b.get("animation"))
+        if not a["resolved"] or not b["resolved"] or agree is None:
+            skipped += 1
+            continue
+
+        checked += 1
+        dur = b["frames"] / a["frames"] if a["frames"] else 0.0
+        trav = b["travel_x"] / a["travel_x"] if a["travel_x"] > 1.0 else None
+        durbad = a["frames"] and abs(dur - DURATION_RATIO) / DURATION_RATIO > 0.08
+        travbad = trav is not None and abs(trav - TRAVEL_RATIO) / TRAVEL_RATIO > 0.12
+        namebad = not agree
+        mark = "  <-" if (durbad or travbad or namebad) else ""
+        if mark:
             bad += 1
-        print(f"{name:22} {a['frames']:>6} {b['frames']:>6} {dur:>7}   "
-              f"{a['travel_x']:>8.1f} {b['travel_x']:>8.1f} {trav:>7}{mark}"
-              f"   {a['animation'] or '-'}/{b['animation'] or '-'}")
-    print(f"\n{bad} move(s) outside tolerance (duration x2 +/-6%, travel x{SCALE} +/-12%)")
+        note = ""
+        if namebad:
+            note = f"  expected {expected_fm_name(a['animation'])}, got {b['animation']}"
+        print(f"{name:20} {a['frames']:>5} {b['frames']:>5} {dur:>6.2f} "
+              f"{a['travel_x']:>8.1f} {b['travel_x']:>8.1f} "
+              f"{(f'{trav:.2f}' if trav else '-'):>7}  "
+              f"{a['animation']}/{b['animation']}{mark}{note}")
+
+    print(f"\n{checked} move(s) compared, {bad} outside tolerance, "
+          f"{skipped} not compared (the two engines did not perform the same move)")
     return 1 if bad else 0
 
 

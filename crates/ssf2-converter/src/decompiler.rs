@@ -130,6 +130,23 @@ fn lookup_api(name: &str) -> Option<ApiEntry> {
 
 // ─── Expression AST ───────────────────────────────────────────────────────────
 
+/// The value of an expression that is just a number, including a negated one. Used to tell an
+/// authored constant (which is in SSF2 units and needs converting) from a computed value (which
+/// has already come back from the engine in its own units).
+fn literal_value(e: &Expr) -> Option<f64> {
+    match e {
+        Expr::Num(n) => Some(*n),
+        Expr::UnOp("-", inner) => literal_value(inner).map(|v| -v),
+        _ => None,
+    }
+}
+
+/// Render a number the way the rest of the emitter does: whole values stay whole, so a rescaled
+/// zero is still `0` rather than `0.0`.
+fn fmt_num(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 { format!("{}", v.round() as i64) } else { format!("{:.4}", v) }
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Num(f64),
@@ -210,7 +227,25 @@ impl Expr {
                 // needed — the FM method already applies the orientation. We only drop SSF2's
                 // optional second boolean flag, which FM's single-arg signature doesn't accept.
                 match method.as_str() {
-                    "setXSpeed" | "setYSpeed" => { rendered.truncate(1); }
+                    "setXSpeed" | "setYSpeed" => {
+                        rendered.truncate(1);
+                        // ...and RESCALE the value, because a speed written into a move is a
+                        // per-frame distance and neither the frame nor the distance means the
+                        // same thing on the other side: SSF2 steps 30 times a second in a world
+                        // the conversion makes `size_multiplier` bigger. Passing the number
+                        // through unchanged leaves the move covering the right ground per frame
+                        // but twice as many frames, so it travels about half as far again as it
+                        // should. Measured on a side special: 2.0x the source distance where
+                        // 1.3x was correct.
+                        //
+                        // Only a LITERAL is rescaled. Anything computed has already been through
+                        // the engine -- `decel(getXSpeed(), ...)` reads a speed back in FM units
+                        // -- and scaling that would shrink it again every frame it is applied.
+                        if let Some(v) = args.first().and_then(literal_value) {
+                            let scaled = v * crate::mappings::character_stats().scaling.velocity_scale();
+                            rendered[0] = fmt_num(scaled);
+                        }
+                    }
                     _ => {}
                 }
                 let arg_str = rendered.join(", ");
@@ -2229,4 +2264,18 @@ mod branch_op_tests {
         assert_eq!(cmp_branch_op(OP_IFTRUE), None);
         assert_eq!(cmp_branch_op(OP_IFFALSE), None);
     }
+}
+
+/// Render one API call the way the emitter would, for tests that pin a conversion RULE rather
+/// than a whole character. Arguments are given as source text and parsed back into the smallest
+/// expression that represents them, so a caller writes `"17"` or `"self.getXSpeed()"` and gets
+/// the same treatment the real path applies.
+pub fn render_call_for_test(method: &str, args: &[&str]) -> String {
+    let exprs: Vec<Expr> = args.iter()
+        .map(|a| match a.trim().parse::<f64>() {
+            Ok(n) => Expr::Num(n),
+            Err(_) => Expr::GetLex(a.to_string()),
+        })
+        .collect();
+    Expr::Call(Box::new(Expr::This), method.to_string(), exprs).render()
 }
