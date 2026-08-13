@@ -295,17 +295,24 @@ const NS_PACKAGE: u8 = 0x16;
 const PROPS_SLOT: &str = "m_peptideProps";
 const META_SLOT: &str = "MetaData";
 
-/// The names this package gives the layer it builds on.
-///
-/// Deliberately NOT the names a package built with the official tooling uses. Packages share one
-/// namespace, and the first definition of a name wins for everything loaded after it. Reusing the
-/// official names means whichever package loads first supplies that layer to every other one --
-/// and a fixture whose layer is a stub would hand its stub to the entire game. Loading the fixture
-/// first broke every stage, not just its own. Unique names cannot collide, so the fixture can be
-/// wrong on its own without being wrong on anyone else's behalf.
+/// The two names this package is free to choose. Everything else it declares has to match what
+/// the game looks up, name for name.
 const PKG_BASE_CLASS: &str = "PeptideBaseObject";
 const PKG_ASSET_CLASS: &str = "PeptideAsset";
-const PKG_STAGE_CLASS: &str = "PeptideStageBase";
+
+
+/// Every class a package must declare to the game, by the game's own names. A package built with
+/// the official tooling carries an implementation of each; the fixture carries the shape and only
+/// the stage base does anything, which is enough to be checked but not enough to be driven.
+const API_CLASSES: [&str; 14] = [
+    "SSF2GameObject", "SSF2Character", "SSF2Enemy", "SSF2Item", "SSF2Platform", "SSF2Projectile",
+    "SSF2Stage", "SSF2CollisionBoundary", "SSF2Target", "SSF2CustomMatch", "SSF2CustomMode",
+    "SSF2Camera", "SSF2GameTimer", "SSF2Beacon",
+];
+
+/// The name of the stage base a package declares to the game. The game looks this exact name up
+/// in the package's own class map, so it is not ours to choose.
+const PKG_STAGE_BASE: &str = "SSF2Stage";
 
 /// What the game calls on a stage while a match runs.
 const STAGE_CALLBACKS: [&str; 2] = ["initialize", "update"];
@@ -457,9 +464,21 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     asset_ctor.push(OP_GETLOCAL0);
     op1(&mut asset_ctor, OP_NEWOBJECT, 0);
     op1(&mut asset_ctor, OP_INITPROPERTY, mn_props);
+    // BASE_CLASSES is a MAP from class name to the package's own class object, not a list. The
+    // game checks a package against its own list of these, and reads entries straight out without
+    // looking first, so every name has to be present: a missing one comes back undefined and is
+    // then used. Each is looked up late, for the usual reason -- naming a class directly binds it
+    // before its own script has run.
     asset_ctor.push(OP_GETLOCAL0);
     op1(&mut asset_ctor, OP_PUSHSTRING, s_base);
-    op1(&mut asset_ctor, OP_NEWARRAY, 0);
+    for name in API_CLASSES {
+        let sn = str_(&mut abc, name);
+        let mn = { let ns = abc.intern_namespace(NS_PACKAGE, s_empty); abc.intern_qname(ns, sn) };
+        op1(&mut asset_ctor, OP_PUSHSTRING, sn);
+        op1(&mut asset_ctor, OP_FINDPROPSTRICT, mn);
+        op1(&mut asset_ctor, OP_GETPROPERTY, mn);
+    }
+    op1(&mut asset_ctor, OP_NEWOBJECT, API_CLASSES.len() as u32);
     op1(&mut asset_ctor, OP_PUSHSTRING, s_vmaj);
     asset_ctor.push(OP_PUSHBYTE); asset_ctor.push(API_VERSION_MAJOR);
     op1(&mut asset_ctor, OP_PUSHSTRING, s_vmin);
@@ -489,7 +508,7 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     let noop = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_RETURNVOID];
     specs.push(ClassSpec {
         name: PKG_ASSET_CLASS, package: String::new(), super_mn: mn_movieclip, param_count: 0,
-        ctor: asset_ctor, max_stack: 10, local_count: 1,
+        ctor: asset_ctor, max_stack: 48, local_count: 1,
         slots: vec![PROPS_SLOT, META_SLOT],
         methods: vec![
             MethodSpec { name: "register", param_count: 2, code: reg, max_stack: 4, local_count: 3 },
@@ -519,14 +538,19 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     // creates classes -- a class must name its base before that base exists as a class object.
     let mn_base = { let n = abc.intern_string(PKG_BASE_CLASS); abc.intern_qname(pub_ns, n) };
     let mn_asset = { let n = abc.intern_string(PKG_ASSET_CLASS); abc.intern_qname(pub_ns, n) };
-    // The stage base a package builds on. A package built with the official tooling carries a
-    // client-side copy of this layer compiled in; this file has no such copy, which is the one
-    // gap it cannot author around. Naming the game's own class instead does NOT work: a loaded
-    // package cannot see it, so the reference resolves to nothing and the package is refused.
-    let mn_ssf2stage = { let n = abc.intern_string(PKG_STAGE_CLASS); abc.intern_qname(pub_ns, n) };
+    // The stage base, under the game's own name for it: the game reads this exact key out of the
+    // package's class map, so it is not a name we get to pick. The class itself is ours, and a
+    // stub -- the official tooling compiles a real implementation in, and that is the one gap this
+    // file cannot author around. Naming the game's own class instead does NOT work either: a
+    // loaded package cannot see it, so the reference resolves to nothing and the package is
+    // refused outright.
+    let mn_ssf2stage = { let n = abc.intern_string(PKG_STAGE_BASE); abc.intern_qname(pub_ns, n) };
     let mn_fixture_cls = { let n = abc.intern_string(FIXTURE_ID); abc.intern_qname(pub_ns, n) };
 
-    declare(&mut specs, PKG_STAGE_CLASS, "", mn_base, 0, plain_ctor(0), 2, 1);
+    for name in API_CLASSES {
+        let sup = if name == PKG_STAGE_BASE { mn_base } else { mn_object };
+        declare(&mut specs, name, "", sup, 0, plain_ctor(0), 2, 1);
+    }
 
     // A stage is constructed WITH an argument and hands it to super; a 0-arg version is rejected.
     // It also has to answer the calls the game drives a stage with. A fixture has no behaviour of

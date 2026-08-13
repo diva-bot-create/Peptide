@@ -243,6 +243,13 @@ part: foreground" instead of a type error with no property, file or line. it is 
 is easy to get wrong and doing so stalls the load queue, which is worse than the failure it
 explains.
 
+a package also declares a CLASS MAP to the game (`MetaData.BASE_CLASSES`): every api class name
+the game knows, each mapped to the package's own class object. the game reads entries straight out
+of it without checking first, so a missing name comes back undefined and is then used. the names
+are the game's, not the package's, and shipped packages build the map with a plain
+`pushstring name; getlex Class` pair per entry. the game resolves a stage as
+`resource.getProp("stage")` first and that map second.
+
 the one gap authoring cannot close is the package-side API layer. a package carries its own copy
 of the classes it builds on, in the top-level namespace, and the stage base is where the behaviour
 the game drives actually lives. the official tooling compiles that copy in. naming the game's own
