@@ -57,6 +57,30 @@ pub trait DebugTarget {
         Ok("tree: no live object-tree walk on this engine yet (SSF2-only)".into())
     }
 
+    /// Screenshot the live frame to `path` (PNG), from inside the engine.
+    ///
+    /// The tree walk proves an object EXISTS, is visible, sized and positioned. None of that is
+    /// evidence that a pixel of it reaches the screen, and the two get confused easily. Reading
+    /// the window host-side is not a substitute: a headless session's window has no capturable
+    /// surface, so the engine has to photograph itself. An engine that can't declares the gap.
+    ///
+    /// WHAT THIS CAPTURES, AND WHY IT IS NOT WHAT A PLAYER SEES
+    /// -------------------------------------------------------
+    /// This photographs the DISPLAY ROOT, not the camera. On BOTH engines that means the frame
+    /// can contain things the game would never show: art outside the camera bounds, the full
+    /// extent of a stage the camera only ever pans across, and regions the camera crops away.
+    /// It also carries no camera zoom, so two engines' frames are not comparable by default --
+    /// the same stage photographs at different apparent scales purely because their cameras were
+    /// never consulted.
+    ///
+    /// So a shot is evidence about what was DRAWN, not about what is VISIBLE in play. Before
+    /// comparing frames across engines, or before treating a frame as "what the player sees",
+    /// set the camera position/mode on both sides first and capture that. Otherwise the
+    /// comparison silently measures framing differences instead of art differences.
+    fn shot(&mut self, _path: &std::path::Path) -> Result<String> {
+        Ok("shot: no in-engine screenshot on this engine yet".into())
+    }
+
     /// Character `idx`'s live animation clock. Default: eval the engine's `animFeed(i)`
     /// helper. `None` when that character doesn't exist (or there's no live match).
     ///
@@ -80,10 +104,43 @@ pub trait DebugTarget {
     }
 
     /// Read back the recorded frame history and stop recording. See [`Self::record`].
-    fn frame_trace(&mut self) -> Result<String> {
+    ///
+    /// `raw` dumps one line per frame (with position) instead of the run-length summary. The
+    /// summary answers how long a move lasted; the raw stream answers how far it moved each
+    /// frame, which is the only way to derive a speed multiplier from observation.
+    fn frame_trace(&mut self, _raw: bool) -> Result<String> {
         Ok("trace: this engine has no host-side frame buffer — its per-frame ANIM \
             telemetry is already in the session log, and `await` reports frame counts"
             .into())
+    }
+}
+
+/// Where the next decoded frame lands. Set when a `shot` goes out, read when the engine's hex
+/// reply arrives — the two happen on different threads, so the path can't just be a local.
+static SHOT_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Remember where the frame that's about to come back should be written.
+pub fn set_shot_path(p: &std::path::Path) {
+    *SHOT_PATH.lock().unwrap() = Some(p.to_path_buf());
+}
+
+/// Decode a `SHOT:` hex payload to the requested PNG path and describe what happened. Shared by
+/// the session daemon and the trait path so both report a frame the same way.
+pub fn write_shot(hex: &str) -> String {
+    let hex = hex.trim();
+    let path = SHOT_PATH.lock().unwrap().clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/peptide-shot.png"));
+    if hex.is_empty() {
+        return "SHOT: the engine returned an empty frame".into();
+    }
+    let bytes: std::result::Result<Vec<u8>, _> = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)).collect();
+    match bytes {
+        Err(e) => format!("SHOT: frame hex is malformed: {e}"),
+        Ok(b) => match std::fs::write(&path, &b) {
+            Err(e) => format!("SHOT: could not write {}: {e}", path.display()),
+            Ok(()) => format!("SHOT: wrote {} ({} bytes)", path.display(), b.len()),
+        },
     }
 }
 
@@ -269,6 +326,75 @@ pub fn fm_frames_take() -> Vec<String> { FM_FRAMES.lock().unwrap().clone() }
 /// engines. These strings previously existed in three files (bridge.rs's serve loop, the
 /// Fraymakers target, the SSF2 target) and could drift apart — which is exactly how `tree`
 /// ended up answering "SSF2-only" through one path and working through another.
+/// One object on a stage, as BOTH engines describe it.
+///
+/// The stage comparison only works if the two engines report the same facts in the same
+/// shape. They don't produce them the same way — SSF2 walks a display list and formats
+/// host-side, Fraymakers builds its rows in injected bytecode — so this is the contract that
+/// keeps them diffable: whatever a target can measure goes in these fields, and anything it
+/// genuinely cannot measure is `None` rather than a filler value that would read as data.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StageNode {
+    /// Nesting depth, so a tree and a flat layer listing print alike.
+    pub depth: usize,
+    /// Runtime class. The engines' names differ; the SHAPE of the row is what's shared.
+    pub class: String,
+    /// Instance name, or `None` when the object is anonymous (common in Fraymakers, where
+    /// reparented vfx sprites are wrapped in unnamed containers).
+    pub name: Option<String>,
+    pub x: f64,
+    pub y: f64,
+    /// Pixel size, when the engine exposes it (SSF2 does; Fraymakers doesn't per-object).
+    pub size: Option<(f64, f64)>,
+    pub visible: bool,
+    /// Animation clock: current frame and length. This is the "does it animate / does it
+    /// loop" axis, and it's the field most worth having on both sides.
+    pub frame: Option<(i64, i64)>,
+    /// Current animation label, when the engine names one.
+    pub label: Option<String>,
+    /// Which named stage layer the object sits in, when known.
+    pub layer: Option<String>,
+    /// Where the object ACTUALLY renders, in absolute space.
+    ///
+    /// A display child's own x/y is local to its container, so it can read (0,0) while the
+    /// thing is drawn anywhere at all — that is exactly how a placement bug hid here once.
+    /// The absolute pair is the figure comparable to an SSF2 world position.
+    pub abs: Option<(f64, f64)>,
+}
+
+/// Render a `StageNode` the SAME way for either engine, so two logs diff field by field.
+///
+/// Absent facts are OMITTED rather than filled: a missing frame clock must not be
+/// indistinguishable from `frame=0/0`, or a comparison would silently read "no animation"
+/// where the truth is "not measured here".
+pub fn fmt_stage_node(n: &StageNode) -> String {
+    let mut out = format!("{}{} ", "  ".repeat(n.depth), n.class);
+    out.push_str(&match &n.name {
+        Some(nm) => format!("{nm:?} "),
+        None => String::new(),
+    });
+    out.push_str(&format!("@({:.1},{:.1})", n.x, n.y));
+    if let Some((w, h)) = n.size {
+        out.push_str(&format!(" {w:.0}x{h:.0}"));
+    }
+    if !n.visible {
+        out.push_str(" HIDDEN");
+    }
+    if let Some((f, t)) = n.frame {
+        out.push_str(&format!(" frame={f}/{t}"));
+    }
+    if let Some(l) = &n.label {
+        out.push_str(&format!(" '{l}'"));
+    }
+    if let Some(l) = &n.layer {
+        out.push_str(&format!(" layer={l}"));
+    }
+    if let Some((ax, ay)) = n.abs {
+        out.push_str(&format!(" abs=({ax:.1},{ay:.1})"));
+    }
+    out
+}
+
 pub fn fmt_record(on: bool) -> String {
     if on { "record: window opened (engine pushes FRAME: telemetry)".into() }
     else { "record: the recorder always pushes — `trace` reads the window".into() }
@@ -276,6 +402,15 @@ pub fn fmt_record(on: bool) -> String {
 
 /// `TRACE:` header plus one `<animation> xN` row per run. `ends[i]`, when present, is the
 /// position the run finished at (SSF2 carries it in the stream; Fraymakers doesn't).
+/// One line per recorded frame, verbatim. The RLE summary says how many frames a move lasted;
+/// this says where the entity was on each of them, which is the only way to derive a speed
+/// multiplier from observation rather than assuming one.
+pub fn fmt_trace_raw(frames: &[String]) -> String {
+    let mut out = format!("TRACERAW:{} frames\n", frames.len());
+    for (i, f) in frames.iter().enumerate() { out.push_str(&format!("  {i}\t{f}\n")); }
+    out
+}
+
 pub fn fmt_trace(total: usize, runs: &[(String, usize)], ends: &[Option<String>]) -> String {
     let mut out = format!("TRACE:{total} frames, {} animations\n", runs.len());
     for (i, (label, n)) in runs.iter().enumerate() {
@@ -383,9 +518,10 @@ pub fn run_command(target: &mut dyn DebugTarget, line: &str) -> Result<Option<St
             Some(if out.is_empty() { "info: no live characters".into() } else { out })
         }
         Command::Record { on } => Some(target.record(on)?),
-        Command::Trace => Some(target.frame_trace()?),
+        Command::Trace { raw } => Some(target.frame_trace(raw)?),
         Command::Console => Some(target.console()?),
         Command::Tree(depth) => Some(target.tree(depth)?),
+        Command::Shot(ref p) => Some(target.shot(p)?),
         Command::AddCharacter => Some(target.add_character()?),
         Command::Exit => { target.exit()?; Some("exit".into()) }
         Command::Load => Some(target.load()?),
@@ -458,7 +594,50 @@ impl FraymakersTarget {
     }
 }
 
+/// Render the engine's raw `tree` reply, turning its `N\t…` field rows into the SHARED
+/// stage-node format.
+///
+/// The injected walk emits fields rather than prose precisely so this formatting lives in one
+/// place for both engines. Non-node lines (group headers, entity rows) pass through untouched.
+pub fn fmt_fm_tree(raw: &str) -> String {
+    let mut out = String::new();
+    for line in raw.lines() {
+        let Some(fields) = line.trim_start().strip_prefix("N\t") else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let f: Vec<&str> = fields.split('\t').collect();
+        let get = |i: usize| f.get(i).copied().unwrap_or("");
+        let num = |v: &str| v.parse::<f64>().unwrap_or(0.0);
+        let name = get(1);
+        let node = StageNode {
+            depth: 3,
+            class: get(0).to_string(),
+            name: (!name.is_empty()).then(|| name.to_string()),
+            x: num(get(2)),
+            y: num(get(3)),
+            // pixel size, when the object has a dimensions component (fields 9/10)
+            size: (!get(8).is_empty() && get(8) != "null")
+                .then(|| (num(get(8)), num(get(9)))),
+            visible: get(4) != "0",
+            // The animation clock, when the object has one. Absent fields stay None: a
+            // display child genuinely has no clock, and that must not read as frame 0.
+            frame: (!get(5).is_empty() && get(5) != "null")
+                .then(|| (num(get(5)) as i64, num(get(6)) as i64)),
+            label: (!get(7).is_empty() && get(7) != "null").then(|| get(7).to_string()),
+            layer: (!get(10).is_empty() && get(10) != "null").then(|| get(10).to_string()),
+            abs: (!get(11).is_empty() && get(11) != "null")
+                .then(|| (num(get(11)), num(get(12)))),
+        };
+        out.push_str(&fmt_stage_node(&node));
+        out.push('\n');
+    }
+    out
+}
+
 impl DebugTarget for FraymakersTarget {
+
     /// Open a recording window: drop whatever the engine has pushed so far.
     /// Symmetric with `Ssf2Target::record` — both engines push per-frame telemetry and the
     /// host decides what counts as a window.
@@ -470,8 +649,9 @@ impl DebugTarget for FraymakersTarget {
     /// Close the window: run-length-encode every frame the engine pushed since `record`.
     /// Identical output shape to the SSF2 side, via the shared `rle_frames`, so a timing
     /// comparison is reading the same measurement from both engines.
-    fn frame_trace(&mut self) -> Result<String> {
+    fn frame_trace(&mut self, raw: bool) -> Result<String> {
         let frames = fm_frames_take();
+        if raw { return Ok(fmt_trace_raw(&frames)); }
         let runs = rle_frames(&frames);
         Ok(fmt_trace(frames.len(), &runs, &[]))
     }
@@ -490,5 +670,22 @@ impl DebugTarget for FraymakersTarget {
     // "not supported" through the session/GUI path (run_command -> target.tree) while the
     // same command worked through the serve path (command_to_wire -> "w"). Two drivers,
     // opposite answers, same command.
-    fn tree(&mut self, depth: u32) -> Result<String> { self.run(&Command::Tree(depth)) }
+    // Rendered through the SHARED stage-node formatter: the injected walk emits fields, not
+    // prose, so both engines' rows are produced by one piece of code and stay diffable.
+    fn tree(&mut self, depth: u32) -> Result<String> {
+        let raw = self.run(&Command::Tree(depth))?;
+        Ok(fmt_fm_tree(&raw))
+    }
+
+    // The engine encodes the PNG and hands it back as hex on the SAME socket the commands ride
+    // (the stock-icon path's trick). No engine-side file write, and nothing depends on the host
+    // being able to see the window — which, headless, it cannot.
+    fn shot(&mut self, path: &std::path::Path) -> Result<String> {
+        let raw = self.run(&Command::Shot(path.to_path_buf()))?;
+        let hex: String = raw.lines()
+            .find_map(|l| l.trim().strip_prefix("SHOT:").map(str::to_string))
+            .ok_or_else(|| anyhow::anyhow!("engine returned no frame: {}", raw.trim()))?;
+        set_shot_path(path);
+        Ok(write_shot(&hex))
+    }
 }

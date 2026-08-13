@@ -55,16 +55,21 @@ pub enum Engine {
 #[derive(Clone, Debug, Default)]
 pub struct BootOptions {
     pub char_name: Option<String>,
+    /// CLI `--stage`. Overrides the configured stage for BOTH the patch-time bake and the
+    /// autostart command, so the stage that gets loaded is the stage that gets launched.
+    pub stage_name: Option<String>,
     pub full: bool,
 }
 
 impl BootOptions {
     /// Build from CLI args. `--full`, `--no-boot`, and `--attach` all mean "bridge only,
-    /// no autostart"; `--char X` names the character (else the config default is used).
+    /// no autostart"; `--char X` names the character and `--stage X` the stage (else the
+    /// config defaults are used).
     pub fn from_cli(args: &[String]) -> Self {
         let full = args.iter().any(|a| a == "--full" || a == "--no-boot" || a == "--attach");
         let char_name = arg_val(args, "--char");
-        BootOptions { char_name, full }
+        let stage_name = arg_val(args, "--stage");
+        BootOptions { char_name, stage_name, full }
     }
 }
 
@@ -96,12 +101,18 @@ pub fn command(engine: Engine, opts: &BootOptions) -> Option<String> {
         // roster is passed through untouched.
         Engine::Fraymakers => {
             let roster = if ch.contains(',') { ch.to_string() } else { format!("{ch},{ch}") };
-            format!("spawn {roster} {} {}", cfg.stage(), cfg.assist())
+            let stage = opts.stage_name.clone().unwrap_or_else(|| cfg.stage());
+            format!("spawn {roster} {stage} {}", cfg.assist())
         }
         // SSF2 also supports the full roster (Ssf2Target::spawn builds an N-slot versus Game),
-        // so pass the comma roster through unchanged. SSF2 resolves its stage from config inside
-        // its own spawn, so only the characters are needed here (no stage/assist tokens).
-        Engine::Ssf2 => format!("spawn {ch}"),
+        // so pass the comma roster through unchanged. A `--stage` is passed on when given, the
+        // same as for Fraymakers — without it the two engines boot different stages from the
+        // same command, which makes a cross-engine comparison compare the wrong things.
+        // Assists are Fraymakers-only, so there's no third token here.
+        Engine::Ssf2 => match opts.stage_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(stage) => format!("spawn {ch} {stage}"),
+            None => format!("spawn {ch}"),
+        },
     })
 }
 
@@ -128,15 +139,36 @@ mod tests {
     }
 
     #[test]
+    fn stage_arg_reaches_both_engines() {
+        // A cross-engine comparison is only valid if both engines booted the SAME stage.
+        let opts = BootOptions::from_cli(&argv(&["--char", "mario", "--stage", "bowserscastle"]));
+        for engine in [Engine::Fraymakers, Engine::Ssf2] {
+            let cmd = command(engine, &opts).expect("should autostart");
+            assert!(cmd.contains("bowserscastle"), "{engine:?} dropped the stage: {cmd}");
+        }
+    }
+
+    #[test]
+    fn stage_arg_drives_the_autostart_stage() {
+        // `--stage` has to reach BOTH the bake and the launch: the patcher's custom-stage
+        // self-bootstrap keys off the baked name, so a stage that's baked but not launched
+        // (or launched but not baked) leaves setupStage with a null resource.
+        let opts = BootOptions::from_cli(&argv(&["--char", "mario", "--stage", "bowserscastlessf2"]));
+        assert_eq!(opts.stage_name.as_deref(), Some("bowserscastlessf2"));
+        let cmd = command(Engine::Fraymakers, &opts).expect("should autostart");
+        assert!(cmd.contains("bowserscastlessf2"), "stage missing from autostart: {cmd}");
+    }
+
+    #[test]
     fn full_boot_never_autostarts() {
-        let opts = BootOptions { char_name: Some("mario".into()), full: true };
+        let opts = BootOptions { char_name: Some("mario".into()), stage_name: None, full: true };
         assert_eq!(command(Engine::Fraymakers, &opts), None);
         assert_eq!(command(Engine::Ssf2, &opts), None);
     }
 
     #[test]
     fn empty_char_never_autostarts() {
-        let opts = BootOptions { char_name: Some("   ".into()), full: false };
+        let opts = BootOptions { char_name: Some("   ".into()), stage_name: None, full: false };
         assert_eq!(command(Engine::Fraymakers, &opts), None);
         assert_eq!(command(Engine::Ssf2, &opts), None);
     }
@@ -145,7 +177,7 @@ mod tests {
     fn ssf2_quick_boot_is_char_only() {
         // SSF2 resolves stage/assist inside its own spawn, so the command is char-only
         // and config-independent.
-        let opts = BootOptions { char_name: Some("mario".into()), full: false };
+        let opts = BootOptions { char_name: Some("mario".into()), stage_name: None, full: false };
         assert_eq!(command(Engine::Ssf2, &opts).as_deref(), Some("spawn mario"));
     }
 
@@ -155,7 +187,7 @@ mod tests {
         // explicit stage + assist, AND an explicit player-2 roster (a single char lets the
         // engine fall back to a native default p2 that freezes the match). 4 tokens: spawn,
         // <char>,<char>, stage, assist.
-        let opts = BootOptions { char_name: Some("mario".into()), full: false };
+        let opts = BootOptions { char_name: Some("mario".into()), stage_name: None, full: false };
         let cmd = command(Engine::Fraymakers, &opts).expect("a char + non-full boot autostarts");
         assert!(cmd.starts_with("spawn mario,mario "), "got: {cmd}");
         assert_eq!(cmd.split_whitespace().count(), 4, "spawn + roster + stage + assist; got: {cmd}");
@@ -163,7 +195,7 @@ mod tests {
 
     #[test]
     fn fraymakers_quick_boot_keeps_an_explicit_roster() {
-        let opts = BootOptions { char_name: Some("mario,zelda".into()), full: false };
+        let opts = BootOptions { char_name: Some("mario,zelda".into()), stage_name: None, full: false };
         let cmd = command(Engine::Fraymakers, &opts).expect("autostarts");
         assert!(cmd.starts_with("spawn mario,zelda "), "an explicit roster is passed through: {cmd}");
     }
@@ -172,7 +204,7 @@ mod tests {
     fn fraymakers_quick_boot_passes_a_full_four_player_roster() {
         // A 4-char roster is passed through verbatim (no mirroring); stage+assist still
         // get appended so the engine `s` handler keeps the extra players at parts[4+].
-        let opts = BootOptions { char_name: Some("sandbag,mario,sandbag,mario".into()), full: false };
+        let opts = BootOptions { char_name: Some("sandbag,mario,sandbag,mario".into()), stage_name: None, full: false };
         let cmd = command(Engine::Fraymakers, &opts).expect("autostarts");
         assert!(cmd.starts_with("spawn sandbag,mario,sandbag,mario "), "got: {cmd}");
         assert_eq!(cmd.split_whitespace().count(), 4, "spawn + roster + stage + assist; got: {cmd}");
@@ -182,7 +214,7 @@ mod tests {
     fn ssf2_quick_boot_passes_the_full_roster() {
         // SSF2's backend builds an N-slot versus Game, so a multi-char roster boots the whole
         // match (no stage/assist tokens — SSF2 resolves the stage from config in its own spawn).
-        let opts = BootOptions { char_name: Some("mario,zelda,kirby".into()), full: false };
+        let opts = BootOptions { char_name: Some("mario,zelda,kirby".into()), stage_name: None, full: false };
         assert_eq!(command(Engine::Ssf2, &opts).as_deref(), Some("spawn mario,zelda,kirby"));
     }
 }

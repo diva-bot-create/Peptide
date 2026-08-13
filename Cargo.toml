@@ -56,3 +56,54 @@ windows-sys = { version = "0.59", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18.0"
+
+# Conversion-hot crates are built OPTIMIZED even in dev/test; everything else (including the
+# whole GUI/webview tree) stays at opt-level 0. A conversion is almost entirely inflate, image
+# decode/encode and the SWF tag walk, so unoptimized these ran ~10x slower than release — one
+# sandbag conversion took ~90s under `cargo test` vs 8s from the release binary, and the suite
+# converts a character several times over. Optimizing JUST these takes it to ~9s.
+#
+# Deliberately NOT `package."*"`: this workspace has 285 crates and blanket-optimizing them
+# means a very long one-time rebuild of dependencies that have nothing to do with conversion
+# speed. Keep this list to the hot path.
+[profile.dev.package.ssf2_converter]
+opt-level = 2
+[profile.dev.package.image]
+opt-level = 2
+[profile.dev.package.png]
+opt-level = 2
+[profile.dev.package.zune-jpeg]
+opt-level = 2
+[profile.dev.package.zune-inflate]
+opt-level = 2
+[profile.dev.package.flate2]
+opt-level = 2
+[profile.dev.package.miniz_oxide]
+opt-level = 2
+[profile.dev.package.swf]
+opt-level = 2
+[profile.dev.package.crc32fast]
+opt-level = 2
+[profile.dev.package.adler2]
+opt-level = 2
+# The rest of the hot path, and the reason a codec-only list wasn't enough: the converter runs
+# thousands of regex rewrites over the extracted scripts, hashes a deterministic uuid per symbol
+# and keyframe, and serialises every .entity as JSON. Unoptimized those three dominate.
+[profile.dev.package.regex]
+opt-level = 2
+[profile.dev.package.regex-automata]
+opt-level = 2
+[profile.dev.package.regex-syntax]
+opt-level = 2
+[profile.dev.package.aho-corasick]
+opt-level = 2
+[profile.dev.package.memchr]
+opt-level = 2
+[profile.dev.package.serde_json]
+opt-level = 2
+[profile.dev.package.sha1]
+opt-level = 2
+[profile.dev.package.sha2]
+opt-level = 2
+[profile.dev.package.digest]
+opt-level = 2

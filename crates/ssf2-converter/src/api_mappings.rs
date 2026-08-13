@@ -1981,10 +1981,12 @@ fn neutralize_getter_callbacks(code: String) -> String {
     use regex::Regex;
     let no_op = "function(){} /*TODO: SSF2 used a non-function (instance var) as the callback here*/";
     // addTimer: callback is the 3rd (last) arg
-    let re_timer = Regex::new(r"(addTimer\(\s*[^,()]+,\s*[^,()]+,\s*)[A-Za-z_][\w.]*\.get\(\)(\s*\))").unwrap();
+    static RE_TIMER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re_timer = RE_TIMER.get_or_init(|| Regex::new(r"(addTimer\(\s*[^,()]+,\s*[^,()]+,\s*)[A-Za-z_][\w.]*\.get\(\)(\s*\))").unwrap());
     let code = re_timer.replace_all(&code, format!("${{1}}{}${{2}}", no_op)).into_owned();
     // addEventListener: callback is the 2nd arg (options may follow)
-    let re_evt = Regex::new(r"(addEventListener\(\s*[^,()]+,\s*)[A-Za-z_][\w.]*\.get\(\)(\s*[,)])").unwrap();
+    static RE_EVT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re_evt = RE_EVT.get_or_init(|| Regex::new(r"(addEventListener\(\s*[^,()]+,\s*)[A-Za-z_][\w.]*\.get\(\)(\s*[,)])").unwrap());
     re_evt.replace_all(&code, format!("${{1}}{}${{2}}", no_op)).into_owned()
 }
 
@@ -2010,7 +2012,8 @@ fn fix_timer_infinite_repeat(code: String) -> String {
     // `[^,()]+` matches a simple delay arg (number or identifier), mirroring
     // `neutralize_getter_callbacks`; it deliberately skips delays that contain
     // a nested call (rare for a timer delay).
-    let re = Regex::new(r"(addTimer\(\s*[^,()]+,\s*)0(\s*,)").unwrap();
+    static RE_REPEAT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE_REPEAT.get_or_init(|| Regex::new(r"(addTimer\(\s*[^,()]+,\s*)0(\s*,)").unwrap());
     re.replace_all(&code, "${1}-1${2}").into_owned()
 }
 
@@ -2215,7 +2218,8 @@ pub fn comment_out_unknown_calls(code: &str) -> String {
     // defines `function jumpToContinue(...)` and also uses it as a COLLIDE_FLOOR
     // listener; commenting its direct call broke the landing/continue transition).
     let local_fns: std::collections::HashSet<String> = {
-        let re = regex::Regex::new(r"(?m)^\s*function\s+(\w+)\s*\(").unwrap();
+        static RE_FNDEF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = RE_FNDEF.get_or_init(|| regex::Regex::new(r"(?m)^\s*function\s+(\w+)\s*\(").unwrap());
         re.captures_iter(code).map(|c| c[1].to_string()).collect()
     };
 
@@ -2278,11 +2282,13 @@ pub fn comment_out_unknown_calls(code: &str) -> String {
 /// valid call to a real local function (e.g. mario's `jumpToContinue`, also used as a
 /// COLLIDE_FLOOR listener). This whole-file post-pass restores those calls.
 pub fn uncomment_local_fn_calls(code: &str) -> String {
-    let def_re = regex::Regex::new(r"(?m)^\s*function\s+(\w+)\s*\(").unwrap();
+    static RE_DEF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let def_re = RE_DEF.get_or_init(|| regex::Regex::new(r"(?m)^\s*function\s+(\w+)\s*\(").unwrap());
     let locals: std::collections::HashSet<String> =
         def_re.captures_iter(code).map(|c| c[1].to_string()).collect();
     if locals.is_empty() { return code.to_string(); }
-    let line_re = regex::Regex::new(r"^(\s*)// \[SSF2-only: (\w+)\] (.*)$").unwrap();
+    static RE_MARKED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let line_re = RE_MARKED.get_or_init(|| regex::Regex::new(r"^(\s*)// \[SSF2-only: (\w+)\] (.*)$").unwrap());
     let mut restored = 0usize;
     let mut joined = code.lines().map(|line| {
         if let Some(c) = line_re.captures(line) {
@@ -2310,7 +2316,8 @@ pub fn uncomment_local_fn_calls(code: &str) -> String {
 /// the names; [`snapshot_conversion_log`] applies them, so a frame-script pass that
 /// accrues counts AFTER the defining file still gets discounted.
 pub fn discount_local_fn_calls(code: &str) {
-    let def_re = regex::Regex::new(r"(?m)^\s*function\s+(\w+)\s*\(").unwrap();
+    static RE_DEF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let def_re = RE_DEF.get_or_init(|| regex::Regex::new(r"(?m)^\s*function\s+(\w+)\s*\(").unwrap());
     let mut log = conversion_log().lock().unwrap();
     log.local_fns.extend(def_re.captures_iter(code).map(|c| c[1].to_string()));
 }
