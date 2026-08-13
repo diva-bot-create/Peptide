@@ -204,6 +204,35 @@ output is a FrayTools character package directory (full layout in [`README.md`](
 after unwrapping, `swf_parser::parse` uses the Ruffle `swf` crate (`decompress_swf` +
 `parse_swf`) to turn the bytes into a tag tree.
 
+### what a package must contain to LOAD (not just to parse)
+
+peptide's reader is deliberately forgiving, so a package can convert cleanly and still be a file
+the game will not open. these are the differences, learned by watching loads fail. everything here
+is a hard requirement of the player or the game, not a style preference:
+
+| requirement | what happens without it |
+| --- | --- |
+| the DAT container (zlib around `u32 swf_len`, `u32 index_count`, `N x u32` index, inner SWF) | the reader passes a bare `FWS` stream through, the game does not recognise the file at all |
+| `FileAttributes` with the ActionScript-3 flag, as the FIRST tag | the player runs the file as AVM1, ignores the ABC, and every symbol link binds to nothing |
+| a class defined for EVERY `SymbolClass` link | the player throws while binding symbols. this is the nastiest one: it happens during the boot's data pass, so the whole game dies rather than just this package |
+| one class per script, not all classes in one script | shared bases (the asset/stage bases) already exist in the game. a script initialiser that trips over an existing name stops there, taking every later class in that script with it -- including `Main` |
+| a `Main` class whose constructor registers `id` | the package has no identity, so nothing can ask for it no matter how correct the geometry is |
+| a stage class constructed WITH one argument, passed to `super` | a 0-argument version is rejected when the stage is built |
+| an entry in the game's own resource manifest | the file is simply never opened. no error is raised, because nothing tried |
+
+the last row is the one that cannot be satisfied by authoring alone. the id-to-file map is not
+derived from the files: it is an obfuscated JSON manifest embedded in the game, and a package the
+manifest does not list is invisible however well formed it is. adding one means patching that
+manifest, which is why a from-scratch package needs a patched game and not just a new file in the
+data directory.
+
+none of these announce themselves. that is what `inject_load_error_reporter` is for: it hooks both
+of the loader's error paths so a package that fails names itself and its error over the
+`SCRIPTERR` channel, instead of leaving an author with a game that boots to a broken state and no
+line to read. reports are buffered on the document and drained the first tick the bridge socket is
+writable, because packages are opened during the boot -- before `connect()` has completed -- so a
+report written at the moment of failure would be dropped exactly when it matters most.
+
 ### SWF structure for SSF2 characters
 
 ```

@@ -72,6 +72,13 @@ pub const SSF2_NS_ENGINE: &str = "com.mcleodgaming.ssf2.engine"; // Character, S
 pub const SSF2_NS_UTIL: &str = "com.mcleodgaming.ssf2.util";     // Controller, ControlsObject, ResourceManager
 pub const SSF2_NS_ENUMS: &str = "com.mcleodgaming.ssf2.enums";   // Mode
 
+/// The loader that opens one data package, and the two handlers it routes a failed open through.
+/// Both are hooked so a package that fails names itself instead of vanishing.
+pub const PEPTIDE_LOAD_LOG: &str = "peptideLoadLog";
+pub const SSF2_RESOURCE_CLASS: &str = "Resource";
+pub const SSF2_RESOURCE_FILE_FIELD: &str = "m_fileName";
+pub const SSF2_RESOURCE_ERROR_METHODS: [&str; 2] = ["initialLoadError", "loadError"];
+
 /// A tiny opcode emitter with the AVM2 u30 var-encoding + label/branch fixups.
 #[derive(Default)]
 struct Code {
@@ -1903,10 +1910,12 @@ pub fn inject_ready_signal(abc: &mut Abc, doc_class_local: &str) -> anyhow::Resu
     let mn_flush = q(abc, pub_ns, "flush");
     let mn_readysent = q(abc, pub_ns, "peptideReadySent"); // one-shot guard flag
     let mn_connected = q(abc, pub_ns, "connected");        // Socket.connected (Boolean)
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);     // load reports buffered pre-connect
     let s_ready = abc.intern_string("READY\n");
 
     // one-shot flag slot on the document instance (defaults to undefined → falsy)
     abc.add_instance_slot(doc_ci, mn_readysent);
+    abc.add_instance_slot(doc_ci, mn_loadlog);
 
     // hook DisclaimerMenu.checkDisclaimer — the recurring check that runs while the boot
     // disclaimer video plays (resolved by NAME, version-resilient; it's an instance method).
@@ -1955,6 +1964,32 @@ pub fn inject_ready_signal(abc: &mut Abc, doc_class_local: &str) -> anyhow::Resu
     c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); c.op_u30(OP_GETPROPERTY, mn_sock);
     c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
     c.place(l_skip);
+
+    // Then, on every tick and independent of READY, drain anything the load-error reporter
+    // buffered. Packages are opened during the boot, which is BEFORE the socket finishes
+    // connecting -- connect() returns immediately and the link only becomes writable a few
+    // event-loop turns later. A report written at the moment of failure would therefore be
+    // thrown away exactly when it matters most, so the reporter parks it on the document and
+    // this drains it the first tick the socket can actually carry it.
+    //   if (Main.ROOT != null && Main.ROOT.peptideSock != null
+    //       && Main.ROOT.peptideSock.connected && Main.ROOT.peptideLoadLog != null) {
+    //       Main.ROOT.peptideSock.writeUTFBytes(Main.ROOT.peptideLoadLog); flush();
+    //       Main.ROOT.peptideLoadLog = null;
+    //   }
+    let l_drained = c.new_label();
+    let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+    root(&mut c); c.branch(OP_IFFALSE, l_drained);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_drained);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+    c.branch(OP_IFFALSE, l_drained);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.branch(OP_IFFALSE, l_drained);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_drained);
+
     c.op(OP_POPSCOPE);
     let payload = c.finish();
 
@@ -2296,6 +2331,85 @@ pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Re
     prepend_code(body, &payload);
     body.max_stack = body.max_stack.max(4);
     body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
+    Ok(())
+}
+
+/// Report every package that fails to load, over the same `SCRIPTERR` channel engine errors use.
+///
+/// A malformed package does not announce itself. The game asks for a data file, the player refuses
+/// it, the failure is handled quietly, and what the author sees is a game that boots to a broken
+/// state with nothing naming the file responsible -- or, when the failure lands mid-enumeration, a
+/// game that does not come up at all. That is the single worst thing about authoring custom
+/// content: the feedback is "it didn't work", with no line to read.
+///
+/// So both of the loader's error paths get a prologue that pushes the file name and the underlying
+/// error text before the game's own handling runs. Nothing is suppressed -- the original body still
+/// executes exactly as before, and the report is skipped whenever the bridge socket is not up, so
+/// an unpatched or pre-connection load behaves as it always did.
+pub fn inject_load_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
+    let ci = abc.find_class_by_name(SSF2_RESOURCE_CLASS)
+        .ok_or_else(|| anyhow::anyhow!("{SSF2_RESOURCE_CLASS} not found"))?;
+
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_main = q(abc, pub_ns, "Main");
+    let mn_root = q(abc, pub_ns, "ROOT");
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_file = q(abc, pub_ns, SSF2_RESOURCE_FILE_FIELD);
+    let s_tag = abc.intern_string("SCRIPTERR: package load failed: ");
+    let s_sep = abc.intern_string(": ");
+    let s_nl = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+
+    for method_name in SSF2_RESOURCE_ERROR_METHODS {
+        let method = abc.instances[ci].traits.iter().find_map(|t| match t.data {
+            TraitKindData::Method { method, .. }
+                if abc.multiname_local(t.name).as_deref() == Some(method_name) => Some(method),
+            _ => None,
+        });
+        // Both handlers are expected, but a missing one is not worth failing a patch over: this
+        // is a diagnostic, and losing one report is better than refusing to boot.
+        let Some(method) = method else { continue };
+        let Some(body_idx) = abc.bodies.iter().position(|b| b.method == method) else { continue };
+
+        // if (Main.ROOT == null) skip;   — nothing to buffer onto yet
+        // Main.ROOT.peptideLoadLog = (Main.ROOT.peptideLoadLog || "")
+        //     + "SCRIPTERR: package load failed: " + this.<file> + ": " + arg1 + "\n";
+        //
+        // Appending rather than writing is what makes this work at all: these handlers run
+        // during the boot, before the socket is writable. The READY tick drains the buffer the
+        // moment the link is up. Every dereference is guarded so the diagnostic can never be the
+        // reason a load fails -- the original handler still runs untouched right after.
+        let mut c = Code::default();
+        let l_skip = c.new_label();
+        let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+        root(&mut c); c.branch(OP_IFFALSE, l_skip);
+
+        root(&mut c);                                   // target for the setproperty below
+        let l_have = c.new_label();
+        let l_joined = c.new_label();
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+        c.branch(OP_IFTRUE, l_have);                    // already a string: keep it
+        c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank); // first report: start from ""
+        c.branch(OP_JUMP, l_joined);
+        c.place(l_have);
+        c.op(OP_CONVERT_S);
+        c.place(l_joined);
+
+        c.op_u30(OP_PUSHSTRING, s_tag); c.op(OP_ADD);
+        c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_file); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_sep); c.op(OP_ADD);
+        c.op_u30(OP_GETLOCAL, 1); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
+        c.op_u30(OP_SETPROPERTY, mn_loadlog);
+        c.place(l_skip);
+
+        let payload = c.finish();
+        let body = &mut abc.bodies[body_idx];
+        prepend_code(body, &payload);
+        body.max_stack = body.max_stack.max(6);
+        body.local_count = body.local_count.max(2);
+    }
     Ok(())
 }
 

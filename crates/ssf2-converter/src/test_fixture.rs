@@ -137,6 +137,9 @@ pub fn build_fixture_swf() -> Vec<u8> {
     let mark = swf::Color { r: 255, g: 0, b: 255, a: 0 }; // invisible beacons
 
     let mut tags: Vec<Tag> = vec![
+        // Must come first, and must say ActionScript 3: without it the player treats the whole
+        // file as AVM1, skips the ABC, and every symbol link silently binds to nothing.
+        Tag::FileAttributes(swf::FileAttributes::IS_ACTION_SCRIPT_3),
         // --- collision geometry, inside a `terrain` clip (the parser's collision container) ---
         rect_shape(1, -FLOOR_HALF_W, FLOOR_Y, FLOOR_HALF_W, FLOOR_Y + 40.0, grey),
         rect_shape(2, -200.0, PLATFORM_Y, 200.0, PLATFORM_Y + 20.0, blue),
@@ -179,21 +182,39 @@ pub fn build_fixture_swf() -> Vec<u8> {
         depth += 1;
     }
 
-    tags.push(place(10, Some("terrain"), 1));
-    tags.push(place(3, Some("deathBoundary"), 2));
-    tags.push(place(4, Some("camBoundary"), 3));
-    tags.extend(placements);
+    // Everything the stage IS lives inside one clip, linked as `stage_<id>`. That is the
+    // convention shipped packages follow and the one the reader looks for, and it is also what
+    // lets the package hand the game a single display object instead of a loose root timeline.
+    let mut stage_body = vec![
+        place(10, Some("terrain"), 1),
+        place(3, Some("deathBoundary"), 2),
+        place(4, Some("camBoundary"), 3),
+    ];
+    stage_body.extend(placements);
+    stage_body.push(Tag::ShowFrame);
+    tags.push(Tag::DefineSprite(swf::Sprite { id: 11, num_frames: 1, tags: stage_body }));
+    tags.push(place(11, Some("stageMC"), 1));
+
+    let stage_symbol = format!("stage_{FIXTURE_ID}");
+    beacons.push((11, stage_symbol));
     tags.push(Tag::SymbolClass(
         beacons.iter().map(|(id, name)| swf::SymbolClassLink {
             id: *id,
             class_name: swf::SwfStr::from_utf8_str(Box::leak(name.clone().into_boxed_str())),
         }).collect(),
     ));
+    // the AS3 half: without it the package has no identity and SSF2 cannot see it at all
+    let abc = build_fixture_abc(&beacons);
+    tags.push(Tag::DoAbc2(swf::DoAbc2 {
+        flags: swf::DoAbc2Flag::LAZY_INITIALIZE,
+        name: swf::SwfStr::from_utf8_str("fixture"),
+        data: Box::leak(abc.into_boxed_slice()),
+    }));
     tags.push(Tag::ShowFrame);
 
     let header = swf::Header {
         compression: swf::Compression::None,
-        version: 10,
+        version: 21,
         stage_size: rect(-800.0, -600.0, 800.0, 600.0),
         frame_rate: Fixed8::from_f32(30.0),
         num_frames: 1,
@@ -201,4 +222,314 @@ pub fn build_fixture_swf() -> Vec<u8> {
     let mut out = Vec::new();
     swf::write_swf(&header, &tags, &mut out).expect("fixture swf");
     out
+}
+
+// ─────────────────────────── the AS3 half ────────────────────────────────────
+//
+// A stage is not just geometry: SSF2 identifies a package by its AS3. The id comes from a class
+// named `Main` whose constructor registers it (`extract_main_package_metadata` reads exactly
+// that), so a shapes-only SWF converts fine and is invisible to the engine.
+//
+// This authors that ABC from scratch rather than copying one out of an existing stage, which
+// matters for two reasons: a donor's bytecode is McLeodGaming content this repo can't ship, and a
+// donor would drag in its own id, class graph and behaviour -- the opposite of a fixture whose
+// contents are entirely known.
+
+use crate::abc_codec::{
+    Abc, ClassInfo, InstanceInfo, MethodBody, MethodInfo, ScriptInfo, Trait,
+    TraitKindData,
+};
+
+/// The id SSF2 and the converter both see this stage as.
+pub const FIXTURE_ID: &str = "peptidefixture";
+
+const OP_GETLOCAL0: u8 = 0xd0;
+const OP_GETLOCAL1: u8 = 0xd1;
+const OP_PUSHSCOPE: u8 = 0x30;
+const OP_POPSCOPE: u8 = 0x1d;
+const OP_PUSHSTRING: u8 = 0x2c;
+const OP_PUSHBYTE: u8 = 0x24;
+const OP_DUP: u8 = 0x2a;
+const OP_GETLEX: u8 = 0x60;
+const OP_NEWCLASS: u8 = 0x58;
+const OP_NEWOBJECT: u8 = 0x55;
+const OP_NEWARRAY: u8 = 0x56;
+const OP_INITPROPERTY: u8 = 0x68;
+const OP_FINDPROPSTRICT: u8 = 0x5d;
+const OP_CALLPROPVOID: u8 = 0x4f;
+const OP_CONSTRUCTSUPER: u8 = 0x49;
+const OP_RETURNVOID: u8 = 0x47;
+const NS_PACKAGE: u8 = 0x16;
+
+/// A stable guid for the fixture. Shipped packages carry one and the reader looks for it, so
+/// leaving it out would make the fixture the only package in the corpus without an identity.
+const FIXTURE_GUID: &str = "9f3c1e7a-2b64-4d18-a5f0-6c81d47e2b90";
+
+/// Append a u30 in AVM2's variable-length encoding.
+fn u30(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 { out.push(b); break; }
+        out.push(b | 0x80);
+    }
+}
+
+/// Emit `op` followed by one u30 operand.
+fn op1(out: &mut Vec<u8>, op: u8, a: u32) { out.push(op); u30(out, a); }
+/// Emit `op` followed by two u30 operands (property multiname + arg count).
+fn op2(out: &mut Vec<u8>, op: u8, a: u32, b: u32) { out.push(op); u30(out, a); u30(out, b); }
+
+/// Everything needed to author one class: what it is called, what it extends, and its
+/// constructor. `param_count` exists because the base a class extends dictates its signature --
+/// a stage class is constructed with one argument and passes it straight to `super`.
+struct ClassSpec {
+    name: &'static str,
+    /// dotted package, `""` for the top level
+    package: String,
+    super_mn: u32,
+    param_count: u32,
+    ctor: Vec<u8>,
+    max_stack: u32,
+    local_count: u32,
+}
+
+/// Build the fixture's ABC from scratch.
+///
+/// The shape is dictated by what actually happens when the game opens a package, each part of
+/// which was learned by watching a load fail:
+///
+/// * Every class named by a `SymbolClass` link must EXIST here. A link to a class the ABC does not
+///   define is not a soft failure -- the player throws while binding symbols, and because that
+///   happens as the data directory is being read, the whole boot dies rather than just this one
+///   package. Nothing in the game's own logs points at the file responsible.
+/// * The identity comes from a class named `Main` whose constructor registers it, so the package
+///   is invisible without one no matter how correct the geometry is.
+/// * `Main` extends `SSF2Asset` and the stage class extends `SSF2Stage`, neither of which this
+///   file can define for real. Declaring them as stubs is exactly what shipped packages do: the
+///   loader resolves a name that already exists to the definition that is already loaded, so the
+///   stubs are replaced by the real classes and never run.
+fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
+    let mut abc = Abc {
+        minor: 16, major: 46,
+        ints: vec![], uints: vec![], doubles: vec![],
+        strings: vec![], strings_raw: vec![],
+        namespaces: vec![], ns_sets: vec![], multinames: vec![],
+        methods: vec![], metadata: vec![], instances: vec![], classes: vec![],
+        scripts: vec![], bodies: vec![],
+    };
+
+    let s_empty = abc.intern_string("");
+    let pub_ns = abc.intern_namespace(NS_PACKAGE, s_empty);
+    let mn_movieclip = {
+        let p = abc.intern_string("flash.display");
+        let ns = abc.intern_namespace(NS_PACKAGE, p);
+        let n = abc.intern_string("MovieClip");
+        abc.intern_qname(ns, n)
+    };
+    let mn_object = { let n = abc.intern_string("Object"); abc.intern_qname(pub_ns, n) };
+    let mn_register = { let n = abc.intern_string("register"); abc.intern_qname(pub_ns, n) };
+
+    // Names the constructor of `Main` pushes. Interning them up front keeps the emit below flat.
+    let str_ = |abc: &mut Abc, s: &str| abc.intern_string(s);
+    let s_id = str_(&mut abc, "id");
+    let s_fixture = str_(&mut abc, FIXTURE_ID);
+    let s_guid = str_(&mut abc, "guid");
+    let s_guid_v = str_(&mut abc, FIXTURE_GUID);
+    let s_resources = str_(&mut abc, "resources");
+    let s_movieclips = str_(&mut abc, "movieclips");
+    let s_sounds = str_(&mut abc, "sounds");
+    let s_stage_mc = str_(&mut abc, &format!("stage_{FIXTURE_ID}"));
+    let s_music = str_(&mut abc, "music");
+    let s_track = str_(&mut abc, "bgm_battlefield");
+    let s_stage = str_(&mut abc, "stage");
+    let s_camera = str_(&mut abc, "camera");
+    let s_x_start = str_(&mut abc, "x_start");
+    let s_y_start = str_(&mut abc, "y_start");
+
+    // ── the stub hierarchy the real definitions take over at load time ──
+    let mut specs: Vec<ClassSpec> = Vec::new();
+    let plain_ctor = |argc: u32| {
+        let mut c = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+        if argc == 1 { c.push(OP_GETLOCAL1); }
+        op1(&mut c, OP_CONSTRUCTSUPER, argc);
+        c.push(OP_RETURNVOID);
+        c
+    };
+
+    let declare = |specs: &mut Vec<ClassSpec>, name, package: &str, super_mn, param_count, ctor: Vec<u8>, max_stack, local_count| {
+        specs.push(ClassSpec { name, package: package.to_string(), super_mn, param_count, ctor, max_stack, local_count });
+    };
+
+    declare(&mut specs, "SSF2BaseAPIObject", "", mn_object, 0, plain_ctor(0), 2, 1);
+    declare(&mut specs, "SSF2Asset", "", mn_movieclip, 0, plain_ctor(0), 2, 1);
+
+    // The stage's own display symbol, plus one class per beacon. All plain clips.
+    let stage_symbol: &'static str = Box::leak(format!("stage_{FIXTURE_ID}").into_boxed_str());
+    declare(&mut specs, stage_symbol, "", mn_movieclip, 0, plain_ctor(0), 2, 1);
+    for (_, sym) in symbols {
+        if sym == stage_symbol { continue; }
+        let (package, local) = match sym.rsplit_once('.') {
+            Some((p, l)) => (p.to_string(), l.to_string()),
+            None => (String::new(), sym.clone()),
+        };
+        let local: &'static str = Box::leak(local.into_boxed_str());
+        declare(&mut specs, local, &package, mn_movieclip, 0, plain_ctor(0), 2, 1);
+    }
+
+    // These two need forward references, so reserve their multinames before the loop that
+    // creates classes -- a class must name its base before that base exists as a class object.
+    let mn_base = { let n = abc.intern_string("SSF2BaseAPIObject"); abc.intern_qname(pub_ns, n) };
+    let mn_asset = { let n = abc.intern_string("SSF2Asset"); abc.intern_qname(pub_ns, n) };
+    let mn_ssf2stage = { let n = abc.intern_string("SSF2Stage"); abc.intern_qname(pub_ns, n) };
+    let mn_fixture_cls = { let n = abc.intern_string(FIXTURE_ID); abc.intern_qname(pub_ns, n) };
+    let _ = mn_base;
+
+    declare(&mut specs, "SSF2Stage", "", mn_base, 0, plain_ctor(0), 2, 1);
+    // A stage is constructed WITH an argument and hands it to super; a 0-arg version is rejected.
+    declare(&mut specs, FIXTURE_ID, "", mn_ssf2stage, 1, plain_ctor(1), 3, 2);
+
+    // ── Main: the package's identity, registered field by field ──
+    let mut m = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+    op1(&mut m, OP_CONSTRUCTSUPER, 0);
+
+    let pair = |m: &mut Vec<u8>, key: u32, emit: &dyn Fn(&mut Vec<u8>)| {
+        op1(m, OP_FINDPROPSTRICT, mn_register);
+        op1(m, OP_PUSHSTRING, key);
+        emit(m);
+        op2(m, OP_CALLPROPVOID, mn_register, 2);
+    };
+
+    pair(&mut m, s_id, &|m| op1(m, OP_PUSHSTRING, s_fixture));
+    pair(&mut m, s_guid, &|m| op1(m, OP_PUSHSTRING, s_guid_v));
+    // resources: { movieclips: [ "stage_<id>" ], sounds: [] }
+    pair(&mut m, s_resources, &|m| {
+        op1(m, OP_PUSHSTRING, s_movieclips);
+        op1(m, OP_PUSHSTRING, s_stage_mc);
+        op1(m, OP_NEWARRAY, 1);
+        op1(m, OP_PUSHSTRING, s_sounds);
+        op1(m, OP_NEWARRAY, 0);
+        op1(m, OP_NEWOBJECT, 2);
+    });
+    // music: [ { id: "<track>" } ]
+    pair(&mut m, s_music, &|m| {
+        op1(m, OP_PUSHSTRING, s_id);
+        op1(m, OP_PUSHSTRING, s_track);
+        op1(m, OP_NEWOBJECT, 1);
+        op1(m, OP_NEWARRAY, 1);
+    });
+    pair(&mut m, s_stage, &|m| op1(m, OP_GETLEX, mn_fixture_cls));
+    // camera: { x_start: 0, y_start: 0 } -- the fixture is centred on its own origin
+    pair(&mut m, s_camera, &|m| {
+        op1(m, OP_PUSHSTRING, s_x_start);
+        m.push(OP_PUSHBYTE); m.push(0);
+        op1(m, OP_PUSHSTRING, s_y_start);
+        m.push(OP_PUSHBYTE); m.push(0);
+        op1(m, OP_NEWOBJECT, 2);
+    });
+    m.push(OP_RETURNVOID);
+    declare(&mut specs, "Main", "", mn_asset, 0, m, 12, 1);
+
+    // ── realise every spec as instance + class, each in a script of its own ──
+    //
+    // One class per script, which is what shipped packages do and is load-bearing rather than
+    // stylistic. Three of these names (the asset and stage bases) already exist in the game, and a
+    // script initialiser that trips over an existing name stops there. With every class sharing one
+    // script that takes `Main` down with it and the package goes silently unregistered; with a
+    // script each, only the stub's own script is affected and it was never going to run anyway.
+    let empty_body = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_RETURNVOID];
+
+    for spec in specs.iter() {
+        let mn = {
+            let p = abc.intern_string(&spec.package);
+            let ns = abc.intern_namespace(NS_PACKAGE, p);
+            let n = abc.intern_string(spec.name);
+            abc.intern_qname(ns, n)
+        };
+        let name_idx = abc.intern_string(spec.name);
+        let iinit = abc.add_method(MethodInfo {
+            param_types: vec![0; spec.param_count as usize], return_type: 0,
+            name: name_idx, flags: 0, options: vec![], param_names: vec![],
+        });
+        abc.add_body(MethodBody {
+            method: iinit, max_stack: spec.max_stack, local_count: spec.local_count,
+            init_scope_depth: 0, max_scope_depth: 1,
+            code: spec.ctor.clone(), exceptions: vec![], traits: vec![],
+        });
+        let cinit = abc.add_method(MethodInfo {
+            param_types: vec![], return_type: 0, name: 0, flags: 0, options: vec![], param_names: vec![],
+        });
+        abc.add_body(MethodBody {
+            method: cinit, max_stack: 1, local_count: 1, init_scope_depth: 0, max_scope_depth: 1,
+            code: empty_body.clone(), exceptions: vec![], traits: vec![],
+        });
+
+        abc.instances.push(InstanceInfo {
+            name: mn, super_name: spec.super_mn, flags: 0, protected_ns: 0,
+            interfaces: vec![], iinit, traits: vec![],
+        });
+        abc.classes.push(ClassInfo { cinit, traits: vec![] });
+        let classi = (abc.classes.len() - 1) as u32;
+
+        // Declaring the trait reserves the name; the class OBJECT only exists once this script's
+        // initialiser builds it against its base.
+        let mut init = vec![OP_GETLOCAL0, OP_PUSHSCOPE];
+        op1(&mut init, OP_GETLEX, spec.super_mn);
+        init.push(OP_DUP);
+        init.push(OP_PUSHSCOPE);
+        op1(&mut init, OP_NEWCLASS, classi);
+        init.push(OP_POPSCOPE);
+        op1(&mut init, OP_INITPROPERTY, mn);
+        init.push(OP_RETURNVOID);
+
+        let script_init = abc.add_method(MethodInfo {
+            param_types: vec![], return_type: 0, name: 0, flags: 0, options: vec![], param_names: vec![],
+        });
+        abc.add_body(MethodBody {
+            method: script_init, max_stack: 3, local_count: 1, init_scope_depth: 0, max_scope_depth: 2,
+            code: init, exceptions: vec![], traits: vec![],
+        });
+        abc.scripts.push(ScriptInfo {
+            init: script_init,
+            traits: vec![Trait {
+                name: mn, kind_byte: 0x04, // Class
+                data: TraitKindData::Class { slot_id: 1, classi },
+                metadata: vec![],
+            }],
+        });
+    }
+
+    crate::abc_codec::write(&abc)
+}
+
+/// Package the fixture the way SSF2 ships its own content: a raw zlib stream wrapping
+///
+/// ```text
+/// u32 BE  inner SWF length
+/// u32 BE  index entry count
+/// N x u32 BE  index entries
+/// <inner SWF>
+/// ```
+///
+/// `build_fixture_swf` alone is enough for the converter, because `ssf::decompress` passes a bare
+/// `FWS` stream through untouched. The game is stricter: it only ever sees `DAT<n>.ssf` in this
+/// container, so a raw SWF dropped in its data directory is simply not a file it can open. Ship the
+/// container and the same bytes serve both sides.
+///
+/// The index carries no entries. Every shipped archive lists some, but nothing in the load path
+/// needs them for a stage this small, and an empty list keeps the packaging honest about what we
+/// actually know rather than inventing plausible ids.
+pub fn build_fixture_dat() -> Vec<u8> {
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+
+    let swf = build_fixture_swf();
+    let mut raw = Vec::with_capacity(swf.len() + 8);
+    raw.extend_from_slice(&(swf.len() as u32).to_be_bytes());
+    raw.extend_from_slice(&0u32.to_be_bytes()); // index entry count
+    raw.extend_from_slice(&swf);
+
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(&raw).expect("zlib write to a Vec cannot fail");
+    enc.finish().expect("zlib finish to a Vec cannot fail")
 }

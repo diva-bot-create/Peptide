@@ -328,7 +328,10 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         // between sending input and starting to watch). See inject_frame_recorder.
         ssf2_converter::abc_inject::inject_frame_recorder(abc, SSF2_DOC_CLASS, 0)?;
         // engine-error telemetry, the SSF2 half of Fraymakers' SCRIPTERR channel
-        ssf2_converter::abc_inject::inject_error_reporter(abc, SSF2_DOC_CLASS)
+        ssf2_converter::abc_inject::inject_error_reporter(abc, SSF2_DOC_CLASS)?;
+        // and the load-time half: a package the engine refuses names itself instead of
+        // failing silently, which is the only signal a custom-content author ever gets
+        ssf2_converter::abc_inject::inject_load_error_reporter(abc)
     })?;
     macos_resign(&dst_app);
     Ok(dst_app)

@@ -58,3 +58,13 @@ fn fixture_blast_box_is_big_enough_for_a_long_fall() {
     let frames = (death.h / SCALE) / 30.0;
     assert!(frames > 150.0, "blast box gives only {frames:.0} frames of fall; want a long drop");
 }
+
+#[test]
+fn fixture_ships_in_the_container_format_the_game_reads() {
+    // The game only ever opens `DAT<n>.ssf` archives, so the packaged form has to survive the same
+    // reader the rest of the corpus goes through and come back as the identical SWF.
+    let packed = ssf2_converter::test_fixture::build_fixture_dat();
+    assert_ne!(&packed[..3], b"FWS", "the packaged fixture must be a container, not a bare SWF");
+    let inner = ssf2_converter::ssf::decompress(&packed).expect("the container must unwrap");
+    assert_eq!(inner, build_fixture_swf(), "unwrapping must yield the fixture unchanged");
+}
