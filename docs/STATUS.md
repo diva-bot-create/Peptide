@@ -126,29 +126,22 @@ dimensions below are the rest.
   startup/active/recovery. the live half is the `record`/`trace` frame recorder (both
   engines push per-frame telemetry); it confirms the emitted lengths actually play that
   way, on a sample rather than the whole roster.
-- **the +1 frame is in how a move is LEFT, not in how it is converted.** the live sweep
-  (`tools/tests/move_sweep.py both`) measures sandbag and mario on the fixture in both engines.
-  input-driven moves land at 2.10-2.17 against a target of 2.00, consistently, which read as the
-  conversion emitting one source frame too many. it is not that: the same sweep drives the smashes
-  by STATE rather than by button (fraymakers tells a smash from a tilt by stick magnitude, which
-  an injected mask has no way to express), and those play their whole animation with nothing
-  deciding when to leave:
+- **a frame whose code ends the move is no longer emitted** (fixed). the two engines run a
+  frame's code on opposite sides of drawing it: SSF2 runs it FIRST, so a frame carrying
+  `endAttack` or a goto hands control away before anything is drawn and never appears; Fraymakers
+  runs it AFTER, so emitting that frame showed a pose the original never displayed and every such
+  move ran one source frame long. the trim happens before any layer is built, because the engine
+  takes an animation's length from its LONGEST layer -- trimming only the images left the labels
+  at the old length and the animation exactly as long as before, just inconsistent.
 
-  | move | how driven | ssf2 | fm | ratio |
-  | --- | --- | --- | --- | --- |
-  | strong_forward | state | 20 | 40 | **2.00** |
-  | strong_down | state | 21 | 42 | **2.00** |
-  | special_down | script-governed | 19 | 38 | **2.00** |
-  | special_side_air | script-governed | 32 | 64 | **2.00** |
-  | jab | input | 13 | 28 | 2.15 |
-  | tilt_up | input | 12 | 26 | 2.17 |
-  | aerial_neutral | input | 20 | 42 | 2.10 |
+  measured on the fixture, sandbag, both engines, before -> after: tilt_forward 2.12 -> 2.00,
+  tilt_up 2.17 -> 2.00, tilt_down 2.15 -> 2.00, aerial_neutral 2.10 -> 2.00, aerial_forward
+  2.14 -> 2.00, aerial_up 2.14 -> 2.00, aerial_down 2.11 -> 2.00.
 
-  every move that plays to its own end is exactly 2.00. every move whose end is decided while it
-  runs is 2.10-2.17. so the emitted LENGTH is right and the two engines differ by about a frame in
-  when they leave a move -- which is a gameplay-timing question (input buffering, the frame a
-  transition is taken on), not a conversion one. worth measuring properly with the per-frame trace
-  before treating it as a defect.
+  two moves are still out. `jab` sits at 2.15 and carries no frame scripts at all, so nothing
+  marks where SSF2 leaves it -- it ends some other way. `strong_forward` moved the wrong way,
+  2.00 -> 1.90, so the rule over-applies to at least one split piece whose terminating frame SSF2
+  does draw. both want the per-frame trace rather than totals.
 - **special-angle sentinels.** SSF2 sentinel angles (`-1`/`-2`/`-3`…) are preserved
   faithfully, we just haven't mapped them to FM's special-angle codes yet. needs the
   SSF2-sentinel → FM-angle table.

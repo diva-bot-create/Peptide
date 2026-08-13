@@ -340,6 +340,10 @@ fn strip_unreachable_returns(body: &str) -> String {
 /// fire on exactly ONE frame, so after doubling we split every non-blank FRAME_SCRIPT
 /// keyframe into a 1-frame script followed by a blank keyframe holding the remainder (so
 /// total timing is preserved and the script is always followed by a blank or the anim end).
+/// Calls that hand control away from the running animation. SSF2 executes a frame's code before
+/// drawing it, so a frame carrying one of these is never displayed.
+const ANIM_TERMINATORS: &[&str] = &["endAttack", "gotoAndStop", "gotoAndPlay"];
+
 fn enforce_one_frame_scripts(layers: &mut [Value], keyframes: &mut Vec<Value>, char_id: &str) {
     let mut new_blanks: Vec<Value> = Vec::new();
     let mut counter = 0usize;
@@ -431,13 +435,45 @@ pub fn generate_entity(
         };
         let base_len = split_len.max(1);
         let head = split.append_head_frames as u32;     // extra frames taken from source [0, head)
-        let frame_count = base_len + head;               // total emitted frames
+        let mut frame_count = base_len + head;           // total emitted frames (see the terminator
+                                                         // trim in the frame-script pass below)
         let split_start_u = split.start_frame as u32;
         // Map a logical (emitted) frame index to its SOURCE frame: the slice maps to
         // [start, end); any appended frames wrap back to the source head [0, head).
         let src_frame = move |f: u32| -> u16 {
             if f < base_len { (split_start_u + f) as u16 } else { (f - base_len) as u16 }
         };
+        // A frame whose code ENDS the move is never SEEN in SSF2, so it must not be emitted.
+        //
+        // The two engines run a frame's code on opposite sides of drawing it. SSF2 runs the code
+        // FIRST, so a frame carrying `endAttack` (or a goto) hands control away before anything is
+        // drawn: the move is already over and that frame never appears. Fraymakers runs a frame's
+        // code AFTER drawing it, so emitting the same frame puts a pose on screen the original
+        // never showed and the converted move lasts one source frame longer than its source.
+        //
+        // This has to happen before ANY layer is built. Every layer is laid out against
+        // `frame_count`, and the engine takes an animation's length from its longest layer, so
+        // trimming only some of them leaves the animation exactly as long as it was and merely
+        // inconsistent.
+        if frame_count >= 2 {
+            let ssf2_name = data.ssf2_to_fm_anim.iter()
+                .find(|(_, fm)| fm.as_str() == source_anim.as_str())
+                .or_else(|| data.ssf2_to_fm_anim.iter().find(|(_, fm)| fm.as_str() == anim_name.as_str()))
+                .map(|(ssf2, _)| ssf2.clone());
+            let frame_offset = sprite_boxes.get(source_anim.as_str())
+                .map(|sb| sb.sprite_frame_offset as u32).unwrap_or(0) + split.start_frame as u32;
+            if let Some(ssf2) = ssf2_name {
+                let want = frame_offset + frame_count - 1;
+                let prefix = format!("{}__frame", ssf2);
+                let ends = data.scripts.iter().any(|sc| {
+                    !sc.is_ext_method
+                        && sc.name.strip_prefix(&prefix).and_then(|r| r.parse::<u32>().ok()) == Some(want)
+                        && ANIM_TERMINATORS.iter().any(|t| sc.code.contains(t))
+                });
+                if ends { frame_count -= 1; }
+            }
+        }
+
         let anim_id = uuid(char_id, &format!("anim_{}", anim_name));
         let mut anim_layer_ids: Vec<String> = Vec::new();
         // IMAGE layers are collected separately so they can be emitted FIRST in
