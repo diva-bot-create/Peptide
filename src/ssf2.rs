@@ -357,6 +357,7 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
             ("StageData", "startGame", false),
             ("Resource", "getProp", false),
             ("ResourceManager", "validateResource", true),
+            ("StageData", "findObjects", false),
         ] } {
             ssf2_converter::abc_inject::inject_error_locator(abc, SSF2_DOC_CLASS, class, method, is_static)?;
         }

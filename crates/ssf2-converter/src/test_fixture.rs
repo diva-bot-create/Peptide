@@ -582,13 +582,29 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     op1(&mut base_ctor, OP_INITPROPERTY, mn_api);
     base_ctor.push(OP_RETURNVOID);
     // Forwarders: one call through to the same name on the game's api object.
-    let forward = |abc: &mut Abc, names: &[&'static str], overriding: bool| -> Vec<MethodSpec> {
+    let forward = |abc: &mut Abc, owner: &'static str, names: &[&'static str], overriding: bool|
+        -> Vec<MethodSpec>
+    {
         names.iter().map(|m| {
-            let mn_m = { let n = abc.intern_string(m); abc.intern_qname(pub_ns, n) };
-            let mut code = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
-            op1(&mut code, OP_GETPROPERTY, mn_api);
-            op2(&mut code, OP_CALLPROPERTY, mn_m, 0);
-            code.push(OP_RETURNVALUE);
+            let code = if *m == "getType" {
+                // NOT a forward. `getType` answers with the name of the class it is on, and that
+                // is load-bearing: the game asks its own object what it is, that object asks the
+                // package's, and a package that asks straight back is two objects each waiting on
+                // the other. It comes out as a stack overflow from deep inside the engine while it
+                // is building collision, which reads like anything but a one-line mistake.
+                let sn = abc.intern_string(owner);
+                let mut c = vec![OP_GETLOCAL0, OP_PUSHSCOPE];
+                op1(&mut c, OP_PUSHSTRING, sn);
+                c.push(OP_RETURNVALUE);
+                c
+            } else {
+                let mn_m = { let n = abc.intern_string(m); abc.intern_qname(pub_ns, n) };
+                let mut c = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+                op1(&mut c, OP_GETPROPERTY, mn_api);
+                op2(&mut c, OP_CALLPROPERTY, mn_m, 0);
+                c.push(OP_RETURNVALUE);
+                c
+            };
             MethodSpec {
                 name: m, param_count: 0, code, max_stack: 3, local_count: 1,
                 is_override: overriding && *m == "getType",
@@ -599,7 +615,7 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     // The root answers the calls the levels below it override. An override needs something to
     // override: marking one when the base does not declare it is refused just as firmly as
     // redeclaring one without marking it.
-    let base_methods = forward(&mut abc, &BASE_API_METHODS, false);
+    let base_methods = forward(&mut abc, PKG_BASE_CLASS, &BASE_API_METHODS, false);
     specs.push(ClassSpec {
         name: PKG_BASE_CLASS, package: String::new(), super_mn: mn_object, param_count: 1,
         ctor: base_ctor, max_stack: 3, local_count: 2,
@@ -618,7 +634,7 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
         (PKG_BOUNDARY_CLASS, mn_root_cls, COLLISION_BOUNDARY_METHODS.as_slice()),
         (PKG_PLATFORM_CLASS, mn_boundary, PLATFORM_METHODS.as_slice()),
     ] {
-        let fwd = forward(&mut abc, methods, true);
+        let fwd = forward(&mut abc, name, methods, true);
         specs.push(ClassSpec {
             name, package: String::new(), super_mn: sup, param_count: 1,
             ctor: plain_ctor(1), max_stack: 3, local_count: 2, slots: vec![],

@@ -163,15 +163,27 @@ which in turn means a stage class redeclaring `initialize`/`update` must mark th
 direction wrong and the class is refused, and one refused class refuses the package -- silently,
 as a load that never completes.
 
-## known gap
+## known gap: the collision scan overflows
 
-with the chain in place and the clips typed, the game DOES scan the stage: it reaches
-`StageData.as:532`, which is `STAGE.findObjects(...)`, and that scan is what builds platforms. it
-then overflows (`Error #1023`) while building them, and the fixture comes up with no fighter at
-all rather than with no ground.
+with the api chain in place and clips typed, the game DOES scan the stage for collision: it
+reaches `StageData.as:532` (`STAGE.findObjects(...)`) and gets as far as `StageData.as:698`, which
+is `TERRAINS.unshift(new MovingPlatform(...))`. building that platform overflows the stack
+(`Error #1023`) and the stage does not come up at all, so clip typing is off by default and turned
+on with `PEPTIDE_CLIP_TYPES`. a stage that comes up without ground beats one that does not come up.
 
-so clip typing is off by default (`PEPTIDE_CLIP_TYPES` turns it on) -- a stage that comes up
-without ground beats one that does not come up. what is known: the scan is iterative rather than
-recursive, it works from a worklist of children, and it reads `type`, `className` and `classAPI`
-off each. supplying the latter two as empty rather than leaving them absent made it worse, which
-fits: an empty name is still a name, and the game goes looking for the class it names.
+one cause of that overflow is understood and fixed: `getType` must return the NAME OF ITS OWN
+CLASS as a constant, not forward to the api like its neighbours do. the game asks its object what
+it is, that object asks the package's, and a package that asks straight back leaves two objects
+each waiting on the other. everything else on those classes IS a plain forward, checked
+method by method against a shipped package.
+
+what is known about the scan, for whoever picks this up:
+
+* it is iterative, not recursive, working from a worklist of the stage's children.
+* it reads `type`, `className` and `classAPI` off each child. supplying the latter two as empty
+  strings made things worse rather than better, which fits: an empty name is still a name, and the
+  game goes looking for the class it names. shipped clips declare only `type`.
+* the branch for `"platform"` reads a `ground` property off the clip, which shipped clips do not
+  appear to declare either.
+* the fixture's clip structure matches a shipped stage shape for shape, so the difference is in
+  what the clips DECLARE rather than how they are built.
