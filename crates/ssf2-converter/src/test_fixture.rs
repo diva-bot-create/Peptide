@@ -203,13 +203,21 @@ pub fn build_fixture_swf() -> Vec<u8> {
     // The boundaries are CLIPS, not bare shapes. The game reads them off the stage and assigns
     // them somewhere typed as a clip, so a shape coerces to nothing and the assignment fails --
     // which surfaces as a type error deep inside the engine with nothing pointing back here.
+    // Shipped stages build all three off one `boundary_clip` linkage and tell them apart by the
+    // name each is placed under, which is the pattern followed here.
     tags.push(Tag::DefineSprite(swf::Sprite { id: 15, num_frames: 1, tags: vec![place(3, None, 1), Tag::ShowFrame] }));
     tags.push(Tag::DefineSprite(swf::Sprite { id: 16, num_frames: 1, tags: vec![place(4, None, 1), Tag::ShowFrame] }));
-    // Floor and platform are clips as well. Everything the game picks out of a stage it picks out
-    // as a clip; a bare shape is simply not seen, which is why the fixture loaded with no ground
-    // under it at all.
+    beacons.push((15, "fixture_fla.boundary_clip_15".to_string()));
+    beacons.push((16, "fixture_fla.boundary_clip_16".to_string()));
+    // Collision is CLIPS carrying LINKAGE names, and the linkage is what says what a clip is for.
+    // Every shipped stage does it this way: solid ground is a clip linked `<something>_terrain_mc`
+    // and a drop-through platform is linked `..._platform`. The name a clip is PLACED under does
+    // not classify it, which is why naming these `terrainGround`/`platform` on the placement and
+    // leaving them unlinked produced a stage with visible ground that nobody could stand on.
     tags.push(Tag::DefineSprite(swf::Sprite { id: 17, num_frames: 1, tags: vec![place(1, None, 1), Tag::ShowFrame] }));
     tags.push(Tag::DefineSprite(swf::Sprite { id: 18, num_frames: 1, tags: vec![place(2, None, 1), Tag::ShowFrame] }));
+    beacons.push((17, format!("fixture_fla.{FIXTURE_ID}_terrain_mc_17")));
+    beacons.push((18, "fixture_fla.terrainGround_platform__18".to_string()));
     let mut terrain = vec![
         // Named the way SSF2 stages name collision. The names are not decoration: solid ground and
         // a drop-through platform are told apart BY name, so a clip called "floor" is neither.
@@ -364,6 +372,12 @@ const PKG_API_CLASS: &str = "SSF2API";
 
 /// Where the base keeps the game's side of the api.
 const API_SLOT: &str = "_api";
+
+// The api layer a package carries is a CHAIN, not a flat set: the collision boundary sits on the
+// package's root object and the platform sits on the boundary, each forwarding its own calls
+// through to the game. The game builds a platform out of the package's own class, so the stub
+// here is why the fixture's ground holds nobody up. Building that chain is the next piece; a first
+// attempt at it stopped the package loading entirely, so it is not in yet.
 
 /// Everything a stage can ask the game for. Each is one forwarding call; the fixture needs almost
 /// none of them itself, but the game calls them on a stage and a missing one is an error, not a
