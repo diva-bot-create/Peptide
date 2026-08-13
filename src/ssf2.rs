@@ -335,11 +335,21 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         // and the surface nothing was watching: an error thrown by a package's OWN code as it
         // loads goes to the loader, not the app, and unhandled there it ends the process
         ssf2_converter::abc_inject::inject_package_error_reporter(abc, SSF2_DOC_CLASS)?;
+        // and the one an author can act on: which part of the stage clip tree is missing, by
+        // name, instead of an undefined-value error from somewhere inside the engine. OPT-IN
+        // while its own wiring is still being settled: it reads the resource as the game
+        // validates it, and getting that wrong stalls the load queue, which is a far worse
+        // failure than the one it explains.
+        if std::env::var("PEPTIDE_STAGE_CHECK").is_ok() {
+            ssf2_converter::abc_inject::inject_stage_shape_check(abc, SSF2_DOC_CLASS)?;
+        }
         if std::env::var("PEPTIDE_PROBE_LOAD").is_ok() {
             for (class, method, is_static, subject) in [
-                ("ResourceManager", "validateResource", true, Some("ID")),
-                ("ResourceManager", "handleLoaded", true, Some("ID")),
                 ("ResourceManager", "cacheLibrary", true, Some("ID")),
+                ("ResourceManager", "getLibraryClass", true, None),
+                ("ResourceManager", "getLibraryMC", true, None),
+                ("GameController", "startMatch", true, None),
+                ("GameController", "actuallyStartMatch", true, None),
             ] {
                 ssf2_converter::abc_inject::inject_method_probe(
                     abc, SSF2_DOC_CLASS, class, method, is_static, subject)?;

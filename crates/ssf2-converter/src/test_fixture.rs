@@ -143,11 +143,6 @@ pub fn build_fixture_swf() -> Vec<u8> {
         // --- collision geometry, inside a `terrain` clip (the parser's collision container) ---
         rect_shape(1, -FLOOR_HALF_W, FLOOR_Y, FLOOR_HALF_W, FLOOR_Y + 40.0, grey),
         rect_shape(2, -200.0, PLATFORM_Y, 200.0, PLATFORM_Y + 20.0, blue),
-        Tag::DefineSprite(swf::Sprite {
-            id: 10,
-            num_frames: 1,
-            tags: vec![place(1, Some("floor"), 1), place(2, Some("platform"), 2), Tag::ShowFrame],
-        }),
         // --- boundaries. The blast box is huge on purpose: that is what buys a long fall. ---
         rect_shape(3, -3000.0, -3000.0, 3000.0, 3000.0, mark),
         rect_shape(4, -800.0, -600.0, 800.0, 600.0, mark),
@@ -182,23 +177,40 @@ pub fn build_fixture_swf() -> Vec<u8> {
         depth += 1;
     }
 
-    // Everything the stage IS lives inside one clip, linked as `stage_<id>`. That is the
-    // convention shipped packages follow and the one the reader looks for, and it is also what
-    // lets the package hand the game a single display object instead of a loose root timeline.
-    let mut stage_body = vec![
-        place(10, Some("terrain"), 1),
-        place(3, Some("deathBoundary"), 2),
-        place(4, Some("camBoundary"), 3),
+    // The clip tree a stage is REQUIRED to have, not a tree of our choosing. The game walks it by
+    // name and does not check as it goes, so a missing layer is not an empty layer: it is a read
+    // off nothing, mid-match-start, with no indication of which name was missing.
+    //
+    //   stageMC          the whole stage, linked `stage_<id>`
+    //     background     art behind the fighters
+    //     terrain        collision, boundaries and the spawn beacons
+    //     foreground     art in front
+    //
+    // Boundaries and beacons belong INSIDE terrain, which is where shipped stages keep them.
+    let mut terrain = vec![
+        place(1, Some("floor"), 1),
+        place(2, Some("platform"), 2),
+        place(3, Some("deathBoundary"), 3),
+        place(4, Some("camBoundary"), 4),
     ];
-    stage_body.extend(placements);
-    stage_body.push(Tag::ShowFrame);
-    tags.push(Tag::DefineSprite(swf::Sprite { id: 11, num_frames: 1, tags: stage_body }));
+    terrain.extend(placements);
+    terrain.push(Tag::ShowFrame);
+    tags.push(Tag::DefineSprite(swf::Sprite { id: 10, num_frames: 1, tags: terrain }));
+
+    // A fixture has no art on purpose, but both layers still have to EXIST.
+    tags.push(Tag::DefineSprite(swf::Sprite { id: 12, num_frames: 1, tags: vec![Tag::ShowFrame] }));
+    tags.push(Tag::DefineSprite(swf::Sprite { id: 13, num_frames: 1, tags: vec![Tag::ShowFrame] }));
+    tags.push(Tag::DefineSprite(swf::Sprite {
+        id: 11,
+        num_frames: 1,
+        tags: vec![
+            place(12, Some("background"), 1),
+            place(10, Some("terrain"), 2),
+            place(13, Some("foreground"), 3),
+            Tag::ShowFrame,
+        ],
+    }));
     tags.push(place(11, Some("stageMC"), 1));
-    // Frame one ends here, and the class bindings land on frame two. That is the layout every
-    // shipped package has, and it is not decoration: the player finishes a load when the frame
-    // carrying the document class has been constructed. With everything crammed into a single
-    // frame the load simply never completed -- no error, no timeout, just a loading screen that
-    // spun forever, which is the hardest failure of the lot to attribute to anything.
     tags.push(Tag::ShowFrame);
 
     let stage_symbol = format!("stage_{FIXTURE_ID}");
@@ -282,6 +294,18 @@ const NS_PACKAGE: u8 = 0x16;
 /// Where a package keeps what it registered about itself, and what it declares to the game.
 const PROPS_SLOT: &str = "m_peptideProps";
 const META_SLOT: &str = "MetaData";
+
+/// The names this package gives the layer it builds on.
+///
+/// Deliberately NOT the names a package built with the official tooling uses. Packages share one
+/// namespace, and the first definition of a name wins for everything loaded after it. Reusing the
+/// official names means whichever package loads first supplies that layer to every other one --
+/// and a fixture whose layer is a stub would hand its stub to the entire game. Loading the fixture
+/// first broke every stage, not just its own. Unique names cannot collide, so the fixture can be
+/// wrong on its own without being wrong on anyone else's behalf.
+const PKG_BASE_CLASS: &str = "PeptideBaseObject";
+const PKG_ASSET_CLASS: &str = "PeptideAsset";
+const PKG_STAGE_CLASS: &str = "PeptideStageBase";
 
 /// What the game calls on a stage while a match runs.
 const STAGE_CALLBACKS: [&str; 2] = ["initialize", "update"];
@@ -404,7 +428,7 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
             max_stack, local_count, slots: vec![], methods: vec![] });
     };
 
-    declare(&mut specs, "SSF2BaseAPIObject", "", mn_object, 0, plain_ctor(0), 2, 1);
+    declare(&mut specs, PKG_BASE_CLASS, "", mn_object, 0, plain_ctor(0), 2, 1);
 
     // The asset base is NOT a stub. A package carries its own copy of the small API layer the
     // game talks to, in the top-level namespace, so the game's same-named classes never stand in
@@ -464,7 +488,7 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
 
     let noop = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_RETURNVOID];
     specs.push(ClassSpec {
-        name: "SSF2Asset", package: String::new(), super_mn: mn_movieclip, param_count: 0,
+        name: PKG_ASSET_CLASS, package: String::new(), super_mn: mn_movieclip, param_count: 0,
         ctor: asset_ctor, max_stack: 10, local_count: 1,
         slots: vec![PROPS_SLOT, META_SLOT],
         methods: vec![
@@ -493,16 +517,16 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
 
     // These two need forward references, so reserve their multinames before the loop that
     // creates classes -- a class must name its base before that base exists as a class object.
-    let mn_base = { let n = abc.intern_string("SSF2BaseAPIObject"); abc.intern_qname(pub_ns, n) };
-    let mn_asset = { let n = abc.intern_string("SSF2Asset"); abc.intern_qname(pub_ns, n) };
+    let mn_base = { let n = abc.intern_string(PKG_BASE_CLASS); abc.intern_qname(pub_ns, n) };
+    let mn_asset = { let n = abc.intern_string(PKG_ASSET_CLASS); abc.intern_qname(pub_ns, n) };
     // The stage base a package builds on. A package built with the official tooling carries a
     // client-side copy of this layer compiled in; this file has no such copy, which is the one
     // gap it cannot author around. Naming the game's own class instead does NOT work: a loaded
     // package cannot see it, so the reference resolves to nothing and the package is refused.
-    let mn_ssf2stage = { let n = abc.intern_string("SSF2Stage"); abc.intern_qname(pub_ns, n) };
+    let mn_ssf2stage = { let n = abc.intern_string(PKG_STAGE_CLASS); abc.intern_qname(pub_ns, n) };
     let mn_fixture_cls = { let n = abc.intern_string(FIXTURE_ID); abc.intern_qname(pub_ns, n) };
 
-    declare(&mut specs, "SSF2Stage", "", mn_base, 0, plain_ctor(0), 2, 1);
+    declare(&mut specs, PKG_STAGE_CLASS, "", mn_base, 0, plain_ctor(0), 2, 1);
 
     // A stage is constructed WITH an argument and hands it to super; a 0-arg version is rejected.
     // It also has to answer the calls the game drives a stage with. A fixture has no behaviour of

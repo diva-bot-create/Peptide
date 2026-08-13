@@ -55,6 +55,7 @@ const OP_PUSHSHORT: u8 = 0x25;
 /// `currentFrame` off a Bitmap throws (display classes are sealed), which would abort the
 /// whole command through the dispatcher's try and answer "ERR:" for an otherwise fine node.
 const NS_PRIVATE: u8 = 0x05;
+const OP_IFNE: u8 = 0x14;
 const OP_ISTYPE: u8 = 0xB2;
 const OP_ISTYPELATE: u8 = 0xB3;
 const OP_IFGE: u8 = 0x18;
@@ -89,6 +90,11 @@ pub const SSF2_RESOURCE_POOL: &str = "poolHash";
 
 /// The engine's resource-type values, as declared on its own resource class.
 pub const SSF2_RESOURCE_TYPE_STAGE: u8 = 2;
+
+/// The clip tree every stage package must have. The game walks these by name and does not check
+/// as it goes, so a missing one surfaces as an undefined-value error with nothing naming it.
+pub const SSF2_STAGE_CLIP: &str = "stageMC";
+pub const SSF2_STAGE_PARTS: [&str; 3] = ["background", "terrain", "foreground"];
 
 /// A tiny opcode emitter with the AVM2 u30 var-encoding + label/branch fixups.
 #[derive(Default)]
@@ -2746,6 +2752,130 @@ pub fn inject_package_error_reporter(abc: &mut Abc, doc_class: &str) -> anyhow::
     let body = &mut abc.bodies[body_idx];
     prepend_code(body, &payload);
     body.max_stack = body.max_stack.max(5);
+    body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
+    Ok(())
+}
+
+/// Name the stage part a package is missing, before the game trips over it.
+///
+/// A stage clip has a required shape, and the game walks it by name without checking as it goes.
+/// Miss one and what surfaces is a type error with no property, no file and no line -- the author
+/// is told something was undefined, not that their stage has no `foreground`. That is close to
+/// useless when the whole problem is that the clip tree has to be built a particular way and
+/// nothing says so.
+///
+/// So check the tree at the point the package is validated, and report each missing part BY NAME
+/// while there is still context to report it with. The game's own behaviour is untouched: this
+/// only reads, and it reads before the walk that would fail.
+pub fn inject_stage_shape_check(abc: &mut Abc, doc_class: &str) -> anyhow::Result<()> {
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    let mn_mc = q(abc, pub_ns, "MC");
+    let mn_id = q(abc, pub_ns, "ID");
+    let mn_type = q(abc, pub_ns, "Type");
+    let mn_stagemc = q(abc, pub_ns, SSF2_STAGE_CLIP);
+    let s_pre = abc.intern_string("SCRIPTERR: stage '");
+    let s_mid = abc.intern_string("' is missing a required part: ");
+    let s_nl = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+    let parts: Vec<(u32, u32)> = SSF2_STAGE_PARTS.iter()
+        .map(|n| (q(abc, pub_ns, n), abc.intern_string(n)))
+        .collect();
+    let mn_clip = q(abc, pub_ns, SSF2_STAGE_CLIP);
+    let s_clip = abc.intern_string(SSF2_STAGE_CLIP);
+
+    let ci = abc.find_class_by_name("ResourceManager")
+        .ok_or_else(|| anyhow::anyhow!("ResourceManager not found"))?;
+    let method = abc.classes[ci].traits.iter().find_map(|t| match t.data {
+        TraitKindData::Method { method, .. }
+            if abc.multiname_local(t.name).as_deref() == Some("validateResource") => Some(method),
+        _ => None,
+    }).ok_or_else(|| anyhow::anyhow!("ResourceManager.validateResource not found"))?;
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for validateResource"))?;
+    let base_local = abc.bodies[body_idx].local_count.max(2);
+    let (l_res, l_clip) = (base_local, base_local + 1);
+
+    let mut c = Code::default();
+    let l_done = c.new_label();
+    let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    root(&mut c); c.branch(OP_IFFALSE, l_done);           // nowhere to report to yet
+    c.op_u30(OP_GETLOCAL, 1); c.op(OP_DUP); c.op_u30(OP_SETLOCAL, l_res);
+    c.branch(OP_IFFALSE, l_done);
+    // stages only; a character or a sound has no clip tree to check
+    c.op_u30(OP_GETLOCAL, l_res); c.op_u30(OP_GETPROPERTY, mn_type);
+    c.op(OP_PUSHBYTE); c.op(SSF2_RESOURCE_TYPE_STAGE); c.branch(OP_IFNE, l_done);
+    c.op_u30(OP_GETLOCAL, l_res); c.op_u30(OP_GETPROPERTY, mn_mc); c.op(OP_DUP);
+    c.branch(OP_IFFALSE, l_done);
+    c.op_u30(OP_GETPROPERTY, mn_stagemc); c.op(OP_DUP); c.op_u30(OP_SETLOCAL, l_clip);
+
+    // One report per missing name. `report` leaves the log longer by one line; the flush at the
+    // end sends whatever accumulated, so a stage missing three parts says so three times rather
+    // than making the author fix one and run again.
+    let report = |c: &mut Code, name_str: u32| {
+        let l_have = c.new_label();
+        let l_joined = c.new_label();
+        root(c);
+        root(c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+        c.branch(OP_IFTRUE, l_have);
+        c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank);
+        c.branch(OP_JUMP, l_joined);
+        c.place(l_have);
+        c.op(OP_CONVERT_S);
+        c.place(l_joined);
+        c.op_u30(OP_PUSHSTRING, s_pre); c.op(OP_ADD);
+        c.op_u30(OP_GETLOCAL, l_res); c.op_u30(OP_GETPROPERTY, mn_id); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_mid); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, name_str); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
+        c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    };
+
+    // no stage clip at all: say that and stop, since there is nothing left to look inside
+    let l_haveclip = c.new_label();
+    c.branch(OP_IFTRUE, l_haveclip);
+    report(&mut c, s_clip);
+    c.branch(OP_JUMP, l_done);
+    c.place(l_haveclip);
+    let _ = mn_clip;
+
+    for (mn_part, s_part) in &parts {
+        let l_ok = c.new_label();
+        c.op_u30(OP_GETLOCAL, l_clip); c.op_u30(OP_GETPROPERTY, *mn_part);
+        c.branch(OP_IFTRUE, l_ok);
+        report(&mut c, *s_part);
+        c.place(l_ok);
+    }
+    c.place(l_done);
+
+    // send whatever was found straight away: the walk that fails comes next
+    let l_sent = c.new_label();
+    root(&mut c); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+    c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_sent);
+    c.op(OP_POPSCOPE);
+
+    let payload = c.finish();
+    let body = &mut abc.bodies[body_idx];
+    prepend_code(body, &payload);
+    body.max_stack = body.max_stack.max(8);
+    body.local_count = body.local_count.max(l_clip + 1);
     body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
     Ok(())
 }

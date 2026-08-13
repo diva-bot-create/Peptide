@@ -224,6 +224,7 @@ is a hard requirement of the player or the game, not a style preference:
 | TWO frames, with the class bindings after the first | the player finishes a load once the frame carrying the document class is built. crammed into one frame the load never completes: no error, no timeout, just a loading screen that spins and reports failure when the queue gives up |
 | `getscopeobject 0` before the class value in each class-defining script | `initproperty` stores INTO something, so that something has to be under the value. leaving it out is a stack underflow and the package is refused whole |
 | the camera block's empty fields (`autoPanMultiplier`, `backgrounds`) | the game reaches into them without checking |
+| the stage clip tree: `stageMC` containing `background`, `terrain`, `foreground`, with boundaries and spawn beacons nested INSIDE `terrain` | the game walks these by name and does not check as it goes, so a missing layer surfaces as an undefined-value error from somewhere inside the engine, naming neither the part nor the package |
 | an entry in the game's own resource manifest | the file is simply never opened. no error is raised, because nothing tried |
 
 the manifest row is the one that cannot be satisfied by authoring alone. the id-to-file map is not
@@ -234,6 +235,13 @@ that same shape at the menu entry point. no manifest is rewritten and no shipped
 and a package with an entry is asked for by id like any other. WHERE that runs is load-bearing:
 the table's own initialiser runs while the table is still null, and the queue call is verified
 before the definitions it names have run, so both of those homes take the resource system down.
+
+`inject_stage_shape_check` exists to make that last row self-explaining: it reads the clip tree as
+the game validates a package and names each missing part, so an author gets "missing a required
+part: foreground" instead of a type error with no property, file or line. it is OPT-IN
+(`PEPTIDE_STAGE_CHECK`) while its wiring settles, because reading the resource at validation time
+is easy to get wrong and doing so stalls the load queue, which is worse than the failure it
+explains.
 
 the one gap authoring cannot close is the package-side API layer. a package carries its own copy
 of the classes it builds on, in the top-level namespace, and the stage base is where the behaviour

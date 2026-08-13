@@ -3161,6 +3161,3 @@ mod tests {
             "post-returnvalue opcodes must still be processed; got: {:?}", result.keys().collect::<Vec<_>>());
     }
 }
-
-pub fn read_u30_pub(d: &[u8], i: &mut usize) -> Option<u32> { read_u30_at(d, i) }
-pub fn skip_ops_pub(op: u8, bc: &[u8], i: &mut usize) { skip_opcode_operands(op, bc, i) }

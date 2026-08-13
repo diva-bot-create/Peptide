@@ -710,6 +710,15 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
         // not the collision child, so the walk propagates it down. We collide with them at
         // their start position; the motion itself is bespoke per stage and not ported yet.
         let moving = inst.moving;
+        // A boundary marker is never collision, wherever it sits. Shipped stages nest the blast
+        // and camera boxes INSIDE terrain, so the name carried down to their shapes contains
+        // "terrain" and they would otherwise read as one enormous floor spanning the whole blast
+        // zone -- swallowing the real floor in the process, since it is the widest thing there.
+        // The instance name matters as much as the linkage here: a boundary is placed by NAME
+        // (`deathBoundary`) over a plain unnamed shape, so the linkage carried down is the
+        // parent's, not its own.
+        let inst_label = inst.inst_name.as_deref().unwrap_or_default().to_ascii_lowercase();
+        if sn.contains("boundary") || inst_label.contains("boundary") { continue; }
         // a stage can flag terrain that is NOT a standable floor (lava/acid you fall into); skip it
         // from collision (it's handled as a hazard instead).
         if entry.map(|e| e.non_floor_terrain.iter().any(|s| sn.contains(&s.to_ascii_lowercase()))).unwrap_or(false) {
