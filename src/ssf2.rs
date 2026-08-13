@@ -332,6 +332,9 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         // and the load-time half: a package the engine refuses names itself instead of
         // failing silently, which is the only signal a custom-content author ever gets
         ssf2_converter::abc_inject::inject_load_error_reporter(abc)?;
+        // and the surface nothing was watching: an error thrown by a package's OWN code as it
+        // loads goes to the loader, not the app, and unhandled there it ends the process
+        ssf2_converter::abc_inject::inject_package_error_reporter(abc)?;
         // make the physics fixture askable by id. the engine's id-to-file map comes from a
         // manifest it carries, so a package outside that manifest is never opened; this adds
         // the one entry without rewriting the manifest or touching any shipped data file.

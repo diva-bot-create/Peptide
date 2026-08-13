@@ -79,6 +79,8 @@ pub const PEPTIDE_LOAD_LOG: &str = "peptideLoadLog";
 pub const SSF2_RESOURCE_CLASS: &str = "Resource";
 pub const SSF2_RESOURCE_FILE_FIELD: &str = "CurrentFileName";
 pub const SSF2_RESOURCE_ERROR_METHODS: [&str; 2] = ["initialLoadError", "loadError"];
+pub const SSF2_RESOURCE_LOADER_FIELD: &str = "m_loader";
+pub const SSF2_RESOURCE_LOAD_METHOD: &str = "load";
 
 /// Where an extra package is registered from, and the table that doubles as its one-shot guard.
 pub const SSF2_MENU_ENTRY_METHOD: &str = "showInitialMenu";
@@ -2581,6 +2583,127 @@ pub fn inject_extra_resource(abc: &mut Abc, id: &str, file: &str, guid: &str, ki
     let body = &mut abc.bodies[body_idx];
     prepend_code(body, &payload);
     body.max_stack = body.max_stack.max(9);
+    body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
+    Ok(())
+}
+
+/// Catch errors thrown INSIDE a package while it loads, and survive them.
+///
+/// This is the surface that matters most and the one nothing was watching. An error raised by a
+/// package's own code as it initialises is not dispatched to the application: it goes to the
+/// loader that opened it. With no listener there the runtime treats it as unhandled and ENDS THE
+/// PROCESS, which is why a malformed package reads as the game reaching its ready state and then
+/// simply disappearing, with no script error and no crash report to look at.
+///
+/// Listening turns that into a line naming the file and the error, and marking it handled keeps
+/// the game running so the next package still gets its turn. One bad package should cost its own
+/// content, not the session.
+pub fn inject_package_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
+    let ci = abc.find_class_by_name(SSF2_RESOURCE_CLASS)
+        .ok_or_else(|| anyhow::anyhow!("{SSF2_RESOURCE_CLASS} not found"))?;
+    let events_ns = { let s = abc.intern_string("flash.events"); abc.intern_namespace(NS_PACKAGE, s) };
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+
+    let mn_uee = q(abc, events_ns, "UncaughtErrorEvent");
+    let mn_uncaught = q(abc, pub_ns, "UNCAUGHT_ERROR");
+    let mn_cli = q(abc, pub_ns, "contentLoaderInfo");
+    let mn_ueevents = q(abc, pub_ns, "uncaughtErrorEvents");
+    let mn_addel = q(abc, pub_ns, "addEventListener");
+    let mn_prevent = q(abc, pub_ns, "preventDefault");
+    let mn_errobj = q(abc, pub_ns, "error");
+    let mn_loader = q(abc, pub_ns, SSF2_RESOURCE_LOADER_FIELD);
+    let mn_file = q(abc, pub_ns, SSF2_RESOURCE_FILE_FIELD);
+    let mn_main = q(abc, pub_ns, "Main");
+    let mn_root = q(abc, pub_ns, "ROOT");
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    let mn_h = q(abc, pub_ns, "peptideOnPackageError");
+    let n_h = abc.intern_string("peptideOnPackageError");
+    let s_tag = abc.intern_string("SCRIPTERR: package threw while loading: ");
+    let s_sep = abc.intern_string(": ");
+    let s_nl = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+
+    // handler(e): mark handled so the runtime does not end the process, then record which package
+    // it was and what it threw. Recording second is deliberate -- if anything below were to fail,
+    // the game has already been kept alive.
+    let mut c = Code::default();
+    let l_skip = c.new_label();
+    let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    c.op_u30(OP_GETLOCAL, 1); c.op_u30_u30(OP_CALLPROPVOID, mn_prevent, 0);
+
+    root(&mut c); c.branch(OP_IFFALSE, l_skip);
+    root(&mut c);
+    let l_have = c.new_label();
+    let l_joined = c.new_label();
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+    c.branch(OP_IFTRUE, l_have);
+    c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank);
+    c.branch(OP_JUMP, l_joined);
+    c.place(l_have);
+    c.op(OP_CONVERT_S);
+    c.place(l_joined);
+    c.op_u30(OP_PUSHSTRING, s_tag); c.op(OP_ADD);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_file); c.op(OP_CONVERT_S); c.op(OP_ADD);
+    c.op_u30(OP_PUSHSTRING, s_sep); c.op(OP_ADD);
+    c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_errobj); c.op(OP_CONVERT_S); c.op(OP_ADD);
+    c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
+    c.op_u30(OP_SETPROPERTY, mn_loadlog);
+
+    // send it now if the link allows; a package that kills the boot leaves no later chance
+    let l_sent = c.new_label();
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+    c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_sent);
+    c.place(l_skip);
+    c.op(OP_RETURNVOID);
+
+    let h = abc.add_method(MethodInfo {
+        param_types: vec![0], return_type: 0, name: n_h, flags: 0, options: vec![], param_names: vec![],
+    });
+    abc.add_body(MethodBody {
+        method: h, max_stack: 7, local_count: 3, init_scope_depth: 0, max_scope_depth: 2,
+        code: c.finish(), exceptions: vec![], traits: vec![],
+    });
+    abc.add_instance_method_trait(ci, mn_h, h);
+
+    // Attached where the load STARTS rather than in the constructor, because the loader has to
+    // exist before it can be listened to.
+    let method = abc.instances[ci].traits.iter().find_map(|t| match t.data {
+        TraitKindData::Method { method, .. }
+            if abc.multiname_local(t.name).as_deref() == Some(SSF2_RESOURCE_LOAD_METHOD) => Some(method),
+        _ => None,
+    }).ok_or_else(|| anyhow::anyhow!("{SSF2_RESOURCE_CLASS}.{SSF2_RESOURCE_LOAD_METHOD} not found"))?;
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for {SSF2_RESOURCE_LOAD_METHOD}"))?;
+
+    let mut ic = Code::default();
+    let l_noloader = ic.new_label();
+    ic.op(OP_GETLOCAL0); ic.op(OP_PUSHSCOPE);
+    ic.op(OP_GETLOCAL0); ic.op_u30(OP_GETPROPERTY, mn_loader); ic.branch(OP_IFFALSE, l_noloader);
+    ic.op(OP_GETLOCAL0); ic.op_u30(OP_GETPROPERTY, mn_loader);
+    ic.op_u30(OP_GETPROPERTY, mn_cli); ic.op_u30(OP_GETPROPERTY, mn_ueevents);
+    ic.op_u30(OP_GETLEX, mn_uee); ic.op_u30(OP_GETPROPERTY, mn_uncaught);
+    ic.op(OP_GETLOCAL0); ic.op_u30(OP_GETPROPERTY, mn_h);
+    ic.op_u30_u30(OP_CALLPROPVOID, mn_addel, 2);
+    ic.place(l_noloader);
+    ic.op(OP_POPSCOPE);
+
+    let payload = ic.finish();
+    let body = &mut abc.bodies[body_idx];
+    prepend_code(body, &payload);
+    body.max_stack = body.max_stack.max(5);
     body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
     Ok(())
 }

@@ -271,8 +271,14 @@ const NS_PACKAGE: u8 = 0x16;
 
 /// A stable guid for the fixture. Shipped packages carry one and the reader looks for it, so
 /// leaving it out would make the fixture the only package in the corpus without an identity.
-/// Where a package keeps what it registered about itself.
+/// Where a package keeps what it registered about itself, and what it declares to the game.
 const PROPS_SLOT: &str = "m_peptideProps";
+const META_SLOT: &str = "MetaData";
+
+/// The package API version this fixture is written against, as the game declares it.
+const API_VERSION_MAJOR: u8 = 0;
+const API_VERSION_MINOR: u8 = 56;
+const API_VERSION_REVISION: u8 = 0;
 
 pub const FIXTURE_GUID: &str = "9f3c1e7a-2b64-4d18-a5f0-6c81d47e2b90";
 
@@ -397,13 +403,36 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     let key_nsset = abc.intern_ns_set(vec![pub_ns]);
     let mn_key = abc.intern_multinamel(key_nsset);   // obj[<runtime key>]
 
-    // ctor: super(); this.<props> = {}
+    let s_meta = str_(&mut abc, META_SLOT);
+    let mn_meta = { let ns = abc.intern_namespace(NS_PACKAGE, s_empty); abc.intern_qname(ns, s_meta) };
+    let s_base = str_(&mut abc, "BASE_CLASSES");
+    let s_vmaj = str_(&mut abc, "VERSION_MAJOR");
+    let s_vmin = str_(&mut abc, "VERSION_MINOR");
+    let s_vrev = str_(&mut abc, "VERSION_REVISION");
+
+    // ctor: super(); this.<props> = {}; this.<meta> = { BASE_CLASSES: [], VERSION_*: ... }
+    //
+    // The game reads the version off a package before it will talk to it, and a package that
+    // cannot answer is one it refuses. The numbers are the API version this file is written
+    // against, taken from the game's own declaration of it.
     let mut asset_ctor = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
     op1(&mut asset_ctor, OP_CONSTRUCTSUPER, 0);
     asset_ctor.push(OP_GETLOCAL0);
     op1(&mut asset_ctor, OP_NEWOBJECT, 0);
     op1(&mut asset_ctor, OP_INITPROPERTY, mn_props);
+    asset_ctor.push(OP_GETLOCAL0);
+    op1(&mut asset_ctor, OP_PUSHSTRING, s_base);
+    op1(&mut asset_ctor, OP_NEWARRAY, 0);
+    op1(&mut asset_ctor, OP_PUSHSTRING, s_vmaj);
+    asset_ctor.push(OP_PUSHBYTE); asset_ctor.push(API_VERSION_MAJOR);
+    op1(&mut asset_ctor, OP_PUSHSTRING, s_vmin);
+    asset_ctor.push(OP_PUSHBYTE); asset_ctor.push(API_VERSION_MINOR);
+    op1(&mut asset_ctor, OP_PUSHSTRING, s_vrev);
+    asset_ctor.push(OP_PUSHBYTE); asset_ctor.push(API_VERSION_REVISION);
+    op1(&mut asset_ctor, OP_NEWOBJECT, 4);
+    op1(&mut asset_ctor, OP_INITPROPERTY, mn_meta);
     asset_ctor.push(OP_RETURNVOID);
+    let _ = mn_meta;
 
     // register(k, v): this.<props>[k] = v
     let mut reg = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
@@ -423,8 +452,8 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     let noop = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_RETURNVOID];
     specs.push(ClassSpec {
         name: "SSF2Asset", package: String::new(), super_mn: mn_movieclip, param_count: 0,
-        ctor: asset_ctor, max_stack: 3, local_count: 1,
-        slots: vec![PROPS_SLOT],
+        ctor: asset_ctor, max_stack: 10, local_count: 1,
+        slots: vec![PROPS_SLOT, META_SLOT],
         methods: vec![
             MethodSpec { name: "register", param_count: 2, code: reg, max_stack: 4, local_count: 3 },
             MethodSpec { name: "getProp", param_count: 1, code: getp, max_stack: 3, local_count: 2 },
