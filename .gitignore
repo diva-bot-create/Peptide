@@ -25,6 +25,7 @@ docs/*
 !docs/STATUS.md
 !docs/PORTING_STAGES.md
 !docs/PORTING_CHARACTERS.md
+!docs/SSF2_PACKAGE_FORMAT.md
 
 # macOS .app bundle output from make-app.sh
 
