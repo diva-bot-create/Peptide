@@ -205,8 +205,23 @@ pub struct SpawnPoint {
 /// directly instead of parsing a real SSF2 file, which keeps official content out of the
 /// default test gate. `scale` defaults to 0.0 under `Default`, so a synthetic model must set
 /// it to a real multiplier (the parser always does).
+/// A stage's particle weather: many copies of one small clip drifting across the camera, with the
+/// particle already rasterised. Neither timeline art nor a hazard, so nothing else in the pipeline
+/// picks it up -- see `abc_parser::extract_stage_weather`.
+#[derive(Clone, Debug)]
+pub struct Weather {
+    /// The particle, rendered once. Every copy draws the same picture.
+    pub art: StageArt,
+    pub count: u32,
+    /// The area particles are scattered over and wrap within, in FM units.
+    pub width: f64,
+    pub height: f64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StageModel {
+    /// Particle weather, if the stage runs any.
+    pub weather: Option<Weather>,
     /// Content id (from `Main.id`, fallback file stem). The emitter may suffix this
     /// (`<id>ssf2`) so it can't shadow a built-in stage; `display_name` stays clean.
     pub id: String,
@@ -1017,7 +1032,62 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
         eprintln!("[platform-behavior] {platform_behavior:?}");
     }
 
-    let mut model = StageModel { id, display_name, series, ssf2_music, fm_music, platforms, death_box, camera_box, entrances, respawns, ledges, hazards, sink_columns, platform_behavior, art, warnings, scale };
+    // ── particle weather ──────────────────────────────────────────────────────
+    // Stepped out of the stage's own initialize (see `extract_stage_weather`), then the particle
+    // clip it names is rendered once. It is not on the timeline and it is not a hazard, so this is
+    // the only pass that sees it.
+    let weather = crate::swf_parser::parse(&swf_data).ok().and_then(|sw| {
+        sw.abc_blocks.iter().filter_map(|b| crate::abc_parser::parse(b).ok()).find_map(|abc| {
+        let w = crate::abc_parser::extract_stage_weather(&abc, &id)?;
+        let dbg = std::env::var("PEPTIDE_STAGE_DEBUG").is_ok();
+        if dbg { eprintln!("[weather] {w:?}"); }
+        let cid = sym_names.iter().find(|(_, n)| n.as_str() == w.art).map(|(cid, _)| *cid);
+        if dbg { eprintln!("[weather] linkage {:?} -> char {cid:?}", w.art); }
+        let cid = cid?;
+        // the clip holds one shape: the particle
+        let shape_id: Option<u16> = sprites.get(&cid).and_then(|tags| tags.iter().find_map(|t| match t {
+            swf::Tag::PlaceObject(po) => match po.action {
+                swf::PlaceObjectAction::Place(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        }));
+        let shape_id = shape_id?;
+        if dbg { eprintln!("[weather] clip {cid} -> shape {shape_id:?}"); }
+        let sh = shape_defs.get(&shape_id)?;
+        // The particle is usually a BITMAP fill (SSF2 art nearly always is), which the vector
+        // rasteriser declines by design, so try that path first and fall back to vectors.
+        let tw = ((sh.shape_bounds.x_max - sh.shape_bounds.x_min).to_pixels().ceil() as u32).max(1);
+        let th = ((sh.shape_bounds.y_max - sh.shape_bounds.y_min).to_pixels().ceil() as u32).max(1);
+        let (rgba, w_px, h_px) = match bitmap_fill_layers(sh, &bitmaps, tw, th) {
+            Some(img) => { let (w, h) = (img.width(), img.height()); (img.into_raw(), w, h) }
+            None => {
+                let r = crate::vector_raster::rasterize_shape(
+                    &sh.shape_bounds, &sh.styles.fill_styles, &sh.styles.line_styles, &sh.shape)?;
+                (r.rgba, r.width, r.height)
+            }
+        };
+        if dbg { eprintln!("[weather] particle {w_px}x{h_px}"); }
+        let mut png = Vec::new();
+        {
+            use image::ImageEncoder;
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&rgba, w_px, h_px, image::ExtendedColorType::Rgba8).ok()?;
+        }
+        Some(Weather {
+            art: StageArt { png, x: 0.0, y: 0.0, w: w_px, h: h_px, hold: 1 },
+            count: w.count,
+            width: w.width * scale,
+            height: w.height * scale,
+        })
+        })
+    });
+    if let Some(w) = &weather {
+        log::info!("stage weather: {} particles of {}x{} over {:.0}x{:.0}",
+                   w.count, w.art.w, w.art.h, w.width, w.height);
+    }
+
+    let mut model = StageModel { id, display_name, series, ssf2_music, fm_music, platforms, death_box, camera_box, entrances, respawns, ledges, hazards, sink_columns, platform_behavior, art, warnings, scale, weather };
     extend_art_to_death_bounds(&mut model);
     Ok(model)
 }

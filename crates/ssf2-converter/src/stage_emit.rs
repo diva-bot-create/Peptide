@@ -216,7 +216,9 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
         .collect::<String>();
     spawns.push_str(&hazard_spawn_lines(model));
     spawns.push_str(&bg_spawns);
-    write_script(&scripts.join(format!("{id}Script.hx")), &script_hx(id, animated, &spawns))?;
+    let (weather_spawn, weather_frame) = emit_weather(model, &lib)?;
+    write_script(&scripts.join(format!("{id}Script.hx")),
+                 &script_hx(id, animated, &spawns, (&weather_spawn, &weather_frame)))?;
     write_meta(&scripts.join(format!("{id}Script.hx.meta")), id, &format!("{id}Script"), "", Some("STAGE"), None)?;
     write_script(&scripts.join(format!("{id}StageStats.hx")), &stage_stats_hx(id, &art.parallax, model.scale))?;
     write_meta(&scripts.join(format!("{id}StageStats.hx.meta")), id, &format!("{id}StageStats"), "hscript", None, None)?;
@@ -2563,6 +2565,88 @@ fn hazard_animation_stats_hx() -> String {
     "// AnimationStats for the stage hazard.\n{\n\tgameObjectIdle: { endType: AnimationEndType.NONE },\n\tgameObjectInactive: { endType: AnimationEndType.NONE }\n}\n".to_string()
 }
 
+// ── particle weather -> N looping VFX the stage drifts every frame ───────────
+//
+// Weather is neither backdrop art nor a hazard: SSF2 builds it in CODE, so it is never placed on a
+// timeline for the art walk to find, and it damages nobody so the hazard path ignores it. A stage
+// converts with every layer correct and the air empty.
+//
+// One VFX ENTITY holds the particle; the stage spawns `count` copies and moves each itself.
+// Rise, drift and alpha are rolled PER PARTICLE from the ranges the source rolls them from, so the
+// field looks scattered rather than like one animation played N times.
+
+/// The particle entity: one still frame, looping forever, reparented like any backdrop VFX.
+fn weather_entity(eid: &str, guid: &str, w: u32, h: u32, scale: f64) -> Value {
+    let g = |s: &str| det_uuid(&format!("weather::{eid}::{s}"));
+    json!({
+        "export": true, "guid": g("entity"), "id": eid, "version": 5,
+        "pluginMetadata": { "com.fraymakers.FraymakersMetadata": { "objectType": "VFX", "version": "0.1.0" } },
+        "plugins": ["com.fraymakers.FraymakersTypes", "com.fraymakers.FraymakersMetadata"],
+        "tags": [], "paletteMap": {}, "tilesets": [], "terrains": [],
+        "symbols": [ json!({
+            "$id": g("sym"), "type": "IMAGE", "imageAsset": guid,
+            // drawn around its own centre, so a particle's position is where it LOOKS like it is
+            "x": -(w as f64) * scale / 2.0, "y": -(h as f64) * scale / 2.0,
+            "pivotX": 0.0, "pivotY": 0.0, "scaleX": scale, "scaleY": scale,
+            "rotation": 0.0, "alpha": 1.0, "pluginMetadata": {}
+        }) ],
+        "keyframes": [ json!({ "$id": g("kf"), "symbol": g("sym"), "length": 1,
+            "tweened": false, "tweenType": "LINEAR", "type": "IMAGE", "pluginMetadata": {} }) ],
+        "layers": [ json!({ "$id": g("layer"), "name": "art", "type": "IMAGE", "hidden": false,
+            "locked": false, "keyframes": [g("kf")], "pluginMetadata": {} }) ],
+        "animations": [ json!({ "$id": g("anim"), "name": "active", "layers": [g("layer")],
+            "pluginMetadata": {} }) ]
+    })
+}
+
+/// Write the particle art + entity. Returns (spawn code, per-frame code) for the stage script.
+fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
+    let Some(w) = &model.weather else { return Ok((String::new(), String::new())) };
+    let eid = format!("{}_weather", model.id);
+    let sprites = lib.join("sprites").join("Stage");
+    std::fs::create_dir_all(&sprites).ok();
+    let png_name = format!("{eid}.png");
+    std::fs::write(sprites.join(&png_name), &w.art.png).context("write weather particle")?;
+    let guid = det_uuid(&format!("weather::{eid}::image"));
+    write_json(&sprites.join(format!("{png_name}.meta")), &json!({
+        "export": false, "guid": guid, "id": "", "pluginMetadata": {}, "plugins": [], "tags": [], "version": 2
+    }))?;
+    write_json(&lib.join("entities").join(format!("{eid}.entity")),
+               &weather_entity(&eid, &guid, w.art.w, w.art.h, model.scale))?;
+
+    // SSF2 scatters over about 1.5x the camera area and wraps at those edges, which keeps
+    // particles arriving from off-screen instead of appearing at the frame edge.
+    let hw = (w.width * 0.75).round() as i64;
+    let hh = (w.height * 0.75).round() as i64;
+    let count = w.count.min(200);   // a stage asking for thousands is a stage we misread
+    let vs = velocity_scale();
+    // Rise and drift are per-frame speeds, so they convert like every other one.
+    let k_lo = 1.0 * vs;
+    let k_span = (2.0 * vs * 100.0).round() as i64;
+    let wind_lo = -1.5 * vs;
+    let wind_span = (4.2 * vs * 100.0).round() as i64;
+    let spawn = format!(
+        "\t\t\tm_weather = [];\n\
+         \t\t\tfor (i in 0...{count}) {{\n\
+         \t\t\t\tvar v = match.createVfx(new VfxStats({{ spriteContent: self.getResource().getContent(\"{eid}\"), animation: \"active\", loop: true, timeout: -1, relativeWith: false }}));\n\
+         \t\t\t\tv.setAlpha(0.2 + Random.getInt(0, 60) / 100.0);\n\
+         \t\t\t\tself.getBackgroundEffectsContainer().addChild(v.getViewRootContainer());\n\
+         \t\t\t\tm_weather.push({{ v: v, x: Random.getInt(-{hw}, {hw}) * 1.0, y: Random.getInt(-{hh}, {hh}) * 1.0, k: {k_lo:.3} + Random.getInt(0, {k_span}) / 100.0, wind: {wind_lo:.3} + Random.getInt(0, {wind_span}) / 100.0 }});\n\
+         \t\t\t}}\n");
+    let per_frame = format!(
+        "\t\tfor (p in m_weather) {{\n\
+         \t\t\tp.y -= p.k;\n\
+         \t\t\tp.x += p.wind;\n\
+         \t\t\t// leaving the field puts it back on the far side, so the count never changes\n\
+         \t\t\tif (p.y < -{hh}) {{ p.y = {hh}; p.x = Random.getInt(-{hw}, {hw}) * 1.0; }}\n\
+         \t\t\tif (p.x < -{hw}) {{ p.x = {hw}; }}\n\
+         \t\t\tif (p.x > {hw}) {{ p.x = -{hw}; }}\n\
+         \t\t\tp.v.setX(p.x);\n\
+         \t\t\tp.v.setY(p.y);\n\
+         \t\t}}\n");
+    Ok((spawn, per_frame))
+}
+
 // ── animated backdrop element -> independent-loop VFX, reparented into a background container ──
 // the architectural fix for Flash's two timeline features the single baked `stage` animation
 // can't represent: (1) a nested movieclip whose loop is INDEPENDENT of the parent (a 260-frame
@@ -2983,12 +3067,20 @@ fn stage_stats_hx(id: &str, parallax: &[ParallaxRef], scale: f64) -> String {
 /// Stage Script.hx — pause a static stage on frame 1; let an animated stage's timeline
 /// play (the SSF2 animated clips loop). The parallax background is camera-scrolled by
 /// StageStats, so no manual scroll is needed.
-fn script_hx(id: &str, animated: bool, hazard_spawns: &str) -> String {
+fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str)) -> String {
     let init = if animated { "\t// animated stage clips play + loop on the timeline" } else { "\tself.pause();" };
     // hazards spawn DEFERRED in update() once the match is live (one-shot via a flag). owner is
     // NULL: a stage hazard belongs to no fighter, so it damages everyone (a null hitbox owner
     // passes the engine's team-hit validation), and createCustomGameObject accepts a null owner.
-    let (haz_var, haz_body) = if hazard_spawns.is_empty() {
+    // Weather spawns in the same deferred block as hazards (it needs a live match too) and then
+    // runs every frame. Its state is one array declared alongside the hazard flag.
+    let (weather_spawn, weather_frame) = weather;
+    let (w_var, w_spawn, w_frame) = if weather_spawn.is_empty() {
+        (String::new(), String::new(), String::new())
+    } else {
+        ("var m_weather = [];\n".to_string(), weather_spawn.to_string(), weather_frame.to_string())
+    };
+    let (haz_var, haz_body) = if hazard_spawns.is_empty() && w_spawn.is_empty() {
         // no hazards: keep update() a clean empty body (byte-stable with hazardless stages).
         (String::new(), String::new())
     } else {
@@ -2998,10 +3090,11 @@ fn script_hx(id: &str, animated: bool, hazard_spawns: &str) -> String {
                   \t\tif (chars.length > 0) {{\n\
                   \t\t\tm_hazardsSpawned = true;\n\
                   \t\t\tvar owner = null;\n\
-{hazard_spawns}\
+{hazard_spawns}{w_spawn}\
                   \t\t}}\n\
-                  \t}}\n"))
+                  \t}}\n{w_frame}"))
     };
+    let haz_var = format!("{w_var}{haz_var}");
     let update_fn = if haz_body.is_empty() {
         "function update() {}\n".to_string()
     } else {

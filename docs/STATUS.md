@@ -150,6 +150,31 @@ dimensions below are the rest.
   scripts and 2.15 to 3 scripts and exactly 2.00.
 
   worth a corpus pass: every character with a multi-hit jab was missing those scripts.
+- **stage weather is ported** (fixed). a stage can build particle weather in CODE rather than on a
+  timeline, so nothing else in the pipeline sees it: the art walk finds no placement and the hazard
+  path finds nothing that damages anyone. bowserscastle converted with every layer correct and the
+  air empty.
+
+  `abc_parser::extract_stage_weather` steps the stage's own `initialize` for the shape "construct a
+  weather object from a particle CLASS, then hand it an area and a count" -- keyed on that shape,
+  not on any stage or class name. bowserscastle reads back as 30 particles of `ember` over
+  255.5x252.5. the particle is rasterised through the bitmap-fill path (SSF2 art nearly always is a
+  bitmap fill, which the vector rasteriser declines by design), and the stage spawns that many
+  looping VFX and drifts each one itself, rolling rise, drift and alpha per particle from the same
+  ranges the source rolls them from. per-frame speeds convert through `velocity_scale` like every
+  other one: SSF2's 1..3 rise becomes 0.65..1.95.
+
+  verified live: 30 VFX in the match, positions scattered across the field and changing between
+  samples.
+
+- **the hazard switch is not wired up.** both engines have one -- SSF2 reads `StageData.HazardsOn`
+  (from `Config.enable_hazards` / `SaveData.Hazards`) -- and a converted stage should not spawn its
+  hazards when it is off. the Fraymakers side is the blocker: nothing under `match.*` answers to
+  any spelling probed live (`getHazardsEnabled`, `isHazardsEnabled`, `getHazards`,
+  `getMatchSettings`, `getStageHazardsEnabled`), so either it is named something else or it is not
+  exposed to hscript at all. worth asking rather than guessing; the emitter change itself is one
+  guard around the deferred spawn block.
+
 - **special-angle sentinels.** SSF2 sentinel angles (`-1`/`-2`/`-3`…) are preserved
   faithfully, we just haven't mapped them to FM's special-angle codes yet. needs the
   SSF2-sentinel → FM-angle table.

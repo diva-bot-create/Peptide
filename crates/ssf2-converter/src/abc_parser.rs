@@ -2135,6 +2135,74 @@ impl AbcVisitor for BehaviorVisitor {
         None
     }
 }
+/// A stage's particle WEATHER: many copies of one small clip drifting across the camera.
+///
+/// Not a hazard and not backdrop art. It is neither placed on the timeline (so the art walk never
+/// sees it) nor damaging (so the hazard path ignores it), which is why a stage can convert with
+/// every layer correct and still be missing the thing filling the air.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StageWeather {
+    /// Linkage of the particle clip (bowserscastle's is `ember`).
+    pub art: String,
+    /// How many exist at once.
+    pub count: u32,
+    /// The area they are scattered over and wrap within, in SSF2 units.
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Find a stage's weather by stepping its own `initialize`.
+///
+/// The shape in the bytecode is: push the particle CLASS, construct a weather object from it, then
+/// hand that object the area and the count. Keyed on that shape rather than on any stage or class
+/// name, so a second stage doing the same thing is found the same way.
+pub fn extract_stage_weather(abc: &AbcFile, stage_class: &str) -> Option<StageWeather> {
+    let class = abc.classes.iter().find(|c| c.name == stage_class)?;
+    let init = class.instance_methods.iter().find(|t| &*t.name == "initialize")?;
+    let body = abc.method_bodies.iter().find(|b| b.method_idx == init.method_idx)?;
+
+    let bc = &body.bytecode;
+    let (mut i, mut last_lex, mut art) = (0usize, None::<String>, None::<String>);
+    let mut nums: Vec<f64> = Vec::new();
+    while i < bc.len() {
+        let op = bc[i];
+        i += 1;
+        match op {
+            OP_GETLEX => {
+                let mn = read_u30_at(bc, &mut i)?;
+                last_lex = abc.multinames.get(mn as usize).map(|m| m.name.to_string());
+            }
+            OP_CONSTRUCTPROP => {
+                let mn = read_u30_at(bc, &mut i)?;
+                let _argc = read_u30_at(bc, &mut i)?;
+                let name = abc.multinames.get(mn as usize).map(|m| m.name.to_string()).unwrap_or_default();
+                // The class being constructed is the weather; the thing most recently pushed is
+                // the particle it is made of.
+                if name.to_ascii_lowercase().contains("weather") {
+                    art = last_lex.clone();
+                    nums.clear();          // the numbers that matter come AFTER the construction
+                }
+            }
+            OP_PUSHDOUBLE => {
+                let idx = read_u30_at(bc, &mut i)?;
+                if art.is_some() { if let Some(v) = abc.doubles.get(idx as usize) { nums.push(*v); } }
+            }
+            OP_PUSHINT => {
+                let idx = read_u30_at(bc, &mut i)?;
+                if art.is_some() { if let Some(v) = abc.ints.get(idx as usize) { nums.push(*v as f64); } }
+            }
+            OP_PUSHBYTE => { if art.is_some() { nums.push(bc.get(i).map(|b| *b as i8 as f64)?); } i += 1; }
+            _ => skip_opcode_operands(op, bc, &mut i),
+        }
+        if art.is_some() && nums.len() >= 3 { break; }
+    }
+
+    let art = art?;
+    if nums.len() < 3 { return None; }
+    // width, height, count -- the order the engine is handed them.
+    Some(StageWeather { art, width: nums[0], height: nums[1], count: nums[2].max(0.0) as u32 })
+}
+
 pub(crate) fn extract_enemy_behavior(abc: &AbcFile, class_name: &str) -> EnemyBehavior {
     let Some(class) = abc.classes.iter().find(|c| c.name == class_name) else { return EnemyBehavior::default() };
     let mut v = BehaviorVisitor { b: EnemyBehavior::default() };
@@ -3161,3 +3229,6 @@ mod tests {
             "post-returnvalue opcodes must still be processed; got: {:?}", result.keys().collect::<Vec<_>>());
     }
 }
+
+pub fn read_u30_pub(d: &[u8], i: &mut usize) -> Option<u32> { read_u30_at(d, i) }
+pub fn skip_ops_pub(op: u8, bc: &[u8], i: &mut usize) { skip_opcode_operands(op, bc, i) }
