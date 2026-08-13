@@ -179,11 +179,22 @@ dimensions below are the rest.
   reparented into is already view-relative and the offset is the wrong correction. worth one probe
   of what the camera actually reports before changing the arithmetic again.
 
-- **the hazard switch is wired up** (fixed). both engines let a match turn hazards off and a
-  converted stage now means it: `match.getMatchSettingsConfig().hazards` gates the hazard spawns.
-  ONLY the hazards -- structures are the ground the stage is made of and backdrop elements are
-  scenery, so turning hazards off stops the stage hurting you rather than taking away its floor.
-  verified in-engine: no script error, and the hazards spawn with the switch at its default.
+- **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
+  in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
+  chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the
+  converter reads each stage's own answer out of its bytecode (`abc_parser::extract_hazard_gate`):
+  the gated region is the branch after the call, and what counts as gated is what the stage SPAWNS
+  in there. a stage that never asks runs everything regardless, and so does its port.
+
+  on bowserscastle that comes out as `gated_classes: ["Thwomp"]` -- the faller is spawned inside the
+  branch, the lava is placed regardless, and the embers update BEFORE the check. verified live both
+  ways: hazards on = lava + thwomp + spectator, hazards off = lava + spectator, thwomp gone, all 36
+  structures still there and the fighter still standing on them.
+
+  the harness had been hiding this. peptide replaces the whole match config on a headless launch, so
+  a field it never set read as false and every test match ran with hazards OFF. `hazards` is now a
+  match setting like lives and time (`match_settings.conf`, default on), which also makes the off
+  case testable on purpose.
 
 - **special-angle sentinels.** SSF2 sentinel angles (`-1`/`-2`/`-3`…) are preserved
   faithfully, we just haven't mapped them to FM's special-angle codes yet. needs the

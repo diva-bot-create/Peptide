@@ -2203,6 +2203,113 @@ pub fn extract_stage_weather(abc: &AbcFile, stage_class: &str) -> Option<StageWe
     Some(StageWeather { art, width: nums[0], height: nums[1], count: nums[2].max(0.0) as u32 })
 }
 
+/// What a stage puts behind the HAZARDS SWITCH, read out of the stage's own code.
+///
+/// Both engines let a match turn hazards off, and in SSF2 the switch is not something the engine
+/// applies to a stage: the stage asks (`SSF2API.isHazardsOn()`) and decides for itself what to skip.
+/// 47 stages in the corpus ask, and they do not all mean the same thing by it, so which parts of a
+/// converted stage go quiet is a question only the source can answer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HazardGate {
+    /// Whether the stage asks at all. A stage that never asks runs everything regardless, and a
+    /// port that gates anyway is quieter than the original.
+    pub checked: bool,
+    /// The classes the stage only ever spawns while the switch is on.
+    pub gated_classes: Vec<String>,
+}
+
+/// Read the hazards switch out of a stage class.
+///
+/// The shape is a call to the switch followed by a branch, so the gated region is everything up to
+/// that branch's target. What counts as gated is what the stage SPAWNS in there: a class it creates
+/// only while the switch is on is a class the port should create only while the switch is on.
+/// Keyed on that shape rather than on any stage or hazard name, so every stage that asks is read
+/// the same way.
+pub fn extract_hazard_gate(abc: &AbcFile, stage_class: &str) -> HazardGate {
+    let mut gate = HazardGate::default();
+    // A stage class is usually named for its id, but not always with the same capitalisation
+    // (`dreamland` declares `Dreamland`), so fall back to a case-insensitive match rather than
+    // reporting a stage that asks as one that doesn't.
+    let Some(class) = abc.classes.iter().find(|c| c.name == stage_class)
+        .or_else(|| abc.classes.iter().find(|c| c.name.eq_ignore_ascii_case(stage_class)))
+    else { return gate };
+    for m in ["update", "initialize"] {
+        let Some(t) = class.instance_methods.iter().find(|t| &*t.name == m) else { continue };
+        let Some(body) = abc.method_bodies.iter().find(|b| b.method_idx == t.method_idx) else { continue };
+        scan_hazard_gate(&body.bytecode, abc, &mut gate);
+    }
+    gate.gated_classes.sort();
+    gate.gated_classes.dedup();
+    gate
+}
+
+fn scan_hazard_gate(bc: &[u8], abc: &AbcFile, gate: &mut HazardGate) {
+    // Regions of the body that only run with the switch on. A stage can ask more than once.
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < bc.len() {
+        let op = bc[i];
+        let op_at = i;
+        i += 1;
+        match op {
+            OP_CALLPROPERTY => {
+                let mn = read_u30_at(bc, &mut i).unwrap_or(0);
+                let _argc = read_u30_at(bc, &mut i).unwrap_or(0);
+                let name = abc.multinames.get(mn as usize).map(|m| m.name.to_string()).unwrap_or_default();
+                if name != "isHazardsOn" { continue; }
+                gate.checked = true;
+                // `if (isHazardsOn())` compiles to the call then a jump-when-false, so the body is
+                // everything between the branch and its target. Anything else (the answer stored in
+                // a field first, an inverted test) still counts as asking, but its extent is not
+                // one this shape can read, and a region guessed wrong is worse than none.
+                if bc.get(i) == Some(&OP_IFFALSE) {
+                    let mut j = i + 1;
+                    if let Some(off) = read_s24_at(bc, &mut j) {
+                        let target = j as i64 + off as i64;
+                        if target > j as i64 && target <= bc.len() as i64 {
+                            regions.push((j, target as usize));
+                        }
+                    }
+                }
+            }
+            _ => { let mut j = op_at + 1; skip_opcode_operands(op, bc, &mut j); i = j; }
+        }
+    }
+    if regions.is_empty() { return; }
+
+    // Second pass: inside a gated region, the thing most recently named is the class being spawned.
+    let mut i = 0usize;
+    let mut last_lex: Option<String> = None;
+    while i < bc.len() {
+        let op = bc[i];
+        let op_at = i;
+        i += 1;
+        let gated = regions.iter().any(|(a, b)| op_at >= *a && op_at < *b);
+        match op {
+            OP_GETLEX => {
+                let mn = read_u30_at(bc, &mut i).unwrap_or(0);
+                last_lex = abc.multinames.get(mn as usize).map(|m| m.name.to_string());
+            }
+            OP_CALLPROPERTY | OP_CALLPROPVOID => {
+                let mn = read_u30_at(bc, &mut i).unwrap_or(0);
+                let _argc = read_u30_at(bc, &mut i).unwrap_or(0);
+                let name = abc.multinames.get(mn as usize).map(|m| m.name.to_string()).unwrap_or_default();
+                if gated && (name == "spawnEnemy" || name == "spawnProjectile") {
+                    if let Some(c) = last_lex.take() { gate.gated_classes.push(c); }
+                }
+            }
+            _ => { let mut j = op_at + 1; skip_opcode_operands(op, bc, &mut j); i = j; }
+        }
+    }
+}
+
+fn read_s24_at(bc: &[u8], i: &mut usize) -> Option<i32> {
+    if *i + 3 > bc.len() { return None; }
+    let v = bc[*i] as i32 | (bc[*i + 1] as i32) << 8 | (bc[*i + 2] as i8 as i32) << 16;
+    *i += 3;
+    Some(v)
+}
+
 pub(crate) fn extract_enemy_behavior(abc: &AbcFile, class_name: &str) -> EnemyBehavior {
     let Some(class) = abc.classes.iter().find(|c| c.name == class_name) else { return EnemyBehavior::default() };
     let mut v = BehaviorVisitor { b: EnemyBehavior::default() };

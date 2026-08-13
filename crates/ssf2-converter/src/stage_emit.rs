@@ -214,13 +214,15 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     let mut spawns = structure_spawn_ids.iter()
         .map(|cid| format!("\t\t\tmatch.createStructure(self.getResource().getContent(\"{cid}\"));\n"))
         .collect::<String>();
-    // Only the HAZARDS go behind the switch. Structures are the ground the stage is made of and
-    // backdrop elements are scenery: turning hazards off should stop the stage hurting you, not
-    // take away its floor.
-    let haz = hazard_spawn_lines(model);
-    if !haz.trim().is_empty() {
+    // What goes behind the hazards switch is READ OFF THE SOURCE STAGE, not decided here: SSF2
+    // stages ask the switch themselves and each one means something different by it, so the port
+    // gates exactly what the original gated (`abc_parser::extract_hazard_gate`) and nothing else.
+    // A stage that never asks runs everything regardless, and so does its port.
+    let (ungated, gated) = hazard_spawn_lines(model);
+    spawns.push_str(&ungated);
+    if !gated.trim().is_empty() {
         spawns.push_str("\t\t\tif (m_hazardsOn) {\n");
-        for line in haz.lines() {
+        for line in gated.lines() {
             spawns.push_str(&format!("\t{line}\n"));
         }
         spawns.push_str("\t\t\t}\n");
@@ -2944,17 +2946,24 @@ fn emit_bg_segmented(
 }
 
 /// hscript the stage Script runs to spawn its hazards (createCustomGameObject + position).
-fn hazard_spawn_lines(model: &StageModel) -> String {
-    let mut out = String::new();
+/// Spawn lines split by what the SOURCE stage put behind the hazards switch: `(always, only when
+/// hazards are on)`. A hazard is gated when the stage class only ever spawns its class inside its
+/// own `isHazardsOn` branch; one the stage places regardless stays ungated, because in SSF2 it
+/// hurts you regardless.
+fn hazard_spawn_lines(model: &StageModel) -> (String, String) {
+    let (mut ungated, mut gated) = (String::new(), String::new());
     for (i, hz) in model.hazards.iter().enumerate() {
         let hid = hazard_id(&model.id, i, hz);
         // owned by a character (a GameObject) so the hitbox registers; setX/setY positions it.
-        out.push_str(&format!(
+        let line = format!(
             "\t\t\tvar _hz{i} = match.createCustomGameObject(self.getResource().getContent(\"{hid}\"), owner);\n\
              \t\t\tif (_hz{i} != null) {{ _hz{i}.setX({:.1}); _hz{i}.setY({:.1}); }}\n",
-            hz.x, hz.y));
+            hz.x, hz.y);
+        let is_gated = hz.class_name.as_deref()
+            .is_some_and(|c| model.hazard_gate.gated_classes.iter().any(|g| g == c));
+        if is_gated { gated.push_str(&line); } else { ungated.push_str(&line); }
     }
-    out
+    (ungated, gated)
 }
 
 fn build_manifest(model: &StageModel, hazard_entries: &[Value], structure_entries: &[Value]) -> Value {
@@ -3108,9 +3117,9 @@ fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str
                   \t\tif (chars.length > 0) {{\n\
                   \t\t\tm_hazardsSpawned = true;\n\
                   \t\t\t// Both engines let a match turn hazards OFF, and a converted stage has to\n\
-                  \t\t\t// mean it: SSF2 checks its own switch before running any, so a port that\n\
-                  \t\t\t// spawns regardless is a stage that ignores the rules it was started with.\n\
-                  \t\t\t// Decoration is unaffected -- the switch is about what can hurt you.\n\
+                  \t\t\t// mean it. WHAT goes quiet is the source stage's own decision, ported: in\n\
+                  \t\t\t// SSF2 the engine does not apply the switch to a stage, the stage asks and\n\
+                  \t\t\t// skips what it chooses to, so only what the original gated is gated here.\n\
                   \t\t\tvar cfg = match.getMatchSettingsConfig();\n\
                   \t\t\tm_hazardsOn = cfg == null || cfg.hazards;\n\
                   \t\t\tvar owner = null;\n\

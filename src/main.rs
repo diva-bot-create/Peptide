@@ -1104,6 +1104,7 @@ fn connect_edit(
     let teamattack_str = add_string(code, "teamAttack");
     let teams_str = add_string(code, "teams");
     let itemfreq_str = add_string(code, "itemFrequency");
+    let hazards_str = add_string(code, "hazards");
     let create_mode = require_fn(code, "createMode", Some("fraymakers.util.$FraymakersClassFactory"))?;
     let mode_start_match = require_fn(code, "startMatch", Some("fraymakers.core.FraymakersMode"))?;
     // FM's native pre-match loading screen factory. The menus set
@@ -1124,8 +1125,8 @@ fn connect_edit(
     let buf_cap_idx = add_int(code, 512);
     let cfg = load_match_settings();
     eprintln!(
-        "match-settings: lives={} time={} teamDamage={} itemFrequency={} (FM applies lives/time/items/teamAttack; damage/size floats are SSF2-only)",
-        cfg.lives, cfg.time, cfg.team_damage, cfg.item_frequency
+        "match-settings: lives={} time={} teamDamage={} itemFrequency={} hazards={} (FM applies lives/time/items/teamAttack/hazards; damage/size floats are SSF2-only)",
+        cfg.lives, cfg.time, cfg.team_damage, cfg.item_frequency, cfg.hazards
     );
     // Int constant slots applied to the TrainingMode matchSettings virtual.
     // team_damage is a Bool emitted inline at the build site.
@@ -1133,6 +1134,7 @@ fn connect_edit(
     let time_idx = add_int(code, cfg.time);
     let itemfreq_idx = add_int(code, cfg.item_frequency);
     let cfg_team_damage = cfg.team_damage;
+    let cfg_hazards = cfg.hazards;
     let nl_idx = add_int(code, '\n' as i32);
     let two_idx = add_int(code, 2);
     let three_idx = add_int(code, 3);
@@ -2830,6 +2832,13 @@ fn connect_edit(
     ops.push(Opcode::Bool { dst: rr(64), value: ValBool(cfg_team_damage) });
     ops.push(Opcode::ToDyn { dst: rr(28), src: rr(64) });
     ops.push(Opcode::DynSet { obj: rr(34), field: RS(teamattack_str), src: rr(28) });
+    // hazards: the switch a stage reads to decide what of itself to run. Replacing matchConfig
+    // wholesale means an unset field is FALSE, so leaving this out launched every match with
+    // hazards off -- and a converted stage that honours the switch then looked broken rather than
+    // obedient. Both engines have the switch, so it lives in the shared match settings.
+    ops.push(Opcode::Bool { dst: rr(64), value: ValBool(cfg_hazards) });
+    ops.push(Opcode::ToDyn { dst: rr(28), src: rr(64) });
+    ops.push(Opcode::DynSet { obj: rr(34), field: RS(hazards_str), src: rr(28) });
     // teams=false (free-for-all): MatchSettingsConfig.teams (field 23, Bool) drives prepTeams@6237.
     ops.push(Opcode::Bool { dst: rr(64), value: ValBool(false) });
     ops.push(Opcode::ToDyn { dst: rr(28), src: rr(64) });

@@ -222,6 +222,8 @@ pub struct Weather {
 pub struct StageModel {
     /// Particle weather, if the stage runs any.
     pub weather: Option<Weather>,
+    /// What this stage's own code puts behind the hazards switch.
+    pub hazard_gate: crate::abc_parser::HazardGate,
     /// Content id (from `Main.id`, fallback file stem). The emitter may suffix this
     /// (`<id>ssf2`) so it can't shadow a built-in stage; `display_name` stays clean.
     pub id: String,
@@ -1032,6 +1034,18 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
         eprintln!("[platform-behavior] {platform_behavior:?}");
     }
 
+    // ── the hazards switch ────────────────────────────────────────────────────
+    // Which parts of the stage go quiet when a match turns hazards off is decided by the STAGE, not
+    // by the engine, so it is read out of the stage's own code (see `extract_hazard_gate`).
+    let hazard_gate = crate::swf_parser::parse(&swf_data).ok().and_then(|sw| {
+        sw.abc_blocks.iter().filter_map(|b| crate::abc_parser::parse(b).ok())
+            .map(|abc| crate::abc_parser::extract_hazard_gate(&abc, &id))
+            .find(|g| g.checked)
+    }).unwrap_or_default();
+    if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok() {
+        eprintln!("[hazard-gate] {hazard_gate:?}");
+    }
+
     // ── particle weather ──────────────────────────────────────────────────────
     // Stepped out of the stage's own initialize (see `extract_stage_weather`), then the particle
     // clip it names is rendered once. It is not on the timeline and it is not a hazard, so this is
@@ -1087,7 +1101,7 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
                    w.count, w.art.w, w.art.h, w.width, w.height);
     }
 
-    let mut model = StageModel { id, display_name, series, ssf2_music, fm_music, platforms, death_box, camera_box, entrances, respawns, ledges, hazards, sink_columns, platform_behavior, art, warnings, scale, weather };
+    let mut model = StageModel { id, display_name, series, ssf2_music, fm_music, platforms, death_box, camera_box, entrances, respawns, ledges, hazards, sink_columns, platform_behavior, art, warnings, scale, weather, hazard_gate };
     extend_art_to_death_bounds(&mut model);
     Ok(model)
 }
