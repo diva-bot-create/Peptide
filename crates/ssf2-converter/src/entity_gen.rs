@@ -342,7 +342,33 @@ fn strip_unreachable_returns(body: &str) -> String {
 /// total timing is preserved and the script is always followed by a blank or the anim end).
 /// Calls that hand control away from the running animation. SSF2 executes a frame's code before
 /// drawing it, so a frame carrying one of these is never displayed.
-const ANIM_TERMINATORS: &[&str] = &["endAttack", "gotoAndStop", "gotoAndPlay"];
+
+/// The SSF2 animation a Fraymakers animation was converted from.
+///
+/// A SPLIT piece has to ask for its parent: the mapping files say `a` becomes `jab`, never
+/// `jab1`, so looking one up by the piece name finds nothing -- and "nothing" is indistinguishable
+/// from "no scripts", which is how sandbag's jab ended up with no frame scripts at all and no idea
+/// where SSF2 leaves it.
+fn ssf2_source_name(data: &CharacterData, source_anim: &str, anim_name: &str) -> Option<String> {
+    let mut names: Vec<&str> = vec![source_anim, anim_name];
+    for n in [source_anim, anim_name] {
+        if let Some(parent) = crate::extractor::split_parent(n) { names.push(parent); }
+    }
+    for want in names {
+        if let Some((ssf2, _)) = data.ssf2_to_fm_anim.iter().find(|(_, fm)| fm.as_str() == want) {
+            return Some(ssf2.clone());
+        }
+    }
+    None
+}
+
+/// Calls that END the move. SSF2 executes a frame's code before drawing it, so a frame carrying
+/// one of these is never displayed.
+///
+/// Only an explicit end counts. A `gotoAndStop` is just as likely to be a LOOP inside the move --
+/// a smash's charge holds itself with one -- and treating that as an ending trims a frame the
+/// original does draw, which showed up as a smash coming out SHORTER than its source.
+const ANIM_TERMINATORS: &[&str] = &["endAttack"];
 
 fn enforce_one_frame_scripts(layers: &mut [Value], keyframes: &mut Vec<Value>, char_id: &str) {
     let mut new_blanks: Vec<Value> = Vec::new();
@@ -456,10 +482,7 @@ pub fn generate_entity(
         // trimming only some of them leaves the animation exactly as long as it was and merely
         // inconsistent.
         if frame_count >= 2 {
-            let ssf2_name = data.ssf2_to_fm_anim.iter()
-                .find(|(_, fm)| fm.as_str() == source_anim.as_str())
-                .or_else(|| data.ssf2_to_fm_anim.iter().find(|(_, fm)| fm.as_str() == anim_name.as_str()))
-                .map(|(ssf2, _)| ssf2.clone());
+            let ssf2_name = ssf2_source_name(data, source_anim, anim_name);
             let frame_offset = sprite_boxes.get(source_anim.as_str())
                 .map(|sb| sb.sprite_frame_offset as u32).unwrap_or(0) + split.start_frame as u32;
             if let Some(ssf2) = ssf2_name {
@@ -549,11 +572,8 @@ pub fn generate_entity(
         {
             let layer_id = uuid(char_id, &format!("layer_script_{}", anim_name));
 
-            // Find the SSF2 name: check source_anim first, then fm_name
-            let ssf2_name = data.ssf2_to_fm_anim.iter()
-                .find(|(_, fm)| fm.as_str() == source_anim.as_str())
-                .or_else(|| data.ssf2_to_fm_anim.iter().find(|(_, fm)| fm.as_str() == anim_name.as_str()))
-                .map(|(ssf2, _)| ssf2.clone());
+            // Find the SSF2 name (a split piece resolves through its parent).
+            let ssf2_name = ssf2_source_name(data, source_anim, anim_name);
 
             // Frame offset = sprite base offset + split start frame
             let sprite_frame_offset = sprite_boxes.get(source_anim.as_str())

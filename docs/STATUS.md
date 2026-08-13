@@ -128,20 +128,28 @@ dimensions below are the rest.
   way, on a sample rather than the whole roster.
 - **a frame whose code ends the move is no longer emitted** (fixed). the two engines run a
   frame's code on opposite sides of drawing it: SSF2 runs it FIRST, so a frame carrying
-  `endAttack` or a goto hands control away before anything is drawn and never appears; Fraymakers
-  runs it AFTER, so emitting that frame showed a pose the original never displayed and every such
-  move ran one source frame long. the trim happens before any layer is built, because the engine
-  takes an animation's length from its LONGEST layer -- trimming only the images left the labels
-  at the old length and the animation exactly as long as before, just inconsistent.
+  `endAttack` hands control away before anything is drawn and never appears; Fraymakers runs it
+  AFTER, so emitting that frame showed a pose the original never displayed and the move ran one
+  source frame long. the trim happens before any layer is built, because an animation's length is
+  its LONGEST layer -- trimming only the images left the labels at the old length and the
+  animation exactly as long as before, just inconsistent.
 
-  measured on the fixture, sandbag, both engines, before -> after: tilt_forward 2.12 -> 2.00,
-  tilt_up 2.17 -> 2.00, tilt_down 2.15 -> 2.00, aerial_neutral 2.10 -> 2.00, aerial_forward
-  2.14 -> 2.00, aerial_up 2.14 -> 2.00, aerial_down 2.11 -> 2.00.
+  ONLY an explicit `endAttack` counts. a `gotoAndStop` is as likely to be a LOOP inside the move
+  (a smash holds its charge with one), and treating that as an ending trims a frame the original
+  does draw.
 
-  two moves are still out. `jab` sits at 2.15 and carries no frame scripts at all, so nothing
-  marks where SSF2 leaves it -- it ends some other way. `strong_forward` moved the wrong way,
-  2.00 -> 1.90, so the rule over-applies to at least one split piece whose terminating frame SSF2
-  does draw. both want the per-frame trace rather than totals.
+  measured on the fixture, sandbag, both engines: jab, tilt_forward, tilt_up, tilt_down,
+  aerial_neutral, aerial_forward, aerial_up, aerial_down and special_down are all now exactly
+  2.00, against 2.10-2.17 before.
+
+- **split animations were losing every frame script** (fixed). the mapping files speak in parent
+  names -- `a` becomes `jab`, never `jab1` -- so looking an SSF2 animation up by a split PIECE
+  name found nothing, and nothing is indistinguishable from "this animation has no scripts".
+  sandbag's jab was emitted with zero frame scripts: no dust, no swing sound, and nothing marking
+  where the move ends. pieces resolve through their parent now, and jab went from 3 missing
+  scripts and 2.15 to 3 scripts and exactly 2.00.
+
+  worth a corpus pass: every character with a multi-hit jab was missing those scripts.
 - **special-angle sentinels.** SSF2 sentinel angles (`-1`/`-2`/`-3`…) are preserved
   faithfully, we just haven't mapped them to FM's special-angle codes yet. needs the
   SSF2-sentinel → FM-angle table.

@@ -559,6 +559,15 @@ pub fn expand_split_anim(fm_name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The FM animation a split piece came FROM (`jab1` -> `jab`), or `None` if this name is not a
+/// piece. The mapping files speak in parent names -- `a` maps to `jab`, never to `jab1` -- so
+/// anything looking an SSF2 animation up from a piece has to ask for the parent.
+pub fn split_parent(fm_name: &str) -> Option<&'static str> {
+    SPLIT_ANIMS.iter()
+        .find(|(parent, subs)| *parent != fm_name && subs.contains(&fm_name))
+        .map(|(parent, _)| *parent)
+}
+
 /// Returns true if this FM animation name is a sub-animation produced by splitting (a produced
 /// name distinct from its parent — so `jab1` is, but the un-renamed `taunt` parent is not).
 pub fn is_split_sub_anim(fm_name: &str) -> bool {
