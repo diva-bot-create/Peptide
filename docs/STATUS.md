@@ -126,35 +126,29 @@ dimensions below are the rest.
   startup/active/recovery. the live half is the `record`/`trace` frame recorder (both
   engines push per-frame telemetry); it confirms the emitted lengths actually play that
   way, on a sample rather than the whole roster.
-- **most animations run one SOURCE frame long, and it is not yet clear which.** the live sweep
-  (`tools/tests/move_sweep.py both`) measured sandbag and mario on the fixture in both engines.
-  the doubling itself is right: emitted length is exactly the sliced range x2 every time, and the
-  moves whose duration is decided by SCRIPT rather than by animation length match SSF2 exactly
-  (sandbag special_down 19->38, special_side_air 32->64, both 2.00). but most animations that play
-  to their own end come out one source frame long:
+- **the +1 frame is in how a move is LEFT, not in how it is converted.** the live sweep
+  (`tools/tests/move_sweep.py both`) measures sandbag and mario on the fixture in both engines.
+  input-driven moves land at 2.10-2.17 against a target of 2.00, consistently, which read as the
+  conversion emitting one source frame too many. it is not that: the same sweep drives the smashes
+  by STATE rather than by button (fraymakers tells a smash from a tilt by stick magnitude, which
+  an injected mask has no way to express), and those play their whole animation with nothing
+  deciding when to leave:
 
-  | char | move | ssf2 plays | fm | fm/2 |
+  | move | how driven | ssf2 | fm | ratio |
   | --- | --- | --- | --- | --- |
-  | sandbag | jab1 | 13 | 28 | 14 |
-  | sandbag | tilt_up | 12 | 26 | 13 |
-  | sandbag | aerial_forward | 14 | 30 | 15 |
-  | sandbag | aerial_down | 19 | 40 | 20 |
-  | mario | tilt_up | 13 | 28 | 14 |
-  | mario | aerial_forward | 29 | 60 | 30 |
-  | mario | aerial_down | 19 | 40 | 20 |
-  | mario | **jab1** | **7** | **14** | **7** |
+  | strong_forward | state | 20 | 40 | **2.00** |
+  | strong_down | state | 21 | 42 | **2.00** |
+  | special_down | script-governed | 19 | 38 | **2.00** |
+  | special_side_air | script-governed | 32 | 64 | **2.00** |
+  | jab | input | 13 | 28 | 2.15 |
+  | tilt_up | input | 12 | 26 | 2.17 |
+  | aerial_neutral | input | 20 | 42 | 2.10 |
 
-  nine of fourteen measurements are +1 and the rest are exact, so a blanket "trim one frame" is
-  wrong: it would break mario's jab, which already matches. two explanations have been tried and
-  killed by the data. it is not simply the last frame being a duplicate of the one before it
-  (mario's jab ends in a duplicate and is exact; mario's aerial_neutral does not and is +1), and
-  it is not the whole source animation being emitted (the sliced range is already shorter than
-  what the extractor reads).
-
-  what it looks like is SSF2 leaving an animation a frame before its slice ends, on a condition
-  that varies per move. the next step is the per-frame trace rather than the totals: both engines
-  push the frame index, so the question "which frame does SSF2 leave on" is answerable directly
-  instead of inferred from a length.
+  every move that plays to its own end is exactly 2.00. every move whose end is decided while it
+  runs is 2.10-2.17. so the emitted LENGTH is right and the two engines differ by about a frame in
+  when they leave a move -- which is a gameplay-timing question (input buffering, the frame a
+  transition is taken on), not a conversion one. worth measuring properly with the per-frame trace
+  before treating it as a defect.
 - **special-angle sentinels.** SSF2 sentinel angles (`-1`/`-2`/`-3`…) are preserved
   faithfully, we just haven't mapped them to FM's special-angle codes yet. needs the
   SSF2-sentinel → FM-angle table.

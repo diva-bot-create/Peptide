@@ -107,9 +107,11 @@ MOVES = [
     ("tilt_down",        "ground", {"fm": "down+attack:2",  "ssf2": "down:6 down+attack:2"}),
     ("dash_attack",      "ground", {"fm":   "dash+right:8 right+attack:2",
                                     "ssf2": "right:2 none:1 right:6 right+attack:2"}),
-    ("strong_forward",   "ground", {"fm": "right:1 right+attack:3", "ssf2": "right+attack:2"}),
-    ("strong_up",        "ground", {"fm": "up:1 up+attack:3",        "ssf2": "up+attack:2"}),
-    ("strong_down",      "ground", {"fm": "down:1 down+attack:3",    "ssf2": "down+attack:2"}),
+    # SSF2 smashes on side+attack pressed together; Fraymakers reads that as a tilt because the
+    # distinction is stick magnitude, so it is entered by state instead.
+    ("strong_forward",   "ground", {"fm": "state:STRONG_FORWARD_IN", "ssf2": "right+attack:2"}),
+    ("strong_up",        "ground", {"fm": "state:STRONG_UP_IN",      "ssf2": "up+attack:2"}),
+    ("strong_down",      "ground", {"fm": "state:STRONG_DOWN_IN",    "ssf2": "down+attack:2"}),
     ("getup_attack",     "ground", "down:2 attack:2"),
     # aerials -- parked high so the whole move plays before the floor arrives
     ("aerial_neutral",   "air",    "attack:2"),
@@ -200,9 +202,17 @@ def run_move(engine, name, kind, timeline):
 
     tell(engine, "record")
     scenario = f"scenario 0,{y:.0f} {away:.0f},{floor_top:.0f}"
-    if timeline:
-        scenario += " " + timeline
-    tell(engine, scenario)
+    if timeline.startswith("state:"):
+        # Some moves cannot be asked for with a button. Fraymakers tells a smash from a tilt by
+        # how far the stick was pushed, and an injected mask has no magnitude to push -- every
+        # spelling of "side and attack together" comes back a tilt. So the move is entered
+        # directly instead. It is the same motion either way; only the asking differs.
+        tell(engine, scenario)
+        tell(engine, f"e p0.toState(CState.{timeline[len('state:'):]})")
+    else:
+        if timeline:
+            scenario += " " + timeline
+        tell(engine, scenario)
     wait_settled(engine, before)
     # `info` gives the position the move ENDED at. The per-frame track only exists while `await`
     # is running, and `await` cannot start until the input timeline it follows has finished, so a
