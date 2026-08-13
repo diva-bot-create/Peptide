@@ -1122,11 +1122,11 @@ pub fn generate_entity(
                         while f + run < total && !(anim_name == "run_turn" && f == 0) {
                             let next = held[(f + run) as usize].as_ref();
                             let matches = next.map(|e| e.symbol_name.as_str()) == sym_name
-                                && next.map(|e| round2(e.world_tx))       == Some(world_tx).filter(|_| sym_name.is_some())
-                                && next.map(|e| round2(e.world_ty))       == Some(world_ty).filter(|_| sym_name.is_some())
-                                && next.map(|e| round2(e.world_sx))       == Some(world_sx).filter(|_| sym_name.is_some())
-                                && next.map(|e| round2(e.world_sy))       == Some(world_sy).filter(|_| sym_name.is_some())
-                                && next.map(|e| round2(e.world_rotation)) == Some(world_rot).filter(|_| sym_name.is_some());
+                                && next.map(|e| round2(e.world_tx))       == sym_name.is_some().then_some(world_tx)
+                                && next.map(|e| round2(e.world_ty))       == sym_name.is_some().then_some(world_ty)
+                                && next.map(|e| round2(e.world_sx))       == sym_name.is_some().then_some(world_sx)
+                                && next.map(|e| round2(e.world_sy))       == sym_name.is_some().then_some(world_sy)
+                                && next.map(|e| round2(e.world_rotation)) == sym_name.is_some().then_some(world_rot);
                             if matches { run += 1; } else { break; }
                         }
 

@@ -76,9 +76,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
         }
         Err(e) => {
             // Already uncompressed? Check if it starts with FWS magic
-            if compressed_data.len() >= 3
-                && [compressed_data[0], compressed_data[1], compressed_data[2]] == [b'F', b'W', b'S']
-            {
+            if compressed_data.starts_with(b"FWS") {
                 log::debug!("Payload already uncompressed (FWS magic)");
                 swf = compressed_data.to_vec();
             } else {
