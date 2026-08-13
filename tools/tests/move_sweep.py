@@ -42,12 +42,16 @@ BIN = os.path.join(ROOT, "build", "release", "peptide")
 # are the same surfaces expressed twice rather than two independent sets of numbers.
 SCALE = 1.3                 # size_multiplier from mappings/character/stats.jsonc
 FLOOR_TOP_SRC = 400.0       # fixture FLOOR_Y
-AIR_CLEARANCE_SRC = 1200.0  # drop height for aerials, in source units
+# Aerials are dropped BELOW the floor, not above it. Above, the only thing a falling character can
+# do is land on the floor, which cuts the move short and makes the measurement about the drop
+# height. Below the floor there is nothing between the character and the blast boundary ~2600
+# source units down, so the move gets the whole of itself before anything interrupts.
+AIR_BELOW_FLOOR_SRC = 300.0
 
 ENGINES = {
     # name:      (tell prefix,             floor top,                 clearance)
-    "fm":   (["session"], FLOOR_TOP_SRC * SCALE, AIR_CLEARANCE_SRC * SCALE),
-    "ssf2": (["ssf2"],    FLOOR_TOP_SRC,         AIR_CLEARANCE_SRC),
+    "fm":   (["session"], FLOOR_TOP_SRC * SCALE, AIR_BELOW_FLOOR_SRC * SCALE),
+    "ssf2": (["ssf2"],    FLOOR_TOP_SRC,         AIR_BELOW_FLOOR_SRC),
 }
 
 # ── the moves ────────────────────────────────────────────────────────────────
@@ -98,6 +102,8 @@ MOVES = [
 # How long to watch. A move that has not resolved in this many engine frames is reported as
 # unfinished rather than silently truncated to whatever was captured.
 WATCH_FRAMES = {"fm": 180, "ssf2": 90}
+# The wait used when a move never reaches a resting state at all (crash, collapse, sleep-in-place).
+FALLBACK_SETTLE_S = 2.5
 
 
 def tell(engine, cmd):
@@ -124,24 +130,105 @@ def read_log(engine):
 
 def run_move(engine, name, kind, timeline):
     """Park the character, play the move, and return the captured trace."""
-    _, floor_top, clearance = ENGINES[engine]
-    y = floor_top if kind == "ground" else floor_top - clearance
+    _, floor_top, below = ENGINES[engine]
+    # +y is DOWN, so an aerial parks BELOW the floor and falls away from it into open space.
+    y = floor_top if kind == "ground" else floor_top + below
     # p1 is parked well away on the same floor so it can neither be hit nor wander into frame.
     away = 400.0 * (SCALE if engine == "fm" else 1.0)
-    before = len(read_log(engine))
+    # Wait for the PREVIOUS move to stop talking before marking where this one starts. SSF2
+    # processes one command per frame at 30fps, so its replies can still be arriving when the next
+    # move begins, and a window opened too early captures the tail of the last move -- which reads
+    # as every move reporting the one before it.
+    before = drain(engine)
 
     tell(engine, "record")
     scenario = f"scenario 0,{y:.0f} {away:.0f},{floor_top:.0f}"
     if timeline:
         scenario += " " + timeline
     tell(engine, scenario)
-    tell(engine, f"await {WATCH_FRAMES[engine]}")
-    time.sleep(WATCH_FRAMES[engine] / 60.0 + 2.0)
+    wait_settled(engine, before)
+    # `info` gives the position the move ENDED at. The per-frame track only exists while `await`
+    # is running, and `await` cannot start until the input timeline it follows has finished, so a
+    # move that travels is already over by the time the track opens. Start and end positions are
+    # known exactly (the scenario placed it at x=0), which is all travel needs.
+    tell(engine, "e p0.getX()" if engine == "fm" else "info")
     tell(engine, "trace")
-    time.sleep(2.0)
+    # The replies come back over the same link the telemetry does; give them a beat to land, then
+    # read once. This is the only wait left and it is bounded by the round trip, not by the move.
+    # Wait for the trace ITSELF to arrive rather than for a guessed interval. SSF2 processes one
+    # command per frame at 30fps, so its replies take noticeably longer to come back than
+    # Fraymakers', and reading on a fixed timer meant reading an empty window.
+    for _ in range(60):
+        time.sleep(0.1)
+        if re.search(r"TRACE:\d+ frames", read_log(engine)[before:]):
+            break
+    time.sleep(0.4)
 
     fresh = read_log(engine)[before:]
     return parse_trace(fresh)
+
+
+# What "the move is over" looks like: the character is back in a state it can sit in forever.
+# Falling counts -- an aerial dropped into open space finishes its move and then simply falls.
+# Deliberately NOT walk_loop/run/shield_loop: those are things the character is DOING, and
+# treating them as "done" ends the measurement on the first frame of the motion being measured.
+# The engine pushes the STATE name, which is not always the animation name: falling arrives as
+# "FALL" even though the animation is fall_loop, so both spellings are here.
+RESTING = ("stand", "idle", "fall", "fall_loop", "fall_special", "helpless", "dizzy", "sleep",
+           # SSF2 names its states differently and shares almost nothing with the converted ones
+           "crouch", "land")
+
+
+def drain(engine, quiet=0.4, timeout=4.0):
+    """Return the log length once it has stopped growing, so a window starts on clean ground."""
+    deadline = time.time() + timeout
+    last = len(read_log(engine))
+    stable_since = time.time()
+    while time.time() < deadline:
+        time.sleep(0.1)
+        now = len(read_log(engine))
+        if now != last:
+            last, stable_since = now, time.time()
+        elif time.time() - stable_since >= quiet:
+            return now
+    return len(read_log(engine))
+
+
+def wait_settled(engine, before, timeout=12.0):
+    """Wait for the move to FINISH, rather than for a fixed number of seconds.
+
+    Most moves are over in well under a second, and sleeping a flat interval per move turned a
+    thirty-move sweep into several minutes of mostly waiting. The engine says when it is done: it
+    pushes the animation it enters, so watch for it re-entering something it can rest in.
+
+    The timeout is a backstop for a move that never resolves, not the normal path.
+    """
+    deadline = time.time() + timeout
+    started = False
+    while time.time() < deadline:
+        anims = re.findall(r"ANIM:(\w+)", read_log(engine)[before:])
+        if anims:
+            # The scenario resets to a resting state first, so wait for something else to begin
+            # before treating a resting state as the end.
+            for a in anims:
+                low = a.lower()
+                if not started and low not in RESTING:
+                    started = True
+                elif started and low in RESTING:
+                    # Confirm it STAYS resting. A move can pass through a resting state on its way
+                    # somewhere else -- a turn settles for a frame before the walk it was the
+                    # start of -- and stopping there measures the turn instead of the walk.
+                    time.sleep(0.35)
+                    later = re.findall(r"ANIM:(\w+)", read_log(engine)[before:])
+                    if later and later[-1].lower() in RESTING:
+                        return True
+                    started = True
+        time.sleep(0.12)
+    # Never settled. Some animations genuinely do not return to a resting state on their own --
+    # the crash/collapse family sits where it lands -- so fall back to waiting out the watch
+    # window rather than reporting a move that did run as if it had not.
+    time.sleep(FALLBACK_SETTLE_S)
+    return False
 
 
 def parse_trace(text):
@@ -151,39 +238,61 @@ def parse_trace(text):
     lines, and the per-frame `E:<anim>|<frame>|<total>|<x>|<y>|<STATE>` telemetry the engine
     pushes while the window is open. The counts give duration; the telemetry gives travel.
     """
-    anims = re.findall(r"^\s*<<\s+(\S+) x(\d+)\s*$", text, re.M)
+    # Both engines list `<name> x<count>`; SSF2 appends the position the animation ended at, and
+    # does not carry the reply prefix onto continuation lines. One pattern covers both.
+    anims = re.findall(r"^\s*(?:<<)?\s+([A-Za-z0-9_]+) x(\d+)(?:\s+end=\((-?[\d.]+),\s*(-?[\d.]+)\))?\s*$",
+                       text, re.M)
+    # `info` reports where the character ended up, in both engines.
+    # Fraymakers answers `e p0.getX()` with `E:<number>`; SSF2's `info` logs `pos=(x, y)`. Both
+    # are read here so one harness covers both engines.
+    pos = re.findall(r"pos=\((-?[\d.]+),\s*(-?[\d.]+)\)", text)
+    evals = re.findall(r"^<<\s*E:(-?[\d.]+)\s*$", text, re.M)
     track = [
         (m.group(1), int(m.group(2)), float(m.group(4)), float(m.group(5)))
         for m in re.finditer(r"E:([A-Za-z0-9_]+)\|(\d+)\|(-?\d+)\|(-?[\d.]+)\|(-?[\d.]+)", text)
     ]
     return {
-        "animations": [(a, int(n)) for a, n in anims],
+        "animations": [(a, int(n)) for a, n, _, _ in anims],
+        # SSF2's trace already says where each animation ended, which is more direct than asking
+        # separately afterwards.
+        "anim_ends": [(a, float(x)) for a, _, x, _ in anims if x],
         "track": track,
+        "end_pos": (float(pos[-1][0]), float(pos[-1][1])) if pos
+                   else ((float(evals[-1]), 0.0) if evals else None),
+        "trace_end_x": None,
     }
 
 
 def summarize(name, kind, cap):
-    """Reduce a capture to the numbers worth comparing."""
+    """Reduce a capture to the numbers worth comparing.
+
+    The duration that matters is the MOVE's own animation, not the whole window: an aerial is
+    followed by the fall and the landing that were always going to happen, and counting those
+    measures the drop height rather than the move. So the move is identified by name where the
+    engine played something matching it, and by "the longest thing that is not a neutral state"
+    otherwise.
+    """
     anims = cap["animations"]
-    track = cap["track"]
-    # The move is whatever ran between the neutral states either side of it. `stand` (and its
-    # airborne equivalent) bookend every capture because the scenario resets to neutral first.
-    NEUTRAL = {"stand", "fall_loop", "fall", "idle", "stand_loop"}
+    NEUTRAL = {"stand", "stand_loop", "idle", "fall", "fall_loop", "fall_in",
+               "land", "land_light", "land_heavy", "walk_out", "crouch_out", "skid"}
     core = [(a, n) for a, n in anims if a.lower() not in NEUTRAL]
-    frames = sum(n for _, n in core)
-    xs = [x for _, _, x, _ in track]
-    ys = [y for _, _, _, y in track]
-    landed = any(a.lower().startswith(("land", "aerial_")) and a.lower().endswith("_land")
-                 for a, _ in anims)
+    # Matched against EVERY animation, not just the non-neutral ones: "fall" is a neutral state
+    # for most moves and the whole point of one of them.
+    named = [(a, n) for a, n in anims if name.lower() in a.lower() or a.lower() in name.lower()]
+    picked = named or core
+    frames = max((n for _, n in picked), default=0)
+    played = picked[0][0] if picked else None
+    end = cap.get("end_pos")
     return {
         "move": name,
         "kind": kind,
+        "animation": played,
         "animations": [a for a, _ in core],
         "frames": frames,
-        "travel_x": (max(xs) - min(xs)) if xs else 0.0,
-        "travel_y": (max(ys) - min(ys)) if ys else 0.0,
-        "landed_early": kind == "air" and landed,
-        "resolved": bool(core),
+        "travel_x": abs(end[0]) if end else 0.0,   # every scenario starts the character at x=0
+        "end_y": end[1] if end else None,
+        "matched": bool(named),
+        "resolved": bool(picked),
     }
 
 
@@ -196,10 +305,10 @@ def sweep(engine, only=None):
         row = summarize(name, kind, cap)
         out.append(row)
         flag = "" if row["resolved"] else "  (no move seen)"
-        if row["landed_early"]:
-            flag = "  LANDED EARLY"
+        if row["resolved"] and not row["matched"]:
+            flag = f"  (input reached {row['animation']})"
         print(f"  {name:22} {row['frames']:>4} frames  dx={row['travel_x']:>7.1f}"
-              f"  dy={row['travel_y']:>7.1f}  {','.join(row['animations'][:3])}{flag}")
+              f"  {row['animation'] or '-':22}{flag}")
     path = f"/tmp/peptide_sweep_{engine}.json"
     with open(path, "w") as f:
         json.dump(out, f, indent=1)
@@ -223,16 +332,21 @@ def compare():
         a, b = ss.get(name), fm.get(name)
         if not a or not b:
             continue
+        # The two engines name the same move completely differently -- SSF2 calls a forward tilt
+        # A_FORWARD_TILT and the conversion calls it tilt_forward -- so the pairing is by the INPUT
+        # that produced it, which is identical on both sides, and the names are reported for
+        # context rather than compared.
         dur = f"{b['frames']/a['frames']:.2f}" if a["frames"] else "-"
         trav = f"{b['travel_x']/a['travel_x']:.2f}" if a["travel_x"] > 1.0 else "-"
         durbad = a["frames"] and abs(b["frames"] / a["frames"] - 2.0) > 0.12
         travbad = a["travel_x"] > 1.0 and abs(b["travel_x"] / a["travel_x"] - SCALE) > 0.15
         mark = ""
-        if durbad or travbad or b["landed_early"] or a["landed_early"]:
+        if durbad or travbad:
             mark = "  <-"
             bad += 1
         print(f"{name:22} {a['frames']:>6} {b['frames']:>6} {dur:>7}   "
-              f"{a['travel_x']:>8.1f} {b['travel_x']:>8.1f} {trav:>7}{mark}")
+              f"{a['travel_x']:>8.1f} {b['travel_x']:>8.1f} {trav:>7}{mark}"
+              f"   {a['animation'] or '-'}/{b['animation'] or '-'}")
     print(f"\n{bad} move(s) outside tolerance (duration x2 +/-6%, travel x{SCALE} +/-12%)")
     return 1 if bad else 0
 
