@@ -167,13 +167,23 @@ dimensions below are the rest.
   verified live: 30 VFX in the match, positions scattered across the field and changing between
   samples.
 
-- **the hazard switch is not wired up.** both engines have one -- SSF2 reads `StageData.HazardsOn`
-  (from `Config.enable_hazards` / `SaveData.Hazards`) -- and a converted stage should not spawn its
-  hazards when it is off. the Fraymakers side is the blocker: nothing under `match.*` answers to
-  any spelling probed live (`getHazardsEnabled`, `isHazardsEnabled`, `getHazards`,
-  `getMatchSettings`, `getStageHazardsEnabled`), so either it is named something else or it is not
-  exposed to hscript at all. worth asking rather than guessing; the emitter change itself is one
-  guard around the deferred spawn block.
+- **weather is not camera-tethered yet.** SSF2 attaches the field to the VIEW: it fills the screen
+  wherever the camera goes, and a particle leaving one edge returns at the other. The port places
+  particles in WORLD space, so the field sits over one patch of the stage -- correct-looking on a
+  screenshot, wrong as soon as the camera travels, and simply absent at the edges of a big stage.
+
+  the per-frame mover already offsets each particle by `match.getCamera().getX()/getY()`, which
+  RESOLVES (no script error in-engine) but contributes nothing: measured live, the vfx x range is
+  identical (-78..1392) with the fighter at x=200 and at x=2600, so the field does not move. either
+  those accessors report something other than a world position, or the container the particles are
+  reparented into is already view-relative and the offset is the wrong correction. worth one probe
+  of what the camera actually reports before changing the arithmetic again.
+
+- **the hazard switch is wired up** (fixed). both engines let a match turn hazards off and a
+  converted stage now means it: `match.getMatchSettingsConfig().hazards` gates the hazard spawns.
+  ONLY the hazards -- structures are the ground the stage is made of and backdrop elements are
+  scenery, so turning hazards off stops the stage hurting you rather than taking away its floor.
+  verified in-engine: no script error, and the hazards spawn with the switch at its default.
 
 - **special-angle sentinels.** SSF2 sentinel angles (`-1`/`-2`/`-3`…) are preserved
   faithfully, we just haven't mapped them to FM's special-angle codes yet. needs the

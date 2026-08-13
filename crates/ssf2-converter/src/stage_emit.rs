@@ -214,7 +214,17 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     let mut spawns = structure_spawn_ids.iter()
         .map(|cid| format!("\t\t\tmatch.createStructure(self.getResource().getContent(\"{cid}\"));\n"))
         .collect::<String>();
-    spawns.push_str(&hazard_spawn_lines(model));
+    // Only the HAZARDS go behind the switch. Structures are the ground the stage is made of and
+    // backdrop elements are scenery: turning hazards off should stop the stage hurting you, not
+    // take away its floor.
+    let haz = hazard_spawn_lines(model);
+    if !haz.trim().is_empty() {
+        spawns.push_str("\t\t\tif (m_hazardsOn) {\n");
+        for line in haz.lines() {
+            spawns.push_str(&format!("\t{line}\n"));
+        }
+        spawns.push_str("\t\t\t}\n");
+    }
     spawns.push_str(&bg_spawns);
     let (weather_spawn, weather_frame) = emit_weather(model, &lib)?;
     write_script(&scripts.join(format!("{id}Script.hx")),
@@ -2633,16 +2643,24 @@ fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
          \t\t\t\tself.getBackgroundEffectsContainer().addChild(v.getViewRootContainer());\n\
          \t\t\t\tm_weather.push({{ v: v, x: Random.getInt(-{hw}, {hw}) * 1.0, y: Random.getInt(-{hh}, {hh}) * 1.0, k: {k_lo:.3} + Random.getInt(0, {k_span}) / 100.0, wind: {wind_lo:.3} + Random.getInt(0, {wind_span}) / 100.0 }});\n\
          \t\t\t}}\n");
+    // Weather is CAMERA-space in SSF2: the field is attached to the view, so it fills the screen
+    // wherever the camera goes and a particle that leaves one edge comes back at the other. Placed
+    // in world space instead it sits over one patch of the stage, thins out as the camera moves
+    // away, and is simply absent at the edges of a big stage. So each particle's position is an
+    // offset from the camera, resolved every frame.
     let per_frame = format!(
-        "\t\tfor (p in m_weather) {{\n\
+        "\t\tvar cam = match.getCamera();\n\
+         \t\tvar camX = cam != null ? cam.getX() : 0;\n\
+         \t\tvar camY = cam != null ? cam.getY() : 0;\n\
+         \t\tfor (p in m_weather) {{\n\
          \t\t\tp.y -= p.k;\n\
          \t\t\tp.x += p.wind;\n\
          \t\t\t// leaving the field puts it back on the far side, so the count never changes\n\
          \t\t\tif (p.y < -{hh}) {{ p.y = {hh}; p.x = Random.getInt(-{hw}, {hw}) * 1.0; }}\n\
          \t\t\tif (p.x < -{hw}) {{ p.x = {hw}; }}\n\
          \t\t\tif (p.x > {hw}) {{ p.x = -{hw}; }}\n\
-         \t\t\tp.v.setX(p.x);\n\
-         \t\t\tp.v.setY(p.y);\n\
+         \t\t\tp.v.setX(camX + p.x);\n\
+         \t\t\tp.v.setY(camY + p.y);\n\
          \t\t}}\n");
     Ok((spawn, per_frame))
 }
@@ -3084,11 +3102,17 @@ fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str
         // no hazards: keep update() a clean empty body (byte-stable with hazardless stages).
         (String::new(), String::new())
     } else {
-        ("var m_hazardsSpawned = false;\n".to_string(),
+        ("var m_hazardsSpawned = false;\nvar m_hazardsOn = true;\n".to_string(),
          format!("\tif (!m_hazardsSpawned) {{\n\
                   \t\tvar chars = match.getCharacters();\n\
                   \t\tif (chars.length > 0) {{\n\
                   \t\t\tm_hazardsSpawned = true;\n\
+                  \t\t\t// Both engines let a match turn hazards OFF, and a converted stage has to\n\
+                  \t\t\t// mean it: SSF2 checks its own switch before running any, so a port that\n\
+                  \t\t\t// spawns regardless is a stage that ignores the rules it was started with.\n\
+                  \t\t\t// Decoration is unaffected -- the switch is about what can hurt you.\n\
+                  \t\t\tvar cfg = match.getMatchSettingsConfig();\n\
+                  \t\t\tm_hazardsOn = cfg == null || cfg.hazards;\n\
                   \t\t\tvar owner = null;\n\
 {hazard_spawns}{w_spawn}\
                   \t\t}}\n\
