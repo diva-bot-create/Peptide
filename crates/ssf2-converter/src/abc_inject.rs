@@ -56,7 +56,7 @@ const OP_PUSHSHORT: u8 = 0x25;
 /// whole command through the dispatcher's try and answer "ERR:" for an otherwise fine node.
 const NS_PRIVATE: u8 = 0x05;
 const OP_IFNE: u8 = 0x14;
-const OP_ISTYPE: u8 = 0xB2;
+const OP_THROW: u8 = 0x03;
 const OP_ISTYPELATE: u8 = 0xB3;
 const OP_IFGE: u8 = 0x18;
 
@@ -78,6 +78,8 @@ pub const SSF2_NS_ENUMS: &str = "com.mcleodgaming.ssf2.enums";   // Mode
 /// The loader that opens one data package, and the two handlers it routes a failed open through.
 /// Both are hooked so a package that fails names itself instead of vanishing.
 pub const PEPTIDE_LOAD_LOG: &str = "peptideLoadLog";
+/// The error most recently reported, so the same one passing outward is not reported again.
+pub const PEPTIDE_LAST_ERR: &str = "peptideLastErr";
 pub const SSF2_RESOURCE_CLASS: &str = "Resource";
 pub const SSF2_RESOURCE_FILE_FIELD: &str = "CurrentFileName";
 pub const SSF2_RESOURCE_ERROR_METHODS: [&str; 2] = ["initialLoadError", "loadError"];
@@ -1766,6 +1768,9 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
         let s = abc.intern_string(PEPTIDE_LOAD_LOG);
         let mn = abc.intern_qname(pub_ns, s);
         abc.add_instance_slot(ci, mn);
+        let s2 = abc.intern_string(PEPTIDE_LAST_ERR);
+        let mn2 = abc.intern_qname(pub_ns, s2);
+        abc.add_instance_slot(ci, mn2);
     }
 
     // ctor: this.peptideSock = new Socket(); addEventListener("socketData", this.peptideOnData);
@@ -2041,7 +2046,9 @@ pub fn inject_ready_signal(abc: &mut Abc, doc_class_local: &str) -> anyhow::Resu
 /// `char_id`/`stage_id` are the resource ids (the same ids the SPAWN verb queues). Queuing an
 /// unknown id is a safe no-op in `queueResources`. This replaces the body wholesale (the
 /// original is ~6 ops: `disclaimerMenu.show()`), so the disclaimer call simply isn't emitted.
-pub fn inject_quickboot(abc: &mut Abc, char_id: &str, stage_id: &str) -> anyhow::Result<()> {
+pub fn inject_quickboot(abc: &mut Abc, char_id: &str, stage_id: &str, prime_stage: Option<&str>)
+    -> anyhow::Result<()>
+{
     let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
     let util_ns = { let s = abc.intern_string(SSF2_NS_UTIL); abc.intern_namespace(NS_PACKAGE, s) };
     let ctrl_ns = { let s = abc.intern_string(SSF2_NS_CONTROLLERS); abc.intern_namespace(NS_PACKAGE, s) };
@@ -2073,6 +2080,15 @@ pub fn inject_quickboot(abc: &mut Abc, char_id: &str, stage_id: &str) -> anyhow:
     let mut c = Code::default();
     c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
     c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_PUSHSTRING, s_char); c.op_u30(OP_NEWARRAY, 1); c.op_u30_u30(OP_CALLPROPVOID, mn_queueres, 1);
+    // Optionally queue another package FIRST. Packages share one namespace for the layer they
+    // build on, and the first definition of a name wins for everything loaded after it. A package
+    // that carries only the shape of that layer therefore depends on a complete one having been
+    // loaded already: with one, its own stubs are discarded and it inherits the real behaviour;
+    // without one, its stubs are what everything gets.
+    if let Some(prime) = prime_stage {
+        let s_prime = abc.intern_string(prime);
+        c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_PUSHSTRING, s_prime); c.op_u30(OP_NEWARRAY, 1); c.op_u30_u30(OP_CALLPROPVOID, mn_queueres, 1);
+    }
     c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_PUSHSTRING, s_stage); c.op_u30(OP_NEWARRAY, 1); c.op_u30_u30(OP_CALLPROPVOID, mn_queueres, 1);
     c.op_u30(OP_GETLEX, mn_menuctrl); c.op_u30(OP_GETPROPERTY, mn_loadingmenu); c.op_u30_u30(OP_CALLPROPVOID, mn_show, 0);
     c.op(OP_RETURNVOID);
@@ -2332,18 +2348,12 @@ pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Re
     // leaves it empty, which is the common case and reports as a bare tag with nothing after it.
     // The thrown object itself stringifies to the message and code, so report that and keep `text`
     // as the suffix for the cases where it is the one carrying detail.
-    let mn_text = q(abc, pub_ns, "text");
     let mn_errobj = q(abc, pub_ns, "error");
     let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
     let s_blank3 = abc.intern_string("");
     let mn_h = q(abc, pub_ns, "peptideOnError");
     let n_h = abc.intern_string("peptideOnError");
     let s_tag = abc.intern_string("SCRIPTERR: ");
-    let s_sep2 = abc.intern_string(" | ");
-    let s_at = abc.intern_string(" @ ");
-    let s_blank2 = abc.intern_string("(no trace)");
-    let mn_stack = q(abc, pub_ns, "getStackTrace");
-    let mn_error_cls = q(abc, pub_ns, "Error");
     let s_nl = abc.intern_string("\n");
 
     // handler(e): if (peptideSock != null) peptideSock.writeUTFBytes("SCRIPTERR: " + e.text + "\n")
@@ -2365,28 +2375,10 @@ pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Re
     c.place(l_joined);
     c.op_u30(OP_PUSHSTRING, s_tag); c.op(OP_ADD);
     c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_errobj); c.op(OP_CONVERT_S); c.op(OP_ADD);
-    c.op_u30(OP_PUSHSTRING, s_sep2); c.op(OP_ADD);
-    c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_text); c.op(OP_CONVERT_S); c.op(OP_ADD);
-
-    // Then WHERE it came from. A bare message says a script broke without saying which one, which
-    // for converted content is most of the question: an author needs the file and line, not just
-    // "TypeError". The thrown object carries its own trace, so ask it for one -- guarded by a type
-    // check, because anything at all can be thrown and calling a method on the wrong thing inside
-    // an error handler would lose the report we are in the middle of writing. Builds that carry no
-    // debug information answer with nothing, and the line is simply the message again.
-    let l_nostack = c.new_label();
-    let l_stack = c.new_label();
-    c.op_u30(OP_PUSHSTRING, s_at); c.op(OP_ADD);
-    c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_errobj);
-    c.op(OP_DUP); c.op_u30(OP_ISTYPE, mn_error_cls);
-    c.branch(OP_IFFALSE, l_nostack);
-    c.op_u30_u30(OP_CALLPROPERTY, mn_stack, 0); c.op(OP_CONVERT_S);
-    c.branch(OP_JUMP, l_stack);
-    c.place(l_nostack);
-    c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank2);
-    c.place(l_stack);
-    c.op(OP_ADD);
-
+    // Said ONCE. The thrown object already stringifies to the message; `text` is empty for
+    // anything that is not an error event, and the runtime shipped to players answers
+    // getStackTrace with the message again -- so printing all three produced the same code three
+    // times over and buried the one thing that varies.
     c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
     c.op_u30(OP_SETPROPERTY, mn_loadlog);
     c.place(l_skip);
@@ -2899,6 +2891,207 @@ pub fn inject_stage_shape_check(abc: &mut Abc, doc_class: &str) -> anyhow::Resul
     Ok(())
 }
 
+
+/// The source file and first line a method was compiled from, read out of the debug instructions
+/// the compiler left in its bytecode (`debugfile` carries the path, `debugline` the line).
+/// Absent from a stripped build, in which case there is simply nothing to say.
+fn source_location(abc: &Abc, code: &[u8]) -> Option<(String, u32)> {
+    let (mut file, mut line) = (None, None);
+    let mut i = 0usize;
+    while i < code.len() && (file.is_none() || line.is_none()) {
+        let op = code[i]; i += 1;
+        let (n30, fixed) = operand_shape(op);
+        let mut first = None;
+        for k in 0..n30 {
+            let (mut v, mut sh) = (0u32, 0u32);
+            for _ in 0..5 {
+                if i >= code.len() { break }
+                let b = code[i]; i += 1;
+                v |= ((b & 0x7f) as u32) << sh;
+                if b & 0x80 == 0 { break }
+                sh += 7;
+            }
+            if k == 0 { first = Some(v); }
+        }
+        i += fixed;
+        match op {
+            0xf1 => file = first.and_then(|f| abc.strings.get(f as usize - 1).cloned()),
+            0xf0 => line = first,
+            _ => {}
+        }
+    }
+    let f = file?;
+    // the compiler writes a full authoring path; only the file itself means anything to a reader
+    let short = f.rsplit([';', '\\', '/']).next().unwrap_or(&f).to_string();
+    Some((short, line?))
+}
+
+/// (u30 operand count, trailing fixed bytes) per opcode. Getting one entry wrong walks the rest of
+/// a method at the wrong offset, which reads as plausible nonsense rather than as an error.
+fn operand_shape(op: u8) -> (usize, usize) {
+    match op {
+        0x04|0x05|0x06|0x08|0x25|0x2c|0x2d|0x2e|0x2f|0x31|0x40|0x41|0x42|0x49|0x53|0x55|0x56|0x58
+        |0x59|0x5a|0x5d|0x5e|0x5f|0x60|0x61|0x62|0x63|0x66|0x68|0x6a|0x6c|0x6d|0x6e|0x6f|0x80|0x86
+        |0x92|0x94|0xb2|0xc2|0xc3|0xf0|0xf1|0xf2 => (1, 0),
+        0x32|0x43|0x44|0x45|0x46|0x4a|0x4c|0x4e|0x4f => (2, 0),
+        0x24|0x65 => (0, 1),
+        0x0c..=0x1a => (0, 3),
+        0xef => (3, 2),
+        _ => (0, 0),
+    }
+}
+
+/// Attribute a thrown error to the place it came from, and let it carry on.
+///
+/// The runtime shipped to players strips line information out of errors, so what surfaces is a
+/// bare code with no property, file or line -- which is the single most useless form an error can
+/// take. The bytecode, though, still carries the file and line it was compiled from. So instead of
+/// asking the error where it came from, wrap the method and let the METHOD say: anything thrown
+/// inside it is reported against its own source location and then rethrown untouched, so the game
+/// behaves exactly as it would have and the log gains the one fact it was missing.
+pub fn inject_error_locator(abc: &mut Abc, doc_class: &str, class_local: &str, method_name: &str,
+    is_static: bool) -> anyhow::Result<()>
+{
+    let ci = abc.find_class_by_name(class_local)
+        .ok_or_else(|| anyhow::anyhow!("class {class_local} not found"))?;
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    let mn_lasterr = q(abc, pub_ns, PEPTIDE_LAST_ERR);
+
+    let method = if method_name == "<ctor>" {
+        abc.instances[ci].iinit
+    } else {
+        let traits = if is_static { &abc.classes[ci].traits } else { &abc.instances[ci].traits };
+        traits.iter().find_map(|t| match t.data {
+            TraitKindData::Method { method, .. }
+                if abc.multiname_local(t.name).as_deref() == Some(method_name) => Some(method),
+            _ => None,
+        }).ok_or_else(|| anyhow::anyhow!("{class_local}.{method_name} not found"))?
+    };
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for {class_local}.{method_name}"))?;
+
+    // One handler per LINE, not one per method. The compiler left a `debugline` marker at the
+    // start of every statement, so the body is already carved into regions of known line; a
+    // handler scoped to each reports the line it covers. That is how a runtime with its line
+    // information stripped can still be made to say line 219, rather than "somewhere in here".
+    let (file, regions) = {
+        let b = &abc.bodies[body_idx];
+        (source_location(abc, &b.code).map(|(f, _)| f), line_regions(&b.code))
+    };
+    let (Some(file), false) = (file, regions.is_empty()) else { return Ok(()) };
+
+    let s_nl = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+    let err_local = abc.bodies[body_idx].local_count.max(1);
+    // The file already names the class, so naming it again earns nothing. `file:line method` says
+    // where and what, once each.
+    let tags: Vec<(u32, u32, u32)> = regions.iter().map(|(from, to, line)| {
+        let t = abc.intern_string(&format!("SCRIPTERR: {file}:{line} {method_name}: "));
+        (*from, *to, t)
+    }).collect();
+
+    let mut handlers: Vec<(u32, u32, u32)> = Vec::new();
+    let mut appended: Vec<u8> = Vec::new();
+    let base = abc.bodies[body_idx].code.len() as u32;
+    for (from, to, s_tag) in &tags {
+        let at = base + appended.len() as u32;
+        let mut h = Code::default();
+        let l_skip = h.new_label();
+        let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+        // Park the thrown object in a local. Juggling it on the stack while building a string
+        // around it is how you end up appending the message to itself.
+        h.op_u30(OP_SETLOCAL, err_local);
+        root(&mut h); h.branch(OP_IFFALSE, l_skip);
+        // Report each error ONCE, at the innermost place that saw it. An error passes through
+        // every frame on its way out, and a line per frame is the same failure restated from
+        // further and further away -- the first one is the only one that says where it happened,
+        // and in a small console the rest just push it off the top.
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_lasterr);
+        h.op_u30(OP_GETLOCAL, err_local); h.branch(OP_IFSTRICTEQ, l_skip);
+        root(&mut h); h.op_u30(OP_GETLOCAL, err_local); h.op_u30(OP_SETPROPERTY, mn_lasterr);
+        root(&mut h);
+        let l_have = h.new_label();
+        let l_joined = h.new_label();
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_loadlog); h.op(OP_DUP);
+        h.branch(OP_IFTRUE, l_have);
+        h.op(OP_POP); h.op_u30(OP_PUSHSTRING, s_blank);
+        h.branch(OP_JUMP, l_joined);
+        h.place(l_have);
+        h.op(OP_CONVERT_S);
+        h.place(l_joined);
+        h.op_u30(OP_PUSHSTRING, *s_tag); h.op(OP_ADD);
+        h.op_u30(OP_GETLOCAL, err_local); h.op(OP_CONVERT_S); h.op(OP_ADD);
+        h.op_u30(OP_PUSHSTRING, s_nl); h.op(OP_ADD);
+        h.op_u30(OP_SETPROPERTY, mn_loadlog);
+        // send at once: whatever threw here may well stop the frame that would otherwise drain it
+        let l_sent = h.new_label();
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_sock); h.branch(OP_IFFALSE, l_sent);
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_sock); h.op_u30(OP_GETPROPERTY, mn_connected);
+        h.branch(OP_IFFALSE, l_sent);
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_sock);
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_loadlog);
+        h.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_sock); h.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+        root(&mut h); h.op(OP_PUSHNULL); h.op_u30(OP_SETPROPERTY, mn_loadlog);
+        h.place(l_sent);
+        h.place(l_skip);
+        // rethrow untouched, so nothing downstream can tell this was here
+        h.op_u30(OP_GETLOCAL, err_local); h.op(OP_THROW);
+        appended.extend_from_slice(&h.finish());
+        handlers.push((*from, *to, at));
+    }
+
+    let body = &mut abc.bodies[body_idx];
+    body.code.extend_from_slice(&appended);
+    for (from, to, at) in handlers {
+        body.exceptions.push(Exception { from, to, target: at, exc_type: 0, var_name: 0 });
+    }
+    body.max_stack = body.max_stack.max(8);
+    body.local_count = body.local_count.max(err_local + 1);
+    Ok(())
+}
+
+/// Carve a method into (from, to, line) regions using the `debugline` markers the compiler left at
+/// the start of each statement. Capped: a handler per line on a very large method costs bytes for
+/// diminishing return.
+fn line_regions(code: &[u8]) -> Vec<(u32, u32, u32)> {
+    let mut marks: Vec<(u32, u32)> = Vec::new();
+    let mut i = 0usize;
+    while i < code.len() {
+        let at = i as u32;
+        let op = code[i]; i += 1;
+        let (n30, fixed) = operand_shape(op);
+        let mut first = None;
+        for k in 0..n30 {
+            let (mut v, mut sh) = (0u32, 0u32);
+            for _ in 0..5 {
+                if i >= code.len() { break }
+                let b = code[i]; i += 1;
+                v |= ((b & 0x7f) as u32) << sh;
+                if b & 0x80 == 0 { break }
+                sh += 7;
+            }
+            if k == 0 { first = Some(v); }
+        }
+        i += fixed;
+        if op == 0xf0 { if let Some(l) = first { marks.push((at, l)); } }
+        if marks.len() > 250 { break }
+    }
+    let end = code.len() as u32;
+    marks.iter().enumerate()
+        .map(|(n, (at, line))| (*at, marks.get(n + 1).map(|(a, _)| *a).unwrap_or(end), *line))
+        .filter(|(f, t, _)| t > f)
+        .collect()
+}
+
 /// Report every time a named method is entered, over the same channel the errors use.
 ///
 /// When a package is refused, the message alone rarely says WHERE: the runtime shipped to players
@@ -2921,18 +3114,33 @@ pub fn inject_method_probe(abc: &mut Abc, doc_class: &str, class_local: &str, me
     let mn_connected = q(abc, pub_ns, "connected");
     let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
     let mn_flush = q(abc, pub_ns, "flush");
-    let s_tag = abc.intern_string(&format!("SCRIPTERR: reached {class_local}.{method_name} "));
+    // The bytecode carries the file and line it was compiled from. The runtime will not tell us
+    // where an error came from, but a probe can say where it IS -- and "the last place reached
+    // was this file at this line" is the same answer arrived at from the other side.
     let s_nl2 = abc.intern_string("\n");
     let s_blank = abc.intern_string("");
 
-    let traits = if is_static { &abc.classes[ci].traits } else { &abc.instances[ci].traits };
-    let method = traits.iter().find_map(|t| match t.data {
-        TraitKindData::Method { method, .. }
-            if abc.multiname_local(t.name).as_deref() == Some(method_name) => Some(method),
-        _ => None,
-    }).ok_or_else(|| anyhow::anyhow!("{class_local}.{method_name} not found"))?;
+    // A constructor is not a trait, so it cannot be found by name like everything else -- and it
+    // is often exactly where a failure lands, since that is where an object is wired up.
+    let method = if method_name == "<ctor>" {
+        abc.instances[ci].iinit
+    } else {
+        let traits = if is_static { &abc.classes[ci].traits } else { &abc.instances[ci].traits };
+        traits.iter().find_map(|t| match t.data {
+            TraitKindData::Method { method, .. }
+                if abc.multiname_local(t.name).as_deref() == Some(method_name) => Some(method),
+            _ => None,
+        }).ok_or_else(|| anyhow::anyhow!("{class_local}.{method_name} not found"))?
+    };
     let body_idx = abc.bodies.iter().position(|b| b.method == method)
         .ok_or_else(|| anyhow::anyhow!("no body for {class_local}.{method_name}"))?;
+
+    let s_tag = {
+        let body = abc.bodies.iter().find(|b| b.method == method);
+        let at = body.and_then(|b| source_location(abc, &b.code))
+            .map(|(f, l)| format!(" ({f}:{l})")).unwrap_or_default();
+        abc.intern_string(&format!("SCRIPTERR: reached {class_local}.{method_name}{at} "))
+    };
 
     let mut c = Code::default();
     let l_skip = c.new_label();
@@ -2953,10 +3161,23 @@ pub fn inject_method_probe(abc: &mut Abc, doc_class: &str, class_local: &str, me
     // Optionally say WHICH subject, read through a public accessor. "a load started" is not
     // actionable when thirty are in flight; "this one started and never finished" is.
     if let Some(g) = subject {
-        let mn_g = q(abc, pub_ns, g);
-        // an instance method describes itself; a static one describes what it was handed
-        if is_static { c.op_u30(OP_GETLOCAL, 1); } else { c.op(OP_GETLOCAL0); }
-        c.op_u30(OP_GETPROPERTY, mn_g); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        // Several subjects, `|` separated, each a dotted path. Correlating two facts in one line
+        // is usually the whole job: "which resource" next to "what it exposes" answers a question
+        // that either alone only narrows.
+        let s_bar = abc.intern_string(" | ");
+        for (n, part) in g.split('|').enumerate() {
+            if n > 0 { c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD); }
+            // an instance method describes itself; a static one describes what it was handed
+            if is_static { c.op_u30(OP_GETLOCAL, 1); } else { c.op(OP_GETLOCAL0); }
+            // "*" means the subject IS the argument rather than a property of it
+            if part != "*" {
+                for hop in part.split('.') {
+                    let mn_g = q(abc, pub_ns, hop);
+                    c.op_u30(OP_GETPROPERTY, mn_g);
+                }
+            }
+            c.op(OP_CONVERT_S); c.op(OP_ADD);
+        }
     }
     c.op_u30(OP_PUSHSTRING, s_nl2); c.op(OP_ADD);
     c.op_u30(OP_SETPROPERTY, mn_loadlog);
@@ -2974,9 +3195,22 @@ pub fn inject_method_probe(abc: &mut Abc, doc_class: &str, class_local: &str, me
     c.place(l_skip);
     c.op(OP_POPSCOPE);
 
+    // A probe must never be the reason something breaks. Reading a subject can throw -- following
+    // a path into an object that does not have it is exactly the situation being investigated --
+    // so anything thrown here is dropped and the method carries on as though the probe were not
+    // there.
+    let l_end = c.new_label();
+    c.branch(OP_JUMP, l_end);
+    let handler_at = c.len();
+    c.op(OP_POP);
+    c.place(l_end);
+
     let payload = c.finish();
     let body = &mut abc.bodies[body_idx];
     prepend_code(body, &payload);
+    body.exceptions.push(Exception {
+        from: 0, to: handler_at as u32, target: handler_at as u32, exc_type: 0, var_name: 0,
+    });
     body.max_stack = body.max_stack.max(6);
     body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
     Ok(())

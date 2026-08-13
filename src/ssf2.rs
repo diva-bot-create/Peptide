@@ -313,7 +313,7 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
             Some((ch, stage)) => {
                 // Headless quick boot: skip the disclaimer/menus at the call site and queue
                 // the match's char + stage so they load during the boot loading screen.
-                ssf2_converter::abc_inject::inject_quickboot(abc, ch, stage)?;
+                ssf2_converter::abc_inject::inject_quickboot(abc, ch, stage, std::env::var("PEPTIDE_PRIME_STAGE").ok().as_deref())?;
             }
             None => {
                 // Normal boot: the disclaimer plays and fires the event-driven READY.
@@ -346,13 +346,24 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         if std::env::var("PEPTIDE_STAGE_CHECK").is_ok() {
             ssf2_converter::abc_inject::inject_stage_shape_check(abc, SSF2_DOC_CLASS)?;
         }
+        // Attribute a thrown error to the method it came from. The runtime strips line
+        // information out of errors, so without this an author gets a bare code and no idea
+        // which file to open; each of these reports against its own compiled-in source location
+        // and rethrows, leaving behaviour untouched.
+        for (class, method, is_static) in [
+            ("GameController", "actuallyStartMatch", true),
+            ("GameController", "startMatch", true),
+            ("StageData", "<ctor>", false),
+            ("StageData", "startGame", false),
+            ("Resource", "getProp", false),
+            ("ResourceManager", "validateResource", true),
+        ] {
+            ssf2_converter::abc_inject::inject_error_locator(abc, SSF2_DOC_CLASS, class, method, is_static)?;
+        }
         if std::env::var("PEPTIDE_PROBE_LOAD").is_ok() {
             for (class, method, is_static, subject) in [
-                ("ResourceManager", "cacheLibrary", true, Some("ID")),
-                ("ResourceManager", "getLibraryClass", true, None),
-                ("ResourceManager", "getLibraryMC", true, None),
-                ("GameController", "startMatch", true, None),
-                ("GameController", "actuallyStartMatch", true, None),
+                ("StageData", "<ctor>", false, None),
+                ("SSF2Stage", "<ctor>", false, None),
             ] {
                 ssf2_converter::abc_inject::inject_method_probe(
                     abc, SSF2_DOC_CLASS, class, method, is_static, subject)?;

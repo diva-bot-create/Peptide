@@ -32,6 +32,10 @@ pub const PLATFORM_Y: f64 = -260.0;
 /// How high above the floor a character can be dropped from and still be inside the blast box.
 pub const DROP_CEILING: f64 = -2800.0;
 
+/// The blast box, which the camera box matches so nothing happens off screen.
+pub const BLAST_HALF_W: f64 = 3000.0;
+pub const BLAST_HALF_H: f64 = 3000.0;
+
 fn px(v: f64) -> Twips { Twips::from_pixels(v) }
 
 fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Rectangle<Twips> {
@@ -144,8 +148,10 @@ pub fn build_fixture_swf() -> Vec<u8> {
         rect_shape(1, -FLOOR_HALF_W, FLOOR_Y, FLOOR_HALF_W, FLOOR_Y + 40.0, grey),
         rect_shape(2, -200.0, PLATFORM_Y, 200.0, PLATFORM_Y + 20.0, blue),
         // --- boundaries. The blast box is huge on purpose: that is what buys a long fall. ---
-        rect_shape(3, -3000.0, -3000.0, 3000.0, 3000.0, mark),
-        rect_shape(4, -800.0, -600.0, 800.0, 600.0, mark),
+        rect_shape(3, -BLAST_HALF_W, -BLAST_HALF_H, BLAST_HALF_W, BLAST_HALF_H, mark),
+        // The camera box is the blast box. A fixture is for WATCHING a fighter fall, and a camera
+        // that stops following before the blast line does hides the part being measured.
+        rect_shape(4, -BLAST_HALF_W, -BLAST_HALF_H, BLAST_HALF_W, BLAST_HALF_H, mark),
     ];
 
     // --- beacons: 4 starts, 4 respawns, 2 ledges ---
@@ -187,11 +193,23 @@ pub fn build_fixture_swf() -> Vec<u8> {
     //     foreground     art in front
     //
     // Boundaries and beacons belong INSIDE terrain, which is where shipped stages keep them.
+    // The boundaries are CLIPS, not bare shapes. The game reads them off the stage and assigns
+    // them somewhere typed as a clip, so a shape coerces to nothing and the assignment fails --
+    // which surfaces as a type error deep inside the engine with nothing pointing back here.
+    tags.push(Tag::DefineSprite(swf::Sprite { id: 15, num_frames: 1, tags: vec![place(3, None, 1), Tag::ShowFrame] }));
+    tags.push(Tag::DefineSprite(swf::Sprite { id: 16, num_frames: 1, tags: vec![place(4, None, 1), Tag::ShowFrame] }));
+    // Floor and platform are clips as well. Everything the game picks out of a stage it picks out
+    // as a clip; a bare shape is simply not seen, which is why the fixture loaded with no ground
+    // under it at all.
+    tags.push(Tag::DefineSprite(swf::Sprite { id: 17, num_frames: 1, tags: vec![place(1, None, 1), Tag::ShowFrame] }));
+    tags.push(Tag::DefineSprite(swf::Sprite { id: 18, num_frames: 1, tags: vec![place(2, None, 1), Tag::ShowFrame] }));
     let mut terrain = vec![
-        place(1, Some("floor"), 1),
-        place(2, Some("platform"), 2),
-        place(3, Some("deathBoundary"), 3),
-        place(4, Some("camBoundary"), 4),
+        // Named the way SSF2 stages name collision. The names are not decoration: solid ground and
+        // a drop-through platform are told apart BY name, so a clip called "floor" is neither.
+        place(17, Some("terrainGround"), 1),
+        place(18, Some("platform"), 2),
+        place(15, Some("deathBoundary"), 3),
+        place(16, Some("camBoundary"), 4),
     ];
     terrain.extend(placements);
     terrain.push(Tag::ShowFrame);
@@ -211,28 +229,42 @@ pub fn build_fixture_swf() -> Vec<u8> {
         ],
     }));
     tags.push(place(11, Some("stageMC"), 1));
-    tags.push(Tag::ShowFrame);
+    // A camera background, as a linked clip of its own at the root. Shipped stages carry one and
+    // name it in their camera block, and the game indexes that list without checking it has
+    // anything in it -- so an empty list is not "no parallax", it is a read off the end.
+    tags.push(Tag::DefineSprite(swf::Sprite { id: 14, num_frames: 1, tags: vec![Tag::ShowFrame] }));
+    tags.push(place(14, Some("bg"), 2));
 
+    let bg_symbol = format!("{FIXTURE_ID}_BG");
     let stage_symbol = format!("stage_{FIXTURE_ID}");
     beacons.push((11, stage_symbol));
     // Symbol 0 is the file's own root, and binding it to `Main` is what makes the loaded content
     // a PACKAGE rather than an anonymous clip. Without it the game gets something that does not
-    // answer to the package API, rejects it, and stops -- the geometry and the id are irrelevant
-    // at that point because nothing ever asks for them.
+    // answer to the package api, and every question it asks comes back undefined.
     beacons.push((0, "Main".to_string()));
-    tags.push(Tag::SymbolClass(
-        beacons.iter().map(|(id, name)| swf::SymbolClassLink {
-            id: *id,
-            class_name: swf::SwfStr::from_utf8_str(Box::leak(name.clone().into_boxed_str())),
-        }).collect(),
-    ));
-    // the AS3 half: without it the package has no identity and SSF2 cannot see it at all
+    beacons.push((14, bg_symbol.clone()));
+
+    // The code goes in FIRST, and the links to it after. A link names a class, and a class that
+    // has not been defined yet is not one it can bind to -- the link is dropped, the root stays an
+    // anonymous clip, and every later question about the package is answered by nothing. Shipped
+    // packages are ordered this way; ours was not, and that single inversion was worth days.
     let abc = build_fixture_abc(&beacons);
     tags.push(Tag::DoAbc2(swf::DoAbc2 {
         flags: swf::DoAbc2Flag::LAZY_INITIALIZE,
         name: swf::SwfStr::from_utf8_str("fixture"),
         data: Box::leak(abc.into_boxed_slice()),
     }));
+    tags.push(Tag::SymbolClass(
+        beacons.iter().map(|(id, name)| swf::SymbolClassLink {
+            id: *id,
+            class_name: swf::SwfStr::from_utf8_str(Box::leak(name.clone().into_boxed_str())),
+        }).collect(),
+    ));
+    // Both frames end HERE, after the links. The root object is built when the frame carrying its
+    // class link is shown, so a link that arrives on a later frame arrives too late: the root has
+    // already been made an anonymous clip, and nothing afterwards can change what it is. Shipped
+    // packages put the code and the links in the first frame and leave the second empty.
+    tags.push(Tag::ShowFrame);
     tags.push(Tag::ShowFrame);
 
     let header = swf::Header {
@@ -274,6 +306,7 @@ const OP_PUSHFALSE: u8 = 0x27;
 const OP_GETPROPERTY: u8 = 0x66;
 const OP_SETPROPERTY: u8 = 0x61;
 const OP_RETURNVALUE: u8 = 0x48;
+const OP_CALLPROPERTY: u8 = 0x46;
 const OP_PUSHSCOPE: u8 = 0x30;
 const OP_POPSCOPE: u8 = 0x1d;
 const OP_PUSHSTRING: u8 = 0x2c;
@@ -314,6 +347,29 @@ const API_CLASSES: [&str; 14] = [
 /// in the package's own class map, so it is not ours to choose.
 const PKG_STAGE_BASE: &str = "SSF2Stage";
 
+/// How many tracks the fixture lists. Shipped stages list a few and the game indexes that list
+/// with an index it carries between matches, so a single entry is not enough to be safe.
+const MUSIC_SLOTS: u32 = 4;
+
+/// The class a package declares itself through. The game looks this up by calling `initAPI` and
+/// using what comes back, so the NAME is ours but the shape is not.
+const PKG_API_CLASS: &str = "SSF2API";
+
+/// Where the base keeps the game's side of the api.
+const API_SLOT: &str = "_api";
+
+/// Everything a stage can ask the game for. Each is one forwarding call; the fixture needs almost
+/// none of them itself, but the game calls them on a stage and a missing one is an error, not a
+/// no-op. Argument-taking members are deliberately absent -- a forwarder that drops arguments is
+/// worse than one that is not there, and nothing here needs them.
+const STAGE_API_METHODS: [&str; 22] = [
+    "getType", "getForeground", "getMidground", "getBackground", "getCameraBackgrounds",
+    "getWeatherMC", "getWeatherMaskMC", "getShadowMC", "getShadowMaskMC", "getHUDBackgroundMC",
+    "getHUDForegroundMC", "isCeilingDeathEnabled", "isFallDeathEnabled", "getStartingPositionMCs",
+    "getSpawnPositionMCs", "getLightSourceMC", "getLedges", "getCameraBounds", "getDeathBounds",
+    "getSmashBallBounds", "getItemSpawnBoundsList", "getStarKOEnabled",
+];
+
 /// What the game calls on a stage while a match runs.
 const STAGE_CALLBACKS: [&str; 2] = ["initialize", "update"];
 
@@ -353,6 +409,10 @@ struct ClassSpec {
     local_count: u32,
     /// named instance slots, declared so the constructor can initialise them
     slots: Vec<&'static str>,
+    /// named STATIC slots, which live on the class object rather than an instance
+    static_slots: Vec<&'static str>,
+    /// code for the class initialiser, which runs once and can fill those static slots
+    cinit: Option<Vec<u8>>,
     methods: Vec<MethodSpec>,
 }
 
@@ -411,6 +471,8 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     let s_movieclips = str_(&mut abc, "movieclips");
     let s_sounds = str_(&mut abc, "sounds");
     let s_stage_mc = str_(&mut abc, &format!("stage_{FIXTURE_ID}"));
+    let s_bg_mc = str_(&mut abc, &format!("{FIXTURE_ID}_BG"));
+    let s_linkage = str_(&mut abc, "linkage_id");
     let s_music = str_(&mut abc, "music");
     let s_track = str_(&mut abc, "bgm_battlefield");
     let s_stage = str_(&mut abc, "stage");
@@ -432,10 +494,25 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
 
     let declare = |specs: &mut Vec<ClassSpec>, name, package: &str, super_mn, param_count, ctor: Vec<u8>, max_stack, local_count| {
         specs.push(ClassSpec { name, package: package.to_string(), super_mn, param_count, ctor,
-            max_stack, local_count, slots: vec![], methods: vec![] });
+            max_stack, local_count, slots: vec![], static_slots: vec![], cinit: None, methods: vec![] });
     };
 
-    declare(&mut specs, PKG_BASE_CLASS, "", mn_object, 0, plain_ctor(0), 2, 1);
+    // The base holds the object the game constructs it with. That object IS the game's side of
+    // the api, and everything a stage can do goes through it -- which is why a stage class is
+    // constructed with one argument and hands it straight to super.
+    let s_api = str_(&mut abc, API_SLOT);
+    let mn_api = { let ns = abc.intern_namespace(NS_PACKAGE, s_empty); abc.intern_qname(ns, s_api) };
+    let mut base_ctor = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+    op1(&mut base_ctor, OP_CONSTRUCTSUPER, 0);
+    base_ctor.push(OP_GETLOCAL0);
+    base_ctor.push(OP_GETLOCAL1);
+    op1(&mut base_ctor, OP_INITPROPERTY, mn_api);
+    base_ctor.push(OP_RETURNVOID);
+    specs.push(ClassSpec {
+        name: PKG_BASE_CLASS, package: String::new(), super_mn: mn_object, param_count: 1,
+        ctor: base_ctor, max_stack: 3, local_count: 2,
+        slots: vec![API_SLOT], static_slots: vec![], cinit: None, methods: vec![],
+    });
 
     // The asset base is NOT a stub. A package carries its own copy of the small API layer the
     // game talks to, in the top-level namespace, so the game's same-named classes never stand in
@@ -506,15 +583,58 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     getp.push(OP_RETURNVALUE);
 
     let noop = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_RETURNVOID];
+
+    // The class the game reads a package's declarations off, and the initialiser that fills it.
+    // The map has to be built at runtime because its values are class objects, which is why it
+    // lives in a class initialiser rather than as constants.
+    let s_api_cls = str_(&mut abc, PKG_API_CLASS);
+    let mn_api_cls = { let ns = abc.intern_namespace(NS_PACKAGE, s_empty); abc.intern_qname(ns, s_api_cls) };
+    let mut init_api = vec![OP_GETLOCAL0, OP_PUSHSCOPE];
+    op1(&mut init_api, OP_FINDPROPSTRICT, mn_api_cls);
+    op1(&mut init_api, OP_GETPROPERTY, mn_api_cls);
+    init_api.push(OP_RETURNVALUE);
+
+    let s_base_c = str_(&mut abc, "BASE_CLASSES");
+    let mn_base_c = { let ns = abc.intern_namespace(NS_PACKAGE, s_empty); abc.intern_qname(ns, s_base_c) };
+    let mut api_cinit = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+    for name in API_CLASSES {
+        let sn = str_(&mut abc, name);
+        let mn = { let ns = abc.intern_namespace(NS_PACKAGE, s_empty); abc.intern_qname(ns, sn) };
+        op1(&mut api_cinit, OP_PUSHSTRING, sn);
+        op1(&mut api_cinit, OP_FINDPROPSTRICT, mn);
+        op1(&mut api_cinit, OP_GETPROPERTY, mn);
+    }
+    op1(&mut api_cinit, OP_NEWOBJECT, API_CLASSES.len() as u32);
+    op1(&mut api_cinit, OP_INITPROPERTY, mn_base_c);
+    for (field, value) in [("VERSION_MAJOR", API_VERSION_MAJOR), ("VERSION_MINOR", API_VERSION_MINOR),
+                           ("VERSION_REVISION", API_VERSION_REVISION)] {
+        let sf = str_(&mut abc, field);
+        let mf = { let ns = abc.intern_namespace(NS_PACKAGE, s_empty); abc.intern_qname(ns, sf) };
+        api_cinit.push(OP_GETLOCAL0);
+        api_cinit.push(OP_PUSHBYTE); api_cinit.push(value);
+        op1(&mut api_cinit, OP_INITPROPERTY, mf);
+    }
+    api_cinit.push(OP_RETURNVOID);
+    specs.push(ClassSpec {
+        name: PKG_API_CLASS, package: String::new(), super_mn: mn_object, param_count: 0,
+        ctor: plain_ctor(0), max_stack: 4, local_count: 1, slots: vec![],
+        static_slots: vec!["BASE_CLASSES", "VERSION_MAJOR", "VERSION_MINOR", "VERSION_REVISION"],
+        cinit: Some(api_cinit), methods: vec![],
+    });
+
     specs.push(ClassSpec {
         name: PKG_ASSET_CLASS, package: String::new(), super_mn: mn_movieclip, param_count: 0,
         ctor: asset_ctor, max_stack: 48, local_count: 1,
         slots: vec![PROPS_SLOT, META_SLOT],
+        static_slots: vec![], cinit: None,
         methods: vec![
             MethodSpec { name: "register", param_count: 2, code: reg, max_stack: 4, local_count: 3 },
             MethodSpec { name: "getProp", param_count: 1, code: getp, max_stack: 3, local_count: 2 },
-            // the game checks these exist before it will talk to a package
-            MethodSpec { name: "initAPI", param_count: 1, code: noop.clone(), max_stack: 2, local_count: 2 },
+            // NOT a no-op, and not optional. The game calls this with its own api and uses what
+            // comes back as the class carrying the package's class map -- it coerces the result
+            // to a Class and reads BASE_CLASSES straight off it. Returning nothing means the
+            // game reads that map off null, which is where validation died.
+            MethodSpec { name: "initAPI", param_count: 1, code: init_api, max_stack: 3, local_count: 2 },
             MethodSpec { name: "deinitAPI", param_count: 0, code: noop.clone(), max_stack: 2, local_count: 1 },
             MethodSpec { name: "getAPIVersion", param_count: 0, code: noop, max_stack: 2, local_count: 1 },
         ],
@@ -548,8 +668,27 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     let mn_fixture_cls = { let n = abc.intern_string(FIXTURE_ID); abc.intern_qname(pub_ns, n) };
 
     for name in API_CLASSES {
-        let sup = if name == PKG_STAGE_BASE { mn_base } else { mn_object };
-        declare(&mut specs, name, "", sup, 0, plain_ctor(0), 2, 1);
+        if name == PKG_STAGE_BASE {
+            // The stage base is not a stub: it is a FORWARDER. Every method on it is one call
+            // through to the same name on the game's own api object, which is exactly what a
+            // package built with the official tooling carries. Reading one of those packages is
+            // what showed this -- `getBackground` there is nine bytes: fetch the api, call the
+            // same name, return it. The wrapper is the whole layer.
+            let fwd: Vec<MethodSpec> = STAGE_API_METHODS.iter().map(|m| {
+                let mn_m = { let n = abc.intern_string(m); abc.intern_qname(pub_ns, n) };
+                let mut code = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+                op1(&mut code, OP_GETPROPERTY, mn_api);
+                op2(&mut code, OP_CALLPROPERTY, mn_m, 0);
+                code.push(OP_RETURNVALUE);
+                MethodSpec { name: m, param_count: 0, code, max_stack: 3, local_count: 1 }
+            }).collect();
+            specs.push(ClassSpec {
+                name, package: String::new(), super_mn: mn_base, param_count: 1,
+                ctor: plain_ctor(1), max_stack: 3, local_count: 2, slots: vec![], static_slots: vec![], cinit: None, methods: fwd,
+            });
+        } else {
+            declare(&mut specs, name, "", mn_object, 0, plain_ctor(0), 2, 1);
+        }
     }
 
     // A stage is constructed WITH an argument and hands it to super; a 0-arg version is rejected.
@@ -565,6 +704,7 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     specs.push(ClassSpec {
         name: FIXTURE_ID, package: String::new(), super_mn: mn_ssf2stage, param_count: 1,
         ctor: plain_ctor(1), max_stack: 3, local_count: 2, slots: vec![],
+        static_slots: vec![], cinit: None,
         methods: STAGE_CALLBACKS.iter().map(|n| MethodSpec {
             name: n, param_count: 0, code: noop_m.clone(), max_stack: 2, local_count: 1,
         }).collect(),
@@ -587,17 +727,24 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     pair(&mut m, s_resources, &|m| {
         op1(m, OP_PUSHSTRING, s_movieclips);
         op1(m, OP_PUSHSTRING, s_stage_mc);
-        op1(m, OP_NEWARRAY, 1);
+        op1(m, OP_PUSHSTRING, s_bg_mc);
+        op1(m, OP_NEWARRAY, 2);
         op1(m, OP_PUSHSTRING, s_sounds);
         op1(m, OP_NEWARRAY, 0);
         op1(m, OP_NEWOBJECT, 2);
     });
-    // music: [ { id: "<track>" } ]
+    // music: several entries of the same track. The game picks one by an index it holds across
+    // matches, and reads the entry it lands on without checking the list is that long, so a
+    // one-entry list is a read off the end whenever that index is anything but zero. Shipped
+    // stages list a few; the fixture lists the same track a few times, which is the same shape
+    // without pretending to have music it does not.
     pair(&mut m, s_music, &|m| {
-        op1(m, OP_PUSHSTRING, s_id);
-        op1(m, OP_PUSHSTRING, s_track);
-        op1(m, OP_NEWOBJECT, 1);
-        op1(m, OP_NEWARRAY, 1);
+        for _ in 0..MUSIC_SLOTS {
+            op1(m, OP_PUSHSTRING, s_id);
+            op1(m, OP_PUSHSTRING, s_track);
+            op1(m, OP_NEWOBJECT, 1);
+        }
+        op1(m, OP_NEWARRAY, MUSIC_SLOTS);
     });
     // Late-bound on purpose. Naming the class directly is what a compiler emits, but it binds at
     // VERIFY time, and this constructor is verified before the class's own script has run: the
@@ -618,7 +765,10 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
         op1(m, OP_PUSHSTRING, s_autopan);
         m.push(OP_PUSHFALSE);
         op1(m, OP_PUSHSTRING, s_backgrounds);
-        op1(m, OP_NEWARRAY, 0);
+        op1(m, OP_PUSHSTRING, s_linkage);
+        op1(m, OP_PUSHSTRING, s_bg_mc);
+        op1(m, OP_NEWOBJECT, 1);
+        op1(m, OP_NEWARRAY, 1);
         op1(m, OP_NEWOBJECT, 4);
     });
     m.push(OP_RETURNVOID);
@@ -653,9 +803,13 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
         let cinit = abc.add_method(MethodInfo {
             param_types: vec![], return_type: 0, name: 0, flags: 0, options: vec![], param_names: vec![],
         });
+        let (cinit_code, cinit_stack) = match &spec.cinit {
+            Some(code) => (code.clone(), 40),
+            None => (empty_body.clone(), 1),
+        };
         abc.add_body(MethodBody {
-            method: cinit, max_stack: 1, local_count: 1, init_scope_depth: 0, max_scope_depth: 1,
-            code: empty_body.clone(), exceptions: vec![], traits: vec![],
+            method: cinit, max_stack: cinit_stack, local_count: 1, init_scope_depth: 0, max_scope_depth: 1,
+            code: cinit_code, exceptions: vec![], traits: vec![],
         });
 
         let mut inst_traits: Vec<Trait> = Vec::new();
@@ -690,7 +844,18 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
             name: mn, super_name: spec.super_mn, flags: 0, protected_ns: 0,
             interfaces: vec![], iinit, traits: inst_traits,
         });
-        abc.classes.push(ClassInfo { cinit, traits: vec![] });
+        // Static slots live on the CLASS, not on an instance, which is what lets the game read a
+        // package's declarations without constructing anything.
+        let class_traits: Vec<Trait> = spec.static_slots.iter().enumerate().map(|(i, n)| {
+            let sn = abc.intern_string(n);
+            let smn = abc.intern_qname(pub_ns, sn);
+            Trait {
+                name: smn, kind_byte: 0x00,
+                data: TraitKindData::Slot { slot_id: i as u32 + 1, type_name: 0, vindex: 0, vkind: 0 },
+                metadata: vec![],
+            }
+        }).collect();
+        abc.classes.push(ClassInfo { cinit, traits: class_traits });
         let classi = (abc.classes.len() - 1) as u32;
 
         // Declaring the trait reserves the name; the class OBJECT only exists once this script's
