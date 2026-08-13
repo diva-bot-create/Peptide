@@ -197,6 +197,11 @@ pub fn build_fixture_swf() -> Vec<u8> {
 
     let stage_symbol = format!("stage_{FIXTURE_ID}");
     beacons.push((11, stage_symbol));
+    // Symbol 0 is the file's own root, and binding it to `Main` is what makes the loaded content
+    // a PACKAGE rather than an anonymous clip. Without it the game gets something that does not
+    // answer to the package API, rejects it, and stops -- the geometry and the id are irrelevant
+    // at that point because nothing ever asks for them.
+    beacons.push((0, "Main".to_string()));
     tags.push(Tag::SymbolClass(
         beacons.iter().map(|(id, name)| swf::SymbolClassLink {
             id: *id,
@@ -245,12 +250,15 @@ pub const FIXTURE_ID: &str = "peptidefixture";
 
 const OP_GETLOCAL0: u8 = 0xd0;
 const OP_GETLOCAL1: u8 = 0xd1;
+const OP_GETLOCAL2: u8 = 0xd2;
+const OP_GETPROPERTY: u8 = 0x66;
+const OP_SETPROPERTY: u8 = 0x61;
+const OP_RETURNVALUE: u8 = 0x48;
 const OP_PUSHSCOPE: u8 = 0x30;
 const OP_POPSCOPE: u8 = 0x1d;
 const OP_PUSHSTRING: u8 = 0x2c;
 const OP_PUSHBYTE: u8 = 0x24;
 const OP_DUP: u8 = 0x2a;
-const OP_GETLEX: u8 = 0x60;
 const OP_NEWCLASS: u8 = 0x58;
 const OP_NEWOBJECT: u8 = 0x55;
 const OP_NEWARRAY: u8 = 0x56;
@@ -263,7 +271,10 @@ const NS_PACKAGE: u8 = 0x16;
 
 /// A stable guid for the fixture. Shipped packages carry one and the reader looks for it, so
 /// leaving it out would make the fixture the only package in the corpus without an identity.
-const FIXTURE_GUID: &str = "9f3c1e7a-2b64-4d18-a5f0-6c81d47e2b90";
+/// Where a package keeps what it registered about itself.
+const PROPS_SLOT: &str = "m_peptideProps";
+
+pub const FIXTURE_GUID: &str = "9f3c1e7a-2b64-4d18-a5f0-6c81d47e2b90";
 
 /// Append a u30 in AVM2's variable-length encoding.
 fn u30(out: &mut Vec<u8>, mut v: u32) {
@@ -290,6 +301,18 @@ struct ClassSpec {
     super_mn: u32,
     param_count: u32,
     ctor: Vec<u8>,
+    max_stack: u32,
+    local_count: u32,
+    /// named instance slots, declared so the constructor can initialise them
+    slots: Vec<&'static str>,
+    methods: Vec<MethodSpec>,
+}
+
+/// One instance method on an authored class.
+struct MethodSpec {
+    name: &'static str,
+    param_count: u32,
+    code: Vec<u8>,
     max_stack: u32,
     local_count: u32,
 }
@@ -358,17 +381,66 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     };
 
     let declare = |specs: &mut Vec<ClassSpec>, name, package: &str, super_mn, param_count, ctor: Vec<u8>, max_stack, local_count| {
-        specs.push(ClassSpec { name, package: package.to_string(), super_mn, param_count, ctor, max_stack, local_count });
+        specs.push(ClassSpec { name, package: package.to_string(), super_mn, param_count, ctor,
+            max_stack, local_count, slots: vec![], methods: vec![] });
     };
 
     declare(&mut specs, "SSF2BaseAPIObject", "", mn_object, 0, plain_ctor(0), 2, 1);
-    declare(&mut specs, "SSF2Asset", "", mn_movieclip, 0, plain_ctor(0), 2, 1);
+
+    // The asset base is NOT a stub. A package carries its own copy of the small API layer the
+    // game talks to, in the top-level namespace, so the game's same-named classes never stand in
+    // for it: what this file declares is what actually runs. `Main` calls `register` on it from
+    // its own constructor, so an empty base means the package throws before it has said what it
+    // is. A property bag is the whole job -- `register` writes, `getProp` reads.
+    let s_props = str_(&mut abc, PROPS_SLOT);
+    let mn_props = { let ns = abc.intern_namespace(NS_PACKAGE, s_empty); abc.intern_qname(ns, s_props) };
+    let key_nsset = abc.intern_ns_set(vec![pub_ns]);
+    let mn_key = abc.intern_multinamel(key_nsset);   // obj[<runtime key>]
+
+    // ctor: super(); this.<props> = {}
+    let mut asset_ctor = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+    op1(&mut asset_ctor, OP_CONSTRUCTSUPER, 0);
+    asset_ctor.push(OP_GETLOCAL0);
+    op1(&mut asset_ctor, OP_NEWOBJECT, 0);
+    op1(&mut asset_ctor, OP_INITPROPERTY, mn_props);
+    asset_ctor.push(OP_RETURNVOID);
+
+    // register(k, v): this.<props>[k] = v
+    let mut reg = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+    op1(&mut reg, OP_GETPROPERTY, mn_props);
+    reg.push(OP_GETLOCAL1);
+    reg.push(OP_GETLOCAL2);
+    op1(&mut reg, OP_SETPROPERTY, mn_key);
+    reg.push(OP_RETURNVOID);
+
+    // getProp(k): return this.<props>[k]
+    let mut getp = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
+    op1(&mut getp, OP_GETPROPERTY, mn_props);
+    getp.push(OP_GETLOCAL1);
+    op1(&mut getp, OP_GETPROPERTY, mn_key);
+    getp.push(OP_RETURNVALUE);
+
+    let noop = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_RETURNVOID];
+    specs.push(ClassSpec {
+        name: "SSF2Asset", package: String::new(), super_mn: mn_movieclip, param_count: 0,
+        ctor: asset_ctor, max_stack: 3, local_count: 1,
+        slots: vec![PROPS_SLOT],
+        methods: vec![
+            MethodSpec { name: "register", param_count: 2, code: reg, max_stack: 4, local_count: 3 },
+            MethodSpec { name: "getProp", param_count: 1, code: getp, max_stack: 3, local_count: 2 },
+            // the game checks these exist before it will talk to a package
+            MethodSpec { name: "initAPI", param_count: 1, code: noop.clone(), max_stack: 2, local_count: 2 },
+            MethodSpec { name: "deinitAPI", param_count: 0, code: noop.clone(), max_stack: 2, local_count: 1 },
+            MethodSpec { name: "getAPIVersion", param_count: 0, code: noop, max_stack: 2, local_count: 1 },
+        ],
+    });
 
     // The stage's own display symbol, plus one class per beacon. All plain clips.
     let stage_symbol: &'static str = Box::leak(format!("stage_{FIXTURE_ID}").into_boxed_str());
     declare(&mut specs, stage_symbol, "", mn_movieclip, 0, plain_ctor(0), 2, 1);
     for (_, sym) in symbols {
-        if sym == stage_symbol { continue; }
+        // both are declared in full below; the loop only covers the plain clips
+        if sym == stage_symbol || sym == "Main" { continue; }
         let (package, local) = match sym.rsplit_once('.') {
             Some((p, l)) => (p.to_string(), l.to_string()),
             None => (String::new(), sym.clone()),
@@ -418,7 +490,14 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
         op1(m, OP_NEWOBJECT, 1);
         op1(m, OP_NEWARRAY, 1);
     });
-    pair(&mut m, s_stage, &|m| op1(m, OP_GETLEX, mn_fixture_cls));
+    // Late-bound on purpose. Naming the class directly is what a compiler emits, but it binds at
+    // VERIFY time, and this constructor is verified before the class's own script has run: the
+    // player rejects the package outright rather than reporting a missing name. Looking it up
+    // through the scope chain defers that to the moment it actually runs, by which point it exists.
+    pair(&mut m, s_stage, &|m| {
+        op1(m, OP_FINDPROPSTRICT, mn_fixture_cls);
+        op1(m, OP_GETPROPERTY, mn_fixture_cls);
+    });
     // camera: { x_start: 0, y_start: 0 } -- the fixture is centred on its own origin
     pair(&mut m, s_camera, &|m| {
         op1(m, OP_PUSHSTRING, s_x_start);
@@ -464,9 +543,37 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
             code: empty_body.clone(), exceptions: vec![], traits: vec![],
         });
 
+        let mut inst_traits: Vec<Trait> = Vec::new();
+        for (slot, slot_name) in spec.slots.iter().enumerate() {
+            let n = abc.intern_string(slot_name);
+            let smn = abc.intern_qname(pub_ns, n);
+            inst_traits.push(Trait {
+                name: smn, kind_byte: 0x00, // Slot
+                data: TraitKindData::Slot { slot_id: slot as u32 + 1, type_name: 0, vindex: 0, vkind: 0 },
+                metadata: vec![],
+            });
+        }
+        for ms in &spec.methods {
+            let n = abc.intern_string(ms.name);
+            let mmn = abc.intern_qname(pub_ns, n);
+            let m = abc.add_method(MethodInfo {
+                param_types: vec![0; ms.param_count as usize], return_type: 0,
+                name: n, flags: 0, options: vec![], param_names: vec![],
+            });
+            abc.add_body(MethodBody {
+                method: m, max_stack: ms.max_stack, local_count: ms.local_count,
+                init_scope_depth: 0, max_scope_depth: 1,
+                code: ms.code.clone(), exceptions: vec![], traits: vec![],
+            });
+            inst_traits.push(Trait {
+                name: mmn, kind_byte: 0x01, // Method
+                data: TraitKindData::Method { disp_id: 0, method: m },
+                metadata: vec![],
+            });
+        }
         abc.instances.push(InstanceInfo {
             name: mn, super_name: spec.super_mn, flags: 0, protected_ns: 0,
-            interfaces: vec![], iinit, traits: vec![],
+            interfaces: vec![], iinit, traits: inst_traits,
         });
         abc.classes.push(ClassInfo { cinit, traits: vec![] });
         let classi = (abc.classes.len() - 1) as u32;
@@ -474,7 +581,8 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
         // Declaring the trait reserves the name; the class OBJECT only exists once this script's
         // initialiser builds it against its base.
         let mut init = vec![OP_GETLOCAL0, OP_PUSHSCOPE];
-        op1(&mut init, OP_GETLEX, spec.super_mn);
+        op1(&mut init, OP_FINDPROPSTRICT, spec.super_mn);
+        op1(&mut init, OP_GETPROPERTY, spec.super_mn);
         init.push(OP_DUP);
         init.push(OP_PUSHSCOPE);
         op1(&mut init, OP_NEWCLASS, classi);

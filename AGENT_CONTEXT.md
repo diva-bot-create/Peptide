@@ -218,13 +218,24 @@ is a hard requirement of the player or the game, not a style preference:
 | one class per script, not all classes in one script | shared bases (the asset/stage bases) already exist in the game. a script initialiser that trips over an existing name stops there, taking every later class in that script with it -- including `Main` |
 | a `Main` class whose constructor registers `id` | the package has no identity, so nothing can ask for it no matter how correct the geometry is |
 | a stage class constructed WITH one argument, passed to `super` | a 0-argument version is rejected when the stage is built |
+| symbol 0 bound to `Main` | the loaded content is an anonymous clip, not a package. the game finds nothing that answers to the package API and rejects it |
+| the api layer (`register` / `getProp` / `initAPI` / `getAPIVersion`) carried BY the package | a package ships its own copy in the top-level namespace, so the game's same-named classes never stand in. an empty stub means the package throws while saying what it is |
+| every class reference LATE bound (`findpropstrict` + `getproperty`, not `getlex`) | naming a class directly binds it at verify time, before its own script has run. the player rejects the whole method rather than reporting a missing name |
 | an entry in the game's own resource manifest | the file is simply never opened. no error is raised, because nothing tried |
 
-the last row is the one that cannot be satisfied by authoring alone. the id-to-file map is not
+the manifest row is the one that cannot be satisfied by authoring alone. the id-to-file map is not
 derived from the files: it is an obfuscated JSON manifest embedded in the game, and a package the
-manifest does not list is invisible however well formed it is. adding one means patching that
-manifest, which is why a from-scratch package needs a patched game and not just a new file in the
-data directory.
+manifest does not list is invisible however well formed it is. `inject_extra_resource` sidesteps it: the game already
+registers one package by hand, ahead of the manifest-driven ones, so peptide prepends another in
+that same shape at the menu entry point. no manifest is rewritten and no shipped file is touched,
+and a package with an entry is asked for by id like any other. WHERE that runs is load-bearing:
+the table's own initialiser runs while the table is still null, and the queue call is verified
+before the definitions it names have run, so both of those homes take the resource system down.
+
+a package the player refuses hard is not a script error and will not reach the `SCRIPTERR`
+channel: the process ends, with no report and no crash log. so a boot that reaches READY and then
+drops the connection the moment an id is requested means the package was rejected below the script
+layer, and the thing to check is the SWF itself rather than anything it does.
 
 none of these announce themselves. that is what `inject_load_error_reporter` is for: it hooks both
 of the loader's error paths so a package that fails names itself and its error over the

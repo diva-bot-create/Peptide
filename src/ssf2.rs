@@ -331,11 +331,22 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         ssf2_converter::abc_inject::inject_error_reporter(abc, SSF2_DOC_CLASS)?;
         // and the load-time half: a package the engine refuses names itself instead of
         // failing silently, which is the only signal a custom-content author ever gets
-        ssf2_converter::abc_inject::inject_load_error_reporter(abc)
+        ssf2_converter::abc_inject::inject_load_error_reporter(abc)?;
+        // make the physics fixture askable by id. the engine's id-to-file map comes from a
+        // manifest it carries, so a package outside that manifest is never opened; this adds
+        // the one entry without rewriting the manifest or touching any shipped data file.
+        ssf2_converter::abc_inject::inject_extra_resource(
+            abc, ssf2_converter::test_fixture::FIXTURE_ID, FIXTURE_DAT_FILE,
+            ssf2_converter::test_fixture::FIXTURE_GUID,
+            ssf2_converter::abc_inject::SSF2_RESOURCE_TYPE_STAGE)
     })?;
     macos_resign(&dst_app);
     Ok(dst_app)
 }
+
+/// The data-directory name the fixture package is installed under. Deliberately far above the
+/// shipped numbering so it can never collide with a future one.
+pub const FIXTURE_DAT_FILE: &str = "DAT9000.ssf";
 
 /// `peptide ssf2 selftest` — install, boot, confirm injected code executed
 /// (the marker file appears). Proves the code-execution bridge end-to-end.

@@ -54,6 +54,7 @@ const OP_PUSHSHORT: u8 = 0x25;
 /// to guard MovieClip-only / container-only properties in the NODE verb — reading
 /// `currentFrame` off a Bitmap throws (display classes are sealed), which would abort the
 /// whole command through the dispatcher's try and answer "ERR:" for an otherwise fine node.
+const OP_ISTYPE: u8 = 0xB2;
 const OP_ISTYPELATE: u8 = 0xB3;
 const OP_IFGE: u8 = 0x18;
 
@@ -76,8 +77,15 @@ pub const SSF2_NS_ENUMS: &str = "com.mcleodgaming.ssf2.enums";   // Mode
 /// Both are hooked so a package that fails names itself instead of vanishing.
 pub const PEPTIDE_LOAD_LOG: &str = "peptideLoadLog";
 pub const SSF2_RESOURCE_CLASS: &str = "Resource";
-pub const SSF2_RESOURCE_FILE_FIELD: &str = "m_fileName";
+pub const SSF2_RESOURCE_FILE_FIELD: &str = "CurrentFileName";
 pub const SSF2_RESOURCE_ERROR_METHODS: [&str; 2] = ["initialLoadError", "loadError"];
+
+/// Where an extra package is registered from, and the table that doubles as its one-shot guard.
+pub const SSF2_MENU_ENTRY_METHOD: &str = "showInitialMenu";
+pub const SSF2_RESOURCE_POOL: &str = "poolHash";
+
+/// The engine's resource-type values, as declared on its own resource class.
+pub const SSF2_RESOURCE_TYPE_STAGE: u8 = 2;
 
 /// A tiny opcode emitter with the AVM2 u30 var-encoding + label/branch fixups.
 #[derive(Default)]
@@ -2190,6 +2198,7 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, char_index: u
     let mn_sock = q(abc, pub_ns, "peptideSock");
     let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
     let mn_flush = q(abc, pub_ns, "flush");
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
     let mn_rec = q(abc, pub_ns, "peptideFrameRec");
     let n_rec = abc.intern_string("peptideFrameRec");
     let pub_nsset = abc.intern_ns_set(vec![pub_ns]);
@@ -2205,6 +2214,20 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, char_index: u
     c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
     // if (this.peptideSock == null) return;  — not connected yet, nobody to push to
     c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
+
+    // Before anything else: flush whatever the error reporters buffered. They cannot write when
+    // they fire, because the failures worth reading happen during the boot while the link is
+    // still coming up, and on a fast boot the menu path that would otherwise drain them never
+    // runs. This has to sit ahead of the recorder's own guards -- those wait for a live match,
+    // and a boot that died never gets one, which is exactly when the report is needed.
+    let l_nolog = c.new_label();
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.branch(OP_IFFALSE, l_nolog);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_nolog);
     // sd = GameController.stageData; if (sd == null) return;
     c.op_u30(OP_GETLEX, mn_gc); c.op_u30(OP_GETPROPERTY, mn_stagedata); c.op_u30(OP_SETLOCAL, l_sd);
     c.op_u30(OP_GETLOCAL, l_sd); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
@@ -2228,6 +2251,7 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, char_index: u
     c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
     c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
     c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+
     c.place(l_skip);
     c.op(OP_RETURNVOID);
 
@@ -2283,26 +2307,67 @@ pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Re
     let mn_loaderinfo = q(abc, pub_ns, "loaderInfo");
     let mn_ueevents = q(abc, pub_ns, "uncaughtErrorEvents");
     let mn_addel = q(abc, pub_ns, "addEventListener");
+    // `text` is only populated when what was thrown is an error EVENT; a thrown Error object
+    // leaves it empty, which is the common case and reports as a bare tag with nothing after it.
+    // The thrown object itself stringifies to the message and code, so report that and keep `text`
+    // as the suffix for the cases where it is the one carrying detail.
     let mn_text = q(abc, pub_ns, "text");
-    let mn_sock = q(abc, pub_ns, "peptideSock");
-    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
-    let mn_flush = q(abc, pub_ns, "flush");
+    let mn_errobj = q(abc, pub_ns, "error");
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let s_blank3 = abc.intern_string("");
     let mn_h = q(abc, pub_ns, "peptideOnError");
     let n_h = abc.intern_string("peptideOnError");
     let s_tag = abc.intern_string("SCRIPTERR: ");
+    let s_sep2 = abc.intern_string(" | ");
+    let s_at = abc.intern_string(" @ ");
+    let s_blank2 = abc.intern_string("(no trace)");
+    let mn_stack = q(abc, pub_ns, "getStackTrace");
+    let mn_error_cls = q(abc, pub_ns, "Error");
     let s_nl = abc.intern_string("\n");
 
     // handler(e): if (peptideSock != null) peptideSock.writeUTFBytes("SCRIPTERR: " + e.text + "\n")
     let mut c = Code::default();
     let l_skip = c.new_label();
     c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
-    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
-    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock);
-    c.op_u30(OP_PUSHSTRING, s_tag);
+    // Buffered, not written. An error raised before the link is up would otherwise be lost, and
+    // those are the ones worth having: a boot that dies takes its own explanation with it. The
+    // per-frame recorder sends whatever has accumulated as soon as the socket can carry it.
+    c.op(OP_GETLOCAL0);
+    let l_have = c.new_label();
+    let l_joined = c.new_label();
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+    c.branch(OP_IFTRUE, l_have);
+    c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank3);
+    c.branch(OP_JUMP, l_joined);
+    c.place(l_have);
+    c.op(OP_CONVERT_S);
+    c.place(l_joined);
+    c.op_u30(OP_PUSHSTRING, s_tag); c.op(OP_ADD);
+    c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_errobj); c.op(OP_CONVERT_S); c.op(OP_ADD);
+    c.op_u30(OP_PUSHSTRING, s_sep2); c.op(OP_ADD);
     c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_text); c.op(OP_CONVERT_S); c.op(OP_ADD);
+
+    // Then WHERE it came from. A bare message says a script broke without saying which one, which
+    // for converted content is most of the question: an author needs the file and line, not just
+    // "TypeError". The thrown object carries its own trace, so ask it for one -- guarded by a type
+    // check, because anything at all can be thrown and calling a method on the wrong thing inside
+    // an error handler would lose the report we are in the middle of writing. Builds that carry no
+    // debug information answer with nothing, and the line is simply the message again.
+    let l_nostack = c.new_label();
+    let l_stack = c.new_label();
+    c.op_u30(OP_PUSHSTRING, s_at); c.op(OP_ADD);
+    c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_errobj);
+    c.op(OP_DUP); c.op_u30(OP_ISTYPE, mn_error_cls);
+    c.branch(OP_IFFALSE, l_nostack);
+    c.op_u30_u30(OP_CALLPROPERTY, mn_stack, 0); c.op(OP_CONVERT_S);
+    c.branch(OP_JUMP, l_stack);
+    c.place(l_nostack);
+    c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank2);
+    c.place(l_stack);
+    c.op(OP_ADD);
+
     c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
-    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
-    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    c.op_u30(OP_SETPROPERTY, mn_loadlog);
     c.place(l_skip);
     c.op(OP_RETURNVOID);
 
@@ -2355,6 +2420,10 @@ pub fn inject_load_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
     let mn_main = q(abc, pub_ns, "Main");
     let mn_root = q(abc, pub_ns, "ROOT");
     let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
     let mn_file = q(abc, pub_ns, SSF2_RESOURCE_FILE_FIELD);
     let s_tag = abc.intern_string("SCRIPTERR: package load failed: ");
     let s_sep = abc.intern_string(": ");
@@ -2402,6 +2471,21 @@ pub fn inject_load_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
         c.op_u30(OP_GETLOCAL, 1); c.op(OP_CONVERT_S); c.op(OP_ADD);
         c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
         c.op_u30(OP_SETPROPERTY, mn_loadlog);
+
+        // Then send it NOW if the link is already up, rather than leaving it for the next frame.
+        // A package failing its FIRST load ends the boot: the game stops, and a report waiting on
+        // a frame that never arrives is a report nobody reads. Buffering still covers the earlier
+        // failures, when there is no link yet; this covers the ones that are about to be fatal.
+        let l_sent = c.new_label();
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_sent);
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+        c.branch(OP_IFFALSE, l_sent);
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+        c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+        root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+        c.place(l_sent);
         c.place(l_skip);
 
         let payload = c.finish();
@@ -2410,6 +2494,94 @@ pub fn inject_load_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
         body.max_stack = body.max_stack.max(6);
         body.local_count = body.local_count.max(2);
     }
+    Ok(())
+}
+
+/// Register one extra package with the engine at boot, so it can be asked for by id.
+///
+/// The id-to-file map is not built from the data directory. It comes from an obfuscated manifest
+/// carried inside the engine, which means a package the manifest does not list is never opened --
+/// no error, because nothing tried. That is a wall for anyone adding content: the file can be
+/// perfectly well formed and still be invisible.
+///
+/// The engine already registers one package by hand, ahead of the manifest-driven ones, so a
+/// hand-registered entry is a shape it fully supports rather than something forced on it. This
+/// prepends another in exactly that shape. Nothing existing is touched: no manifest is rewritten
+/// and no shipped data file is modified, so the only difference from stock is one additional entry
+/// in the pool.
+///
+/// `kind` names the resource-type constant (`"STAGE"`, `"CHARACTER"`, ...). `file` is the name as
+/// it appears in the data directory.
+pub fn inject_extra_resource(abc: &mut Abc, id: &str, file: &str, guid: &str, kind: u8)
+    -> anyhow::Result<()>
+{
+    let util_ns = { let s = abc.intern_string(SSF2_NS_UTIL); abc.intern_namespace(NS_PACKAGE, s) };
+    let ctrl_ns = { let s = abc.intern_string(SSF2_NS_CONTROLLERS); abc.intern_namespace(NS_PACKAGE, s) };
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_rm = q(abc, util_ns, "ResourceManager");
+    let mn_res = q(abc, util_ns, SSF2_RESOURCE_CLASS);
+    let mn_add = q(abc, pub_ns, "addResource");
+    let mn_pool = q(abc, pub_ns, SSF2_RESOURCE_POOL);
+    let key_nsset = abc.intern_ns_set(vec![pub_ns]);
+    let mn_key = abc.intern_multinamel(key_nsset);   // pool[<runtime key>]
+    let s_id = abc.intern_string(id);
+    let s_file = abc.intern_string(file);
+    let s_guid = abc.intern_string(guid);
+
+    // Hooked on the menu entry point, which is where the boot decides what to load. That timing is
+    // the whole point: the table already exists by then, and this runs immediately before anything
+    // is queued, so the entry is in place the first time the id is asked for.
+    //
+    // Two earlier homes both failed, in opposite ways, and the difference is worth keeping: the
+    // table's own initialiser runs while the table is still null, and the queue call is verified
+    // before the definitions it names have run, which the player rejects outright. This method is
+    // verified with the same lookups the fast-boot rewrite already uses, so it is known good.
+    let ci = abc.find_class_by_name("MenuController")
+        .ok_or_else(|| anyhow::anyhow!("MenuController not found"))?;
+    let method = abc.classes[ci].traits.iter().find_map(|t| match t.data {
+        TraitKindData::Method { method, .. }
+            if abc.multiname_local(t.name).as_deref() == Some(SSF2_MENU_ENTRY_METHOD) => Some(method),
+        _ => None,
+    }).ok_or_else(|| anyhow::anyhow!("MenuController.{SSF2_MENU_ENTRY_METHOD} not found"))?;
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for {SSF2_MENU_ENTRY_METHOD}"))?;
+    let _ = ctrl_ns;
+
+    // if (pool[<id>] != null) skip;   -- the table doubles as the one-shot guard, so this needs no
+    //                                    state of its own however often the entry point runs
+    // ResourceManager.addResource(new Resource(id, file, file, guid, <kind>));
+    //
+    // The two filename arguments are the plain and obfuscated names. Passing the same value for
+    // both means the entry resolves to the same file whichever naming a build reads.
+    let mut c = Code::default();
+    let l_skip = c.new_label();
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    // if (pool == null) skip -- indexing a table that has not been built yet throws, and a throw
+    // here escapes into the boot and stops it, which looks exactly like the package being at fault
+    c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_GETPROPERTY, mn_pool);
+    c.branch(OP_IFFALSE, l_skip);
+    c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_GETPROPERTY, mn_pool);
+    c.op_u30(OP_PUSHSTRING, s_id); c.op_u30(OP_GETPROPERTY, mn_key);
+    c.branch(OP_IFTRUE, l_skip);
+
+    c.op_u30(OP_GETLEX, mn_rm);
+    c.op_u30(OP_FINDPROPSTRICT, mn_res);
+    c.op_u30(OP_PUSHSTRING, s_id);
+    c.op_u30(OP_PUSHSTRING, s_file);
+    c.op_u30(OP_PUSHSTRING, s_file);
+    c.op_u30(OP_PUSHSTRING, s_guid);
+    c.op(OP_PUSHBYTE); c.op(kind);
+    c.op_u30_u30(OP_CONSTRUCTPROP, mn_res, 5);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_add, 1);
+    c.place(l_skip);
+    c.op(OP_POPSCOPE);
+
+    let payload = c.finish();
+    let body = &mut abc.bodies[body_idx];
+    prepend_code(body, &payload);
+    body.max_stack = body.max_stack.max(9);
+    body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
     Ok(())
 }
 
