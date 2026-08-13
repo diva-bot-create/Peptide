@@ -6,6 +6,7 @@ use ssf2_converter::{classify_ssf, AssetKind};
 mod common;
 
 #[test]
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
 fn battlefield_classifies_as_stage() {
     // corpus stages live under <corpus>/stages/<id>.ssf (copied by `peptide ssf2 identify`).
     let bf = common::ssfs_dir().join("stages").join("battlefield.ssf");
@@ -21,6 +22,7 @@ fn battlefield_classifies_as_stage() {
 }
 
 #[test]
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
 fn a_character_does_not_classify_as_stage() {
     // any named character .ssf in the corpus root must be a Character, never a Stage.
     let dir = common::ssfs_dir();

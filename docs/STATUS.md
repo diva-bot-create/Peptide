@@ -118,9 +118,14 @@ dimensions below are the rest.
 ## open parity dimensions
 
 - **frame data (active-frame range).** startup/active/recovery lives in the `.entity`
-  collision-box keyframes and animation lengths, not in `HitboxStats.hx`. we check per-char
-  coverage (it's what caught the empty shells), but an exact active-frame comparison against
-  SSF2 (×2 for the 30→60 fps bump) is its own fiddly harness pass.
+  collision-box keyframes and animation lengths, not in `HitboxStats.hx`.
+  **animation LENGTHS are now checked**: `tools/tests/timing_parity.py` verifies the
+  30→60fps doubling for every emitted animation against the source range the splitter
+  sliced it from (mario: 164 animations, 0 off 2.00x). what's still open is the
+  COLLISION-BOX active range within each animation, which is the part that decides
+  startup/active/recovery. the live half is the `record`/`trace` frame recorder (both
+  engines push per-frame telemetry); it confirms the emitted lengths actually play that
+  way, on a sample rather than the whole roster.
 - **special-angle sentinels.** SSF2 sentinel angles (`-1`/`-2`/`-3`…) are preserved
   faithfully, we just haven't mapped them to FM's special-angle codes yet. needs the
   SSF2-sentinel → FM-angle table.
@@ -357,6 +362,30 @@ before treating one as a gap.
 ## known issues & gaps
 
 the live list of open converter issues. strike an entry when you fix it.
+
+- **fraymakers exposes no blend modes; ssf2 blends ship as a SOLVED alpha overlay.** an ssf2
+  placement drawn with a flash blend mode (bowserscastle's `bowsers_lightmask` uses HardLight)
+  can't be reproduced at runtime: the renderer underneath has `blendMode` on every display object,
+  but a mod only ever gets a `ContainerApi`, whose whole surface is addChild/addChildAt/removeChild
+  plus state, and the scripting api's entire visual vocabulary is scale, alpha and visibility. no
+  setBlendMode, setTint, setFilter or setShader exists anywhere in `pxf.api.*`. reaching the field
+  needs engine injection, which is fine for peptide's own testing and useless for a converted
+  stage, since that stage runs on the stock engine.
+  so the converter SOLVES the blend against the art beneath it and emits the result as an ordinary
+  alpha overlay in the foreground, above the character containers (`fit_blend_overlay` in
+  `stage_parser.rs`): per pixel it picks `C = HardLight(base, mask)` at the mask's own alpha, which
+  reproduces the static art exactly AND still tints whatever moves underneath. baking into the art
+  is the fallback when there's nothing to solve against; it's equally exact but tints only what
+  was baked, which is wrong for the layer fighters run around inside.
+  two gotchas worth keeping: the overlay must ship at FULL layer alpha (the authored foreground
+  sheet wants ~0.5, and halving a solved overlay halves the blend itself), and a blended placement
+  must not be split into its own per-element layer.
+  remaining gap, structural: a chromatic mask can't be matched exactly on MOVING art. normal
+  blending gives `out_c = b_c(1-a) + C_c*a`, so the slope is shared across channels and only the
+  offset is per-channel, while HardLight needs a per-channel slope. a greyscale mask IS exactly
+  expressible (black at `1-2t` + white at `2t-1`); `mask_chroma` reports which case a stage is in.
+  quantifying the residue against ssf2 needs camera-matched shots, since `shot` captures the
+  display root and the two engines' frames are currently different views.
 
 - **shape-only menu portraits.** a few characters (`donkeykong`, `fox`, `marth`) have
   `*_head` portraits built entirely from shapes instead of a bitmap. the head finder grabs

@@ -52,7 +52,7 @@ impl Mat {
 }
 
 /// An axis-aligned box in FM stage coordinates (x/y = top-left, w/h = size).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Rect { pub x: f64, pub y: f64, pub w: f64, pub h: f64 }
 impl Rect {
     pub fn left(&self) -> f64 { self.x }
@@ -62,7 +62,8 @@ impl Rect {
 }
 
 /// A collision platform (the main floor or a soft platform).
-#[derive(Clone, Debug)]
+// Default so a stage can be built from scratch in the emitter tests (see StageModel).
+#[derive(Clone, Debug, Default)]
 pub struct Platform {
     /// World AABB in FM coords.
     pub rect: Rect,
@@ -199,7 +200,12 @@ pub struct SpawnPoint {
 }
 
 /// The parsed SSF2 stage geometry, in FM stage coordinates.
-#[derive(Clone, Debug)]
+///
+/// `Default` exists so a stage can be built from scratch — the emitter tests construct one
+/// directly instead of parsing a real SSF2 file, which keeps official content out of the
+/// default test gate. `scale` defaults to 0.0 under `Default`, so a synthetic model must set
+/// it to a real multiplier (the parser always does).
+#[derive(Clone, Debug, Default)]
 pub struct StageModel {
     /// Content id (from `Main.id`, fallback file stem). The emitter may suffix this
     /// (`<id>ssf2`) so it can't shadow a built-in stage; `display_name` stays clean.
@@ -276,11 +282,26 @@ pub struct StageArtSet {
     /// semi-transparent overlay (bowserscastle's shimmering lava-glow sheet + lightmask tint). One
     /// frame = static, more = the emitter loops it. Empty = no foreground.
     pub foreground: Vec<StageArt>,
+    /// The SAME foreground plane as [`Self::foreground`], but split into per-element layers the way
+    /// [`Self::background`] is, so each object keeps its OWN loop instead of being frozen into one
+    /// composite. Populated whenever the grouping finds elements; the flat `foreground` is then
+    /// left empty so the two can't both draw. The plane is one image only as a fallback.
+    pub foreground_elements: Vec<BgLayer>,
     /// OPAQUE foreground occluders that draw in front of the fighter but BEHIND the semi-transparent
     /// `foreground` tint: the near face of a standable structure SSF2 split off as a separate piece
     /// (bowscastle's bridge parapet) so a fighter standing on the deck is occluded from the front.
     /// Rendered at full alpha (a translucent occluder would show the fighter through solid brick).
     pub foreground_occluders: Vec<StageArt>,
+    /// The foreground plane's own opacity, as authored: the product of the colour-transform alpha
+    /// multipliers on the SSF2 placement chain (a translucent plane is made by setting alpha on a
+    /// PARENT movieclip). Read from the source per stage; it is NOT a fixed convention, so the
+    /// emitter must use this rather than assume a value.
+    pub foreground_alpha: f64,
+    /// `true` when [`Self::foreground`] holds a SOLVED blend overlay rather than ordinary
+    /// semi-transparent foreground art. Such an overlay already carries the exact per-pixel alpha
+    /// the blend needs, so the emitter must ship it at full layer alpha — halving it (the ~0.5 the
+    /// authored foreground sheet wants) halves the blend itself and the tint reads as missing.
+    pub foreground_is_blend_overlay: bool,
 }
 
 impl StageArtSet {
@@ -323,6 +344,23 @@ pub struct ParallaxLayer {
 pub struct BgLayer {
     pub name: String,
     pub frames: Vec<StageArt>,
+    /// The element's label-delimited segments, when its clip's timeline is a state machine rather
+    /// than one loop. Empty for an ordinary looping element, which is the common case. When this is
+    /// populated the emitter must NOT play `frames` end to end: only the reachable segments are ever
+    /// shown in SSF2, and they are chained by [`BgSegment::next`], not by running off the end.
+    pub segments: Vec<BgSegment>,
+}
+
+/// One label-delimited stretch of a backdrop element's own timeline.
+#[derive(Clone, Debug)]
+pub struct BgSegment {
+    /// The SSF2 frame label naming this segment (`idle`, `wait`, `lose`).
+    pub label: String,
+    /// Its rasterized frames, in order, at SSF2 (30fps) rate.
+    pub frames: Vec<StageArt>,
+    /// What the timeline does when the segment ends. `None` = nothing scripted, so playback simply
+    /// runs on into the next segment (the last segment wrapping to the first).
+    pub next: Option<crate::abc_parser::LabelJump>,
 }
 
 /// A composited stage-art image ready to drop in as an IMAGE layer / parallax bg.
@@ -402,6 +440,15 @@ struct Instance {
     /// grouping splits them into independent elements that each loop on their OWN period (a
     /// merged capture cuts every child whose cycle doesn't divide the parent's).
     inst_path: u64,
+    /// Sprite definition id of the clip that named this leaf (the one supplying [`Self::sym_name`]).
+    /// The element's own timeline lives there, so it's what carries the frame LABELS: a clip whose
+    /// labels split it into segments is a state machine, not a loop, and must not be played end to
+    /// end. `None` for leaves with no named clip ancestor.
+    inst_clip: Option<u16>,
+    /// Product of the colour-transform alpha multipliers down this leaf's placement chain. SSF2
+    /// authors a translucent plane by setting alpha on a PARENT movieclip, so the value belongs to
+    /// the source, not to the plane: it varies per stage and must never be assumed.
+    alpha: f64,
 }
 
 /// Parse the SSF2 stage at `path` into a [`StageModel`], rendering its art (read-only).
@@ -480,6 +527,29 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
         if let swf::Tag::DefineShape(s) = tag { shape_defs.insert(s.id, s); }
     }
     // debug (`PEPTIDE_DUMP_SHAPE=<ids>`): a shape's bounds + fill styles, gradients in full.
+    if let Ok(ids) = std::env::var("PEPTIDE_PATH_DUMP") {
+        for id in ids.split(',').filter_map(|x| x.trim().parse::<u16>().ok()) {
+            let Some(sh) = shape_defs.get(&id) else { continue };
+            let (mut moves, mut edges, mut styles) = (0, 0, 0);
+            let mut xs: Vec<f64> = Vec::new();
+            let (mut cx, mut cy) = (0.0f64, 0.0f64);
+            for r in &sh.shape {
+                match r {
+                    swf::ShapeRecord::StyleChange(sc) => {
+                        styles += 1;
+                        if let Some(mv) = sc.move_to { moves += 1; cx = mv.x.get() as f64; cy = mv.y.get() as f64; xs.push(cx / 20.0); }
+                        let _ = cy;
+                    }
+                    swf::ShapeRecord::StraightEdge { delta } => { edges += 1; cx += delta.dx.get() as f64; xs.push(cx / 20.0); }
+                    swf::ShapeRecord::CurvedEdge { control_delta, anchor_delta } => {
+                        edges += 1; cx += control_delta.dx.get() as f64 + anchor_delta.dx.get() as f64; xs.push(cx / 20.0);
+                    }
+                }
+            }
+            let (mn, mx) = (xs.iter().cloned().fold(f64::MAX, f64::min), xs.iter().cloned().fold(f64::MIN, f64::max));
+            eprintln!("[path] shape {id}: {styles} style-changes ({moves} moveTo), {edges} edges, x span {mn:.0}..{mx:.0}px");
+        }
+    }
     if let Ok(ids) = std::env::var("PEPTIDE_DUMP_SHAPE") {
         for id in ids.split(',').filter_map(|x| x.trim().parse::<u16>().ok()) {
             let Some(sh) = shape_defs.get(&id) else { continue };
@@ -508,21 +578,60 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
     // backgrounds are usually bitmaps, which `vector_raster` can't fill). Only decoded
     // when rendering art (decoding every stage's bitmaps is the slow part).
     let mut bitmaps: BTreeMap<u16, (u32, u32, Vec<u8>)> = BTreeMap::new();
+    let mut unsupported_bitmaps: Vec<(u16, &str, String)> = Vec::new();
     if render_art_flag {
         for tag in &swf.tags {
             match tag {
                 swf::Tag::DefineBitsLossless(b) => {
-                    if let Ok(rgba) = crate::image_extractor::decode_lossless(b) {
-                        bitmaps.insert(b.id, (b.width as u32, b.height as u32, rgba));
+                    match crate::image_extractor::decode_lossless(b) {
+                        Ok(rgba) => { bitmaps.insert(b.id, (b.width as u32, b.height as u32, rgba)); }
+                        // a decode that fails silently is art that vanishes: the shape filled with
+                        // it rasterises empty and the object is simply absent from the stage.
+                        Err(e) => unsupported_bitmaps.push((b.id, "DefineBitsLossless", e.to_string())),
                     }
                 }
                 swf::Tag::DefineBitsJpeg3(j) => {
-                    if let Ok((w, h, rgba)) = crate::image_extractor::decode_jpeg3(j) {
-                        bitmaps.insert(j.id, (w, h, rgba));
+                    match crate::image_extractor::decode_jpeg3(j) {
+                        Ok((w, h, rgba)) => { bitmaps.insert(j.id, (w, h, rgba)); }
+                        Err(e) => unsupported_bitmaps.push((j.id, "DefineBitsJpeg3", e.to_string())),
                     }
                 }
+                // Any other bitmap-defining tag is art we CANNOT render: the shape that uses it
+                // rasterises to an empty image and the object silently disappears from the stage
+                // (bowserscastle's front chandeliers came out as a blank 807x113 sheet this way).
+                // Name them rather than dropping them quietly.
+                swf::Tag::DefineBitsJpeg2 { id, .. } =>
+                    unsupported_bitmaps.push((*id, "DefineBitsJpeg2", "tag not handled".into())),
+                swf::Tag::DefineBits { id, .. } =>
+                    unsupported_bitmaps.push((*id, "DefineBits", "tag not handled".into())),
                 _ => {}
             }
+        }
+    }
+    if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok() {
+        let want = std::env::var("PEPTIDE_BMP_STATS").unwrap_or_default();
+        for (id, (w, h, rgba)) in &bitmaps {
+            if !want.split(',').any(|x| x.trim().parse::<u16>() == Ok(*id)) { continue; }
+            let n = rgba.len() / 4;
+            let opaque = (0..n).filter(|i| rgba[i * 4 + 3] > 8).count();
+            eprintln!("[bmp-stat] bitmap {id}: {w}x{h} non-transparent={:.1}%",
+                100.0 * opaque as f64 / n.max(1) as f64);
+        }
+    }
+    if let Ok(want) = std::env::var("PEPTIDE_BMP_DUMP") {
+        for (id, (w, h, rgba)) in &bitmaps {
+            if !want.split(',').any(|x| x.trim().parse::<u16>() == Ok(*id)) { continue; }
+            if let Some(img) = image::RgbaImage::from_raw(*w, *h, rgba.clone()) {
+                let _ = img.save(format!("/tmp/bmp{id}.png"));
+                eprintln!("[bmp-dump] wrote /tmp/bmp{id}.png ({w}x{h})");
+            }
+        }
+    }
+    if !unsupported_bitmaps.is_empty() {
+        log::warn!("stage art: {} bitmap(s) use a tag this build can't decode {:?} — every shape \
+            filled with one renders EMPTY", unsupported_bitmaps.len(), unsupported_bitmaps);
+        if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok() {
+            eprintln!("[bmp-skip] undecodable: {unsupported_bitmaps:?}");
         }
     }
 
@@ -843,8 +952,14 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
     // hazard floors (a standable molten lake) never anchor, however wide.
     let main_floor_y = platforms.iter().filter(|p| !p.drop_through && !p.hazard_floor)
         .max_by(|a, b| a.rect.w.total_cmp(&b.rect.w)).map(|p| p.rect.y);
+    // the timeline classes, for the frame-script jumps that chain a segmented clip's labels.
+    let art_abcs: Vec<crate::abc_parser::AbcFile> = if render_art_flag {
+        crate::swf_parser::parse(&swf_data)
+            .map(|s| s.abc_blocks.iter().filter_map(|b| crate::abc_parser::parse(b).ok()).collect())
+            .unwrap_or_default()
+    } else { Vec::new() };
     let art = if render_art_flag {
-        render_art_layers(&swf.tags, &sprites, &sym_names, &shape_defs, &bitmaps, ox, oy, scale, keep_foreground, &planes, main_floor_y)
+        render_art_layers(&swf.tags, &sprites, &sym_names, &shape_defs, &bitmaps, ox, oy, scale, keep_foreground, &planes, main_floor_y, &art_abcs)
     } else {
         StageArtSet::default()
     };
@@ -1171,7 +1286,7 @@ fn clip_attack_boxes(
     ) {
         if depth > 3 { return; }
         for frame in build_frames(tags) {
-            for (id, local, name, _, _, _) in &frame {
+            for (id, local, name, _, _, _, _) in &frame {
                 let m = mat.mul(local);
                 let is_box = name.as_deref() == Some("attackBox")
                     || sym_names.get(id).is_some_and(|s| {
@@ -1182,7 +1297,7 @@ fn clip_attack_boxes(
                     // the box sprite's inner shape, through its own placement matrix.
                     if let Some(btags) = sprites.get(id) {
                         for inner in build_frames(btags) {
-                            for (sid, smat, _, _, _, _) in &inner {
+                            for (sid, smat, _, _, _, _, _) in &inner {
                                 if let Some((x0, y0, x1, y1)) = shape_bounds.get(sid) {
                                     let mm = m.mul(smat);
                                     let c = [mm.apply(*x0, *y0), mm.apply(*x1, *y0), mm.apply(*x1, *y1), mm.apply(*x0, *y1)];
@@ -1342,7 +1457,11 @@ fn union_rect(a: &Rect, b: &Rect) -> Rect {
 /// (character id, local matrix, instance name, graphic frame, placement depth). The depth is the
 /// SWF display-list slot — stable per child across frames, so it discriminates same-anchor
 /// siblings (a clip whose children all sit at the clip origin, like a multi-emitter bubble set).
-type PlacedChild = (u16, Mat, Option<String>, Option<u16>, u16, Option<swf::BlendMode>);
+/// A placed child: `(id, matrix, name, pinned-frame, depth, blend, alpha)`. `alpha` is the
+/// placement's own colour-transform alpha multiplier (1.0 when it has none) — SSF2 authors a
+/// translucent plane by setting alpha on the PARENT movieclip, so it has to be read from the
+/// source and carried down rather than assumed.
+type PlacedChild = (u16, Mat, Option<String>, Option<u16>, u16, Option<swf::BlendMode>, f64);
 
 /// instance/symbol name -> AS3-assigned render plane (from `stage_abc::extract_stage`). empty when
 /// the stage has no parseable SSF2Stage subclass, in which case `plane_tag` falls back to heuristics.
@@ -1379,7 +1498,14 @@ fn build_frames(tags: &[swf::Tag]) -> Vec<Vec<PlacedChild>> {
                     // ratio selects (Flash's "Single Frame" setting); carried like the matrix.
                     let pinned = po.ratio.or_else(|| prev.and_then(|e| e.3));
                     let blend = po.blend_mode.or_else(|| prev.and_then(|e| e.5));
-                    depth.insert(po.depth, (*id, mat, name, pinned, po.depth, blend));
+                    let alpha = po.color_transform
+                        .map(|ct| {
+                            let m = f32::from(ct.a_multiply) as f64;
+                            (m + f32::from(ct.a_add) as f64 / 255.0).clamp(0.0, 1.0)
+                        })
+                        .or_else(|| prev.map(|e| e.6))
+                        .unwrap_or(1.0);
+                    depth.insert(po.depth, (*id, mat, name, pinned, po.depth, blend, alpha));
                 }
                 swf::PlaceObjectAction::Modify => {
                     if let Some(e) = depth.get_mut(&po.depth) {
@@ -1406,7 +1532,7 @@ fn collect_clip_positions(
     sprite_frames: &BTreeMap<u16, Vec<Vec<PlacedChild>>>, out: &mut Vec<(i64, i64)>,
 ) {
     if out.len() > 100_000 { return; }
-    for (id, local, _, _, _, _) in children {
+    for (id, local, _, _, _, _, _) in children {
         let world = parent.mul(local);
         if let Some(frames) = sprite_frames.get(id) {
             out.push((world.tx.round() as i64, world.ty.round() as i64));
@@ -1425,10 +1551,11 @@ fn walk_frame(
     sym_names: &BTreeMap<u16, String>, shape_defs: &BTreeMap<u16, &swf::Shape>,
     sprite_frames: &BTreeMap<u16, Vec<Vec<PlacedChild>>>, out: &mut Vec<Instance>, rec: usize,
     inst_anchor: (f64, f64), inst_path: u64, blend: Option<swf::BlendMode>,
-    phase_rank: &std::collections::HashMap<(i64, i64), usize>,
+    phase_rank: &std::collections::HashMap<(i64, i64), usize>, inst_clip: Option<u16>,
+    alpha: f64,
 ) {
     if rec > 8 { return; }
-    for (id, local, name, pinned, pdepth, pblend) in children {
+    for (id, local, name, pinned, pdepth, pblend, palpha) in children {
         let world = parent.mul(local);
         let sym = sym_names.get(id).cloned().unwrap_or_default();
         // an instance establishes a plane for its subtree: the stage's AS3 plane map (authoritative)
@@ -1452,6 +1579,8 @@ fn walk_frame(
                 inst_anchor,
                 inst_path,
                 blend: pblend.or(blend),
+                inst_clip,
+                alpha: alpha * palpha,
             });
         }
         if let Some(frames) = sprite_frames.get(id) {
@@ -1474,15 +1603,388 @@ fn walk_frame(
             // and their per-frame leans cancel (the row reads as still). see `phase_rank` above.
             let rank = phase_rank.get(&(world.tx.round() as i64, world.ty.round() as i64)).copied().unwrap_or(0);
             let phase = ((rank as f64 * 0.618_033_988_75).fract() * frames.len() as f64) as usize;
-            // a graphic-pinned placement shows the frame its ratio SELECTS (Flash's Single Frame
-            // choice), always — it never self-animates.
-            let f = match pinned {
-                Some(r) => &frames[*r as usize % frames.len()],
-                None => &frames[(global_frame + phase) % frames.len()],
-            };
-            walk_frame(f, world, global_frame, next.as_deref(), my_plane, planes, sym_names, shape_defs, sprite_frames, out, rec + 1, child_anchor, child_path, pblend.or(blend), phase_rank);
+            // A `ratio` on a placement does NOT pin a sprite to one frame. Ratio is only
+            // meaningful for MorphShape characters; Flash ignores it on a sprite, so the sprite
+            // runs its own timeline as normal. Treating it as a pin froze animations the source
+            // plays: bowserscastle's thwomp places its `idle` sub-clip with ratio=2, and SSF2
+            // runs that clip through all 52 of its frames (read live: `thwomp_idle_41 frame=51/52
+            // 'loop'`) while we emitted a single static frame — so the pose never changed during
+            // the landing wait the way the original does.
+            let f = &frames[(global_frame + phase) % frames.len()];
+            let _ = pinned;
+            // the clip id tracks `next`: whichever clip supplies the carried symbol name is the one
+            // whose timeline (and so whose frame labels) the grouped element corresponds to.
+            let child_clip = if name.is_some() || !sym.is_empty() { Some(*id) } else { inst_clip };
+            walk_frame(f, world, global_frame, next.as_deref(), my_plane, planes, sym_names, shape_defs, sprite_frames, out, rec + 1, child_anchor, child_path, pblend.or(blend), phase_rank, child_clip, alpha * palpha);
         }
     }
+}
+
+/// Hard-light `mask` into `target` where the two overlap, in place.
+///
+/// WHY THIS IS BAKED AND NOT SET AT RUNTIME
+/// ---------------------------------------
+/// Fraymakers exposes no blend modes to a mod. The renderer underneath has them (`blendMode` is a
+/// real field on every Heaps display object), but the only handle a stage Script gets is a
+/// `ContainerApi`, whose entire surface is addChild/addChildAt/removeChild + state — and the whole
+/// scripting API's visual vocabulary is scale, alpha and visibility. There is no setBlendMode,
+/// setTint, setFilter or setShader anywhere in it. Reaching the field needs engine injection,
+/// which is fine for Peptide's own testing and useless for a converted stage, because that stage
+/// runs on the STOCK engine.
+///
+/// So the blend has to happen before the art ships. For STATIC art that is exact rather than an
+/// approximation: hard-light of a fixed mask over fixed pixels is a constant image, so it can be
+/// computed once and emitted as the art itself.
+///
+/// THE LIMIT, which no amount of baking fixes: only what is baked gets tinted. SSF2 draws its mask
+/// over the LIVE scene, so fighters, hazards and anything else moving underneath are tinted there
+/// and cannot be here. That divergence is permanent until the engine exposes a blend mode.
+///
+/// Both images are in the same scaled stage space (1 unit = 1 pixel), so their overlap is just the
+/// difference of their top-left corners.
+/// Mean per-pixel spread between a mask's colour channels, over its visible pixels. 0 means the
+/// mask is greyscale, which is what decides whether HardLight can be reproduced by ALPHA LAYERS
+/// instead of baked: the black/white decomposition needs one alpha per pixel, so it is exact for a
+/// greyscale mask and cannot express a mask whose channels disagree.
+fn mask_chroma(mask: &StageArt) -> f64 {
+    let Ok(img) = image::load_from_memory(&mask.png).map(|i| i.to_rgba8()) else { return -1.0 };
+    let (mut sum, mut n) = (0.0f64, 0u64);
+    for p in img.pixels() {
+        if p[3] < 8 { continue; }
+        let (r, g, b) = (p[0] as f64, p[1] as f64, p[2] as f64);
+        let mx = r.max(g).max(b);
+        let mn = r.min(g).min(b);
+        sum += mx - mn;
+        n += 1;
+    }
+    if n == 0 { 0.0 } else { sum / n as f64 }
+}
+
+/// Turn a blended placement into an ordinary ALPHA overlay that reproduces the blend over the art
+/// we already know, while staying translucent so whatever MOVES underneath is tinted too.
+///
+/// Baking the blend into the art is exact, but it can only ever tint what was baked: SSF2 draws
+/// its mask over the LIVE scene, so the fighters running around under it are tinted there and
+/// would not be here. That is the difference people actually see.
+///
+/// A layer can't reproduce a chromatic HardLight exactly. Normal blending gives
+/// `out_c = b_c(1-a) + C_c*a`, so the slope `(1-a)` is SHARED across channels and only the offset
+/// is per-channel; stacking more alpha layers just multiplies the slopes and they stay shared.
+/// HardLight with a coloured mask needs a PER-CHANNEL slope, which no arrangement of alpha layers
+/// has. (For a greyscale mask it is exactly expressible: black at `1-2t` is the multiply half,
+/// white at `2t-1` is the screen half — hence `mask_chroma`, which decides which case a stage is.)
+///
+/// So instead of approximating the blend in the abstract, solve it against the base we KNOW:
+/// per pixel, find `(a, C)` with `b(1-a) + C*a = HardLight(b, t)`, taking the SMALLEST alpha that
+/// keeps `C` in gamut. Over the static stage art that is exact. Over a fighter it is a tint rather
+/// than a true hard-light, but it is present, positioned and moves with them — which baking can
+/// never manage.
+fn fit_blend_overlay(mask: &StageArt, base: &StageArt) -> Option<StageArt> {
+    let m = image::load_from_memory(&mask.png).ok()?.to_rgba8();
+    let b_img = image::load_from_memory(&base.png).ok()?.to_rgba8();
+    let hl = |b: f64, t: f64| if t <= 0.5 { 2.0 * b * t } else { 1.0 - 2.0 * (1.0 - b) * (1.0 - t) };
+    let (dx, dy) = ((mask.x - base.x).round() as i64, (mask.y - base.y).round() as i64);
+    let (bw, bh) = (b_img.width() as i64, b_img.height() as i64);
+    let mut out = image::RgbaImage::new(m.width(), m.height());
+    for (mx, my, sp) in m.enumerate_pixels() {
+        let sa = sp[3] as f64 / 255.0;
+        if sa <= 0.0 { continue; }
+        let (cx, cy) = (dx + mx as i64, dy + my as i64);
+        // base pixel under this mask pixel; outside the art (or transparent there) we have nothing
+        // to solve against, so carry the mask through at its own alpha and let it tint whatever
+        // passes underneath at runtime.
+        let base_px = if cx >= 0 && cy >= 0 && cx < bw && cy < bh {
+            let p = b_img.get_pixel(cx as u32, cy as u32);
+            (p[3] > 0).then(|| [p[0] as f64 / 255.0, p[1] as f64 / 255.0, p[2] as f64 / 255.0])
+        } else { None };
+        let t = [sp[0] as f64 / 255.0, sp[1] as f64 / 255.0, sp[2] as f64 / 255.0];
+        let Some(bp) = base_px else {
+            out.put_pixel(mx, my, image::Rgba([sp[0], sp[1], sp[2], sp[3]]));
+            continue;
+        };
+        // Carry the MASK'S OWN alpha and let the colour be the hard-lit result. Substituting
+        // a = sa and C = hl(b,t) into `b(1-a) + C*a` returns the target exactly, so the static art
+        // is as accurate as baking — and because the alpha is the source's rather than the minimum
+        // that stays in gamut, everything else underneath gets the coverage SSF2 intended.
+        //
+        // Solving for the SMALLEST in-gamut alpha also reproduces the static art exactly, but it
+        // is the wrong objective: it maximises transparency, so moving objects barely change.
+        // Measured on bowserscastle, it shifted Mario's overalls R/B 0.315 -> 0.327 where SSF2
+        // reads 0.426 — a tenth of the intended strength.
+        let mut px = [0u8; 4];
+        for c in 0..3 {
+            px[c] = (hl(bp[c], t[c]).clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+        px[3] = sp[3];
+        out.put_pixel(mx, my, image::Rgba(px));
+    }
+    let mut png = Vec::new();
+    use image::ImageEncoder;
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(out.as_raw(), out.width(), out.height(), image::ExtendedColorType::Rgba8).ok()?;
+    Some(StageArt { png, x: mask.x, y: mask.y, w: mask.w, h: mask.h, hold: 1 })
+}
+
+/// Paint a shape's bitmap FILL into a `tw` x `th` tile by mapping through the fill's own matrix,
+/// which is what says where the bitmap sits and whether it repeats.
+///
+/// Stretching the bitmap across the shape's box instead (the obvious shortcut) is only ever right
+/// when the bitmap happens to be one image sized to that box. It is wrong for a fill placed at an
+/// offset, and badly wrong for a small REPEATING tile: the art lands outside the path, and once the
+/// path mask is applied almost nothing survives. bowserscastle showed both failure modes — its
+/// front chandeliers are a 29x38 tile spread over 807x113 (the sheet came out blank, so two of the
+/// four chandeliers were missing), and its foreground lava is a 1305x124 texture stretched over a
+/// 1305x284 box, which showed the wrong slice of lava and left a hard horizontal seam where the
+/// sheet met the stage.
+///
+/// Maps destination pixel -> shape-local twips -> (inverse fill matrix) -> bitmap twips -> pixel.
+/// Paint EVERY bitmap fill in a shape, each through its own matrix and clipped to its own
+/// sub-paths, and composite them into one `tw` x `th` tile.
+///
+/// A shape is not limited to one bitmap fill. `StyleChange` records can carry `new_styles`, a fresh
+/// fill table, so a single shape can place many different bitmaps at many different matrices --
+/// bowserscastle's sconce sheet is one shape spanning 807px with 6 sconce regions, each with its
+/// own fill. Treating the shape as "one bitmap, one matrix" paints only whichever region that fill
+/// happens to cover and silently drops the rest, which is why the stage was missing sconces.
+///
+/// Each fill is isolated by rasterising the shape with THAT fill white and every other fill fully
+/// transparent, giving a per-fill mask; the bitmap is then mapped through its own matrix and
+/// multiplied by that mask.
+fn bitmap_fill_layers(
+    shape: &swf::Shape, bitmaps: &BTreeMap<u16, (u32, u32, Vec<u8>)>, tw: u32, th: u32,
+) -> Option<image::RgbaImage> {
+    let clear = || swf::FillStyle::Color(swf::Color { r: 0, g: 0, b: 0, a: 0 });
+    let white = || swf::FillStyle::Color(swf::Color { r: 255, g: 255, b: 255, a: 255 });
+    // every bitmap fill, tagged by which table (0 = the shape's own, then each new_styles in order)
+    let mut wanted: Vec<(usize, usize, u16, swf::Matrix, bool)> = Vec::new();
+    let mut scan = |t: usize, fs: &[swf::FillStyle]| {
+        for (i, f) in fs.iter().enumerate() {
+            if let swf::FillStyle::Bitmap { id, matrix, is_repeating, .. } = f {
+                if bitmaps.contains_key(id) { wanted.push((t, i, *id, *matrix, *is_repeating)); }
+            }
+        }
+    };
+    scan(0, &shape.styles.fill_styles);
+    let mut t = 0usize;
+    for r in &shape.shape {
+        if let swf::ShapeRecord::StyleChange(sc) = r {
+            if let Some(ns) = &sc.new_styles { t += 1; scan(t, &ns.fill_styles); }
+        }
+    }
+    if wanted.is_empty() { return None; }
+
+    let mut out = image::RgbaImage::new(tw, th);
+    for (table, idx, bid, mat, repeating) in &wanted {
+        let pick = |t: usize, fs: &[swf::FillStyle]| -> Vec<swf::FillStyle> {
+            fs.iter().enumerate()
+                .map(|(i, _)| if t == *table && i == *idx { white() } else { clear() })
+                .collect()
+        };
+        let top = pick(0, &shape.styles.fill_styles);
+        let mut t2 = 0usize;
+        let recs: Vec<swf::ShapeRecord> = shape.shape.iter().map(|r| match r {
+            swf::ShapeRecord::StyleChange(sc) if sc.new_styles.is_some() => {
+                let mut sc = sc.clone();
+                t2 += 1;
+                if let Some(ns) = sc.new_styles.as_mut() { ns.fill_styles = pick(t2, &ns.fill_styles); }
+                swf::ShapeRecord::StyleChange(sc)
+            }
+            other => other.clone(),
+        }).collect();
+        let Some(mask) = crate::vector_raster::rasterize_shape(
+            &shape.shape_bounds, &top, &shape.styles.line_styles, &recs,
+        ).and_then(|r| image::RgbaImage::from_raw(r.width, r.height, r.rgba)) else { continue };
+        let mask = resize_to(&mask, tw, th);
+        let (w, h, rgba) = &bitmaps[bid];
+        let Some(src) = image::RgbaImage::from_raw(*w, *h, rgba.clone()) else { continue };
+        let art = bitmap_fill_tile(&src, &shape.shape_bounds, mat, *repeating, tw, th)
+            .unwrap_or_else(|| resize_to(&src, tw, th));
+        for ((o, a), m) in out.pixels_mut().zip(art.pixels()).zip(mask.pixels()) {
+            let sa = (a[3] as u32 * m[3] as u32 / 255) as u8;
+            if sa == 0 { continue; }
+            // src-over onto whatever earlier fills already painted
+            let da = o[3] as u32;
+            let na = sa as u32 + da * (255 - sa as u32) / 255;
+            if na == 0 { continue; }
+            for c in 0..3 {
+                o[c] = (((a[c] as u32 * sa as u32) + (o[c] as u32 * da * (255 - sa as u32) / 255)) / na) as u8;
+            }
+            o[3] = na as u8;
+        }
+    }
+    Some(out)
+}
+
+fn bitmap_fill_tile(
+    bmp: &image::RgbaImage, bounds: &swf::Rectangle<swf::Twips>, m: &swf::Matrix, repeating: bool,
+    tw: u32, th: u32,
+) -> Option<image::RgbaImage> {
+    let (a, b, c, d) = (m.a.to_f64(), m.b.to_f64(), m.c.to_f64(), m.d.to_f64());
+    let det = a * d - b * c;
+    if !det.is_finite() || det.abs() < 1e-9 { return None; }
+    let (tx, ty) = (m.tx.get() as f64, m.ty.get() as f64);
+    let (x0, y0) = (bounds.x_min.get() as f64, bounds.y_min.get() as f64);
+    let (bw, bh) = (bounds.width().get() as f64, bounds.height().get() as f64);
+    if bw <= 0.0 || bh <= 0.0 { return None; }
+    let (iw, ih) = (bmp.width() as i64, bmp.height() as i64);
+    if iw == 0 || ih == 0 { return None; }
+    if std::env::var("PEPTIDE_FILL_DEBUG").is_ok() {
+        let corner = |lx: f64, ly: f64| {
+            let (px, py) = (lx - tx, ly - ty);
+            ((d * px - c * py) / det, (a * py - b * px) / det)
+        };
+        eprintln!("[fill] bmp {iw}x{ih} bounds twips ({x0},{y0}) {bw}x{bh} repeating={repeating} \
+            mat a={a:.4} b={b:.4} c={c:.4} d={d:.4} tx={tx} ty={ty} -> topleft={:?} botright={:?}",
+            corner(x0, y0), corner(x0 + bw, y0 + bh));
+    }
+    let mut out = image::RgbaImage::new(tw, th);
+    for dy in 0..th {
+        for dx in 0..tw {
+            // destination pixel -> shape-local twips (pixel centres)
+            let lx = x0 + (dx as f64 + 0.5) / tw as f64 * bw;
+            let ly = y0 + (dy as f64 + 0.5) / th as f64 * bh;
+            // inverse fill matrix -> bitmap twips -> bitmap pixels (20 twips per pixel)
+            let (px, py) = (lx - tx, ly - ty);
+            // The inverse already lands in bitmap PIXELS: SSF2's fill matrices are
+            // `a = d = 20, tx/ty = the shape's origin`, i.e. they map bitmap pixels onto shape
+            // twips. Dividing by 20 again (treating the source as twips) shrinks the sampled
+            // region by 20x and reads a tiny corner of the image. Checked against the lava sheet,
+            // where the shape is 26100 twips wide and the bitmap 1305px: 26100/20 = 1305, exactly
+            // 1:1, and its 124px band lines up with the path mask.
+            let sx = (d * px - c * py) / det;
+            let sy = (a * py - b * px) / det;
+            let (mut ix, mut iy) = (sx.floor() as i64, sy.floor() as i64);
+            if repeating {
+                ix = ix.rem_euclid(iw);
+                iy = iy.rem_euclid(ih);
+            } else if ix < 0 || iy < 0 || ix >= iw || iy >= ih {
+                continue;                       // outside a clamped fill: leave it transparent
+            }
+            out.put_pixel(dx, dy, *bmp.get_pixel(ix as u32, iy as u32));
+        }
+    }
+    Some(out)
+}
+
+fn bake_hardlight(target: &mut StageArt, mask: &StageArt) {
+    let (Ok(mut base), Ok(top)) = (
+        image::load_from_memory(&target.png).map(|i| i.to_rgba8()),
+        image::load_from_memory(&mask.png).map(|i| i.to_rgba8()),
+    ) else { return };
+    let hl = |b: f64, t: f64| if t <= 0.5 { 2.0 * b * t } else { 1.0 - 2.0 * (1.0 - b) * (1.0 - t) };
+    let (dx, dy) = ((mask.x - target.x).round() as i64, (mask.y - target.y).round() as i64);
+    let (bw, bh) = (base.width() as i64, base.height() as i64);
+    for (mx, my, sp) in top.enumerate_pixels() {
+        let (cx, cy) = (dx + mx as i64, dy + my as i64);
+        if cx < 0 || cy < 0 || cx >= bw || cy >= bh { continue; }
+        let sa = sp[3] as f64 / 255.0;
+        if sa <= 0.0 { continue; }
+        let dp = base.get_pixel_mut(cx as u32, cy as u32);
+        // only tint pixels the target actually painted: hard-lighting transparent pixels would
+        // stamp the mask onto empty space, which is the artefact the old canvas-local emulation
+        // produced whenever it ran over an unpainted region.
+        let da = dp[3] as f64 / 255.0;
+        if da <= 0.0 { continue; }
+        for c in 0..3 {
+            let b = dp[c] as f64 / 255.0;
+            let t = sp[c] as f64 / 255.0;
+            dp[c] = ((b * (1.0 - sa) + hl(b, t) * sa).clamp(0.0, 1.0) * 255.0) as u8;
+        }
+    }
+    let mut png = Vec::new();
+    use image::ImageEncoder;
+    if image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(base.as_raw(), base.width(), base.height(), image::ExtendedColorType::Rgba8)
+        .is_ok()
+    {
+        target.png = png;
+    }
+}
+
+/// Split a backdrop element's rasterized frames into its clip's label-delimited segments, keeping
+/// only the ones SSF2 can actually reach during play.
+///
+/// A clip carrying more than one frame label is a state machine, not a loop: its frame scripts jump
+/// between labels, so playing the timeline end to end shows animations the source never shows
+/// (bowserscastle's crowd has a `lose` reaction that nothing on the timeline reaches). Returns empty
+/// for the ordinary single-label element, which is the common case.
+#[allow(clippy::too_many_arguments)]
+fn clip_segments(
+    inst: Option<&&Instance>,
+    per_frame: &[StageArt],
+    sprites: &BTreeMap<u16, &Vec<swf::Tag>>,
+    sym_names: &BTreeMap<u16, String>,
+    sprite_frames: &BTreeMap<u16, Vec<Vec<PlacedChild>>>,
+    abcs: &[crate::abc_parser::AbcFile],
+    phase_rank: &std::collections::HashMap<(i64, i64), usize>,
+) -> Vec<BgSegment> {
+    use crate::abc_parser::LabelJump;
+    let Some(cid) = inst.and_then(|i| i.inst_clip) else { return Vec::new() };
+    let Some(tags) = sprites.get(&cid) else { return Vec::new() };
+    let labels = crate::sprite_parser::extract_frame_labels_from_tags(tags);
+    if labels.len() < 2 { return Vec::new(); }
+    let n = sprite_frames.get(&cid).map(|f| f.len()).unwrap_or(0);
+    // a lap of the clip has to fit in the sample window, or there is nothing to slice
+    if n < 2 || per_frame.len() < n { return Vec::new(); }
+    // the walk starts each clip at a phase offset (repeated placements are spread across their loop
+    // so their per-frame leans cancel), so sample i holds clip frame (i + phase) % n. Undo it, or
+    // the segment boundaries land in the wrong place.
+    let anchor = inst.map(|i| i.inst_anchor).unwrap_or((0.0, 0.0));
+    let rank = phase_rank.get(&(anchor.0.round() as i64, anchor.1.round() as i64)).copied().unwrap_or(0);
+    let phase = ((rank as f64 * 0.618_033_988_75).fract() * n as f64) as usize % n;
+    let at = |f: usize| per_frame[(f + n - phase) % n].clone();
+
+    let jumps: Vec<(u32, LabelJump)> = sym_names.get(&cid)
+        .map(|class| abcs.iter().flat_map(|a| crate::abc_parser::extract_label_jumps(a, class)).collect())
+        .unwrap_or_default();
+    let mut segs: Vec<BgSegment> = Vec::new();
+    for (li, (label, start)) in labels.iter().enumerate() {
+        let s = *start as usize;
+        let e = labels.get(li + 1).map(|(_, f)| *f as usize).unwrap_or(n);
+        if e <= s || e > n { continue; }
+        // AS3 frame numbers are 1-based, so the script ending segment [s,e) is `frame{e}`.
+        let next = jumps.iter().find(|(f, _)| *f as usize == e).map(|(_, j)| j.clone());
+        segs.push(BgSegment { label: label.clone(), frames: (s..e).map(at).collect(), next });
+    }
+    if segs.len() < 2 { return Vec::new(); }
+
+    // Reachability from the clip's entry (its first label). A segment nothing reaches is dead
+    // during normal play: it exists for an event the stage fires by name, not for the timeline.
+    let mut live = vec![false; segs.len()];
+    let mut stack = vec![0usize];
+    while let Some(i) = stack.pop() {
+        if live[i] { continue; }
+        live[i] = true;
+        let mut targets: Vec<usize> = Vec::new();
+        match &segs[i].next {
+            Some(LabelJump::Always(t)) => targets.extend(segs.iter().position(|s| &s.label == t)),
+            // a chance jump can also NOT fire, in which case playback runs on into the next segment
+            Some(LabelJump::Chance { target, .. }) => {
+                targets.extend(segs.iter().position(|s| &s.label == target));
+                targets.push(i + 1);
+            }
+            // nothing scripted: run on, wrapping at the end of the timeline
+            None => targets.push(if i + 1 < segs.len() { i + 1 } else { 0 }),
+        }
+        stack.extend(targets.into_iter().filter(|&t| t < segs.len()));
+    }
+    let dropped: Vec<&str> = segs.iter().zip(&live).filter(|(_, &l)| !l).map(|(s, _)| s.label.as_str()).collect();
+    if !dropped.is_empty() {
+        log::warn!("stage art: clip '{}' segments {:?} are unreachable from its timeline \
+            (event-driven); not ported",
+            sym_names.get(&cid).map(String::as_str).unwrap_or("?"), dropped);
+    }
+    let mut out: Vec<BgSegment> = segs.into_iter().zip(live).filter(|(_, l)| *l).map(|(s, _)| s).collect();
+    // a jump to a segment that got pruned would dangle; treat it as "run on" instead.
+    let names: Vec<String> = out.iter().map(|s| s.label.clone()).collect();
+    for s in &mut out {
+        let target = match &s.next {
+            Some(LabelJump::Always(t)) | Some(LabelJump::Chance { target: t, .. }) => Some(t.clone()),
+            None => None,
+        };
+        if target.is_some_and(|t| !names.contains(&t)) { s.next = None; }
+    }
+    out
 }
 
 /// Rasterize the stage's art into background / stage / foreground layers. The stage layer
@@ -1499,6 +2001,7 @@ fn render_art_layers(
     keep_foreground: bool,
     planes: &PlaneMap,
     surface_y_fm: Option<f64>,
+    abcs: &[crate::abc_parser::AbcFile],
 ) -> StageArtSet {
     // per-sprite + root frame timelines.
     let mut sprite_frames: BTreeMap<u16, Vec<Vec<PlacedChild>>> = BTreeMap::new();
@@ -1552,7 +2055,7 @@ fn render_art_layers(
     let frame_instances = |g: usize| -> Vec<Instance> {
         let root = &root_frames[root_idx];
         let mut out = Vec::new();
-        walk_frame(root, Mat::id(), g, None, None, planes, sym_names, shape_defs, &sprite_frames, &mut out, 0, (0.0, 0.0), 0, None, &phase_rank);
+        walk_frame(root, Mat::id(), g, None, None, planes, sym_names, shape_defs, &sprite_frames, &mut out, 0, (0.0, 0.0), 0, None, &phase_rank, None, 1.0);
         // exclude non-art PLANES (terrain/masks/spawns, by instance name) and any stray
         // collision/scaffolding markers (by linkage suffix) that slipped into an art plane.
         if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok() {
@@ -1592,6 +2095,19 @@ fn render_art_layers(
     let total_counts: Vec<usize> = sampled.iter().map(|(insts, _)| insts.len()).collect();
     let base_idx = total_counts.iter().enumerate().max_by_key(|(_, c)| **c).map(|(i, _)| i).unwrap_or(0);
     let base_insts = &sampled[base_idx].0;
+    if let Ok(want) = std::env::var("PEPTIDE_FRAME_SCAN") {
+        let ids: Vec<u16> = want.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        let mut seen: std::collections::BTreeMap<(u16, i64), Vec<usize>> = Default::default();
+        for (fi, (insts, _)) in sampled.iter().enumerate() {
+            for i in insts.iter().filter(|i| ids.contains(&i.shape_id)) {
+                seen.entry((i.shape_id, (i.cx / 25.0).round() as i64 * 25)).or_default().push(fi);
+            }
+        }
+        for ((sid, x), frames) in &seen {
+            eprintln!("[frame-scan] shape {sid} near x={x}: on {} of {} frames (base={}, first={:?})",
+                frames.len(), sampled.len(), frames.contains(&base_idx), &frames[..frames.len().min(4)]);
+        }
+    }
     if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok() {
         eprintln!("=== art instances (richest frame {base_idx}, {} insts) ===", base_insts.len());
         for i in base_insts {
@@ -1714,6 +2230,20 @@ fn render_art_layers(
             }).collect();
             let animated = per_frame.len() == n_samples
                 && per_frame.windows(2).any(|w| w[0].png != w[1].png);
+            // a label-segmented clip is a state machine: its emitted art is the segments SSF2 can
+            // reach, chained by their jumps, NOT the whole timeline played end to end.
+            let segments = if animated {
+                clip_segments(all.first(), &per_frame, sprites, sym_names, &sprite_frames, abcs, &phase_rank)
+            } else { Vec::new() };
+            if !segments.is_empty() {
+                // run-length each segment SEPARATELY: collapsing across a boundary (the last frame
+                // of one segment matching the first of the next) would merge them into one keyframe
+                // and the emitter could no longer tell where a segment starts.
+                let mut segments = segments;
+                for s in &mut segments { s.frames = rle(std::mem::take(&mut s.frames)); }
+                let frames = segments.iter().flat_map(|s| s.frames.iter().cloned()).collect();
+                return Some(BgLayer { name: sname.clone(), frames, segments });
+            }
             let frames = if animated {
                 // truncate to the element's OWN loop period (it was sampled over the stage's
                 // longest clip), so its VFX loops at its own length, not the whole stage's.
@@ -1723,14 +2253,41 @@ fn render_art_layers(
                 let grp: Vec<&Instance> = base_insts.iter().filter(|i| matches(i)).collect();
                 composite_grp(grp, bounds).into_iter().collect()
             };
-            (!frames.is_empty()).then(|| BgLayer { name: sname.clone(), frames })
+            (!frames.is_empty()).then(|| BgLayer { name: sname.clone(), frames, segments: Vec::new() })
         }).collect()
     };
 
     // foreground = the genuine in-front props (non-overlapping foreground), sampled PER FRAME so
     // an animated SSF2 foreground (bowserscastle's shimmering lava-glow sheet over the floor)
     // actually animates instead of freezing on one frame. static foregrounds collapse to one frame.
-    let fg_member = |i: &Instance| art_kind(i) == ArtKind::Foreground && !is_dup_fg(i);
+    // A blended placement is NOT emitted as art of its own: it is baked into the art beneath it
+    // (see `bake_hardlight` for why the engine leaves no other option). Splitting it out as its
+    // own element is what made bowserscastle's lightmask vanish — alone on an empty canvas the
+    // old emulation had nothing to blend against and fell back to plain alpha.
+    let is_blended = |i: &Instance| i.blend == Some(swf::BlendMode::HardLight);
+    // the plane's authored opacity: the LOWEST alpha any of its placements carries (SSF2 sets it
+    // on a parent clip, so every leaf under that clip inherits the same value). 1.0 when nothing
+    // in the plane is translucent.
+    let authored = base_insts.iter()
+        .filter(|i| art_kind(i) == ArtKind::Foreground)
+        .map(|i| i.alpha)
+        .fold(f64::INFINITY, f64::min);
+    // A plane with no colour transform anywhere reads as fully opaque, and drawing this sheet
+    // opaque over the backdrop's own lava puts a hard seam at its top edge (the rasterised path is
+    // binary 0/255 — the source art carries no soft edge to inherit). SSF2 makes the plane
+    // translucent outside the SWF placement data, so when the source says nothing, fall back to the
+    // long-standing translucent default rather than to opaque.
+    const FG_ALPHA_FALLBACK: f64 = 0.5;
+    let foreground_alpha = match authored.is_finite() && authored < 1.0 {
+        true => authored.clamp(0.0, 1.0),
+        false => FG_ALPHA_FALLBACK,
+    };
+    if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok() {
+        let alphas: Vec<String> = base_insts.iter().filter(|i| art_kind(i) == ArtKind::Foreground)
+            .map(|i| format!("{:.2}", i.alpha)).collect();
+        eprintln!("[fg-alpha] plane opacity {foreground_alpha:.2} from placements {alphas:?}");
+    }
+    let fg_member = |i: &Instance| art_kind(i) == ArtKind::Foreground && !is_dup_fg(i) && !is_blended(i);
     let fg_all: Vec<&Instance> = sampled.iter().flat_map(|(insts, _)| insts.iter().filter(|i| fg_member(i))).collect();
     let fg_bounds = union_bounds(&fg_all);
     let fg_per_frame: Vec<StageArt> = sampled.iter()
@@ -1738,11 +2295,22 @@ fn render_art_layers(
         .collect();
     let fg_animated = fg_per_frame.len() == n_samples
         && fg_per_frame.windows(2).any(|w| w[0].png != w[1].png);
-    let foreground: Vec<StageArt> = if fg_animated {
+    let foreground_composite: Vec<StageArt> = if fg_animated {
         rle(fg_per_frame)
     } else {
         composite_grp(base_insts.iter().filter(|i| fg_member(i)).collect(), fg_bounds).into_iter().collect()
     };
+    // The foreground plane gets the SAME per-element split the background does. Compositing the
+    // whole plane into one image is what froze it: SSF2 authors each in-front prop as its own
+    // movieclip on its own loop (exactly like the backdrop), and flattening them into a single
+    // picture leaves one master clock for all of them, so every one that animates independently
+    // stops animating. The composite stays as the fallback for a plane the grouping can't split.
+    //
+    // Blended placements are no longer a reason to keep the plane composited: they are baked into
+    // the art beneath instead of shipped as a layer (see `bake_hardlight`), so nothing here needs
+    // a shared canvas any more and every unblended element can have its own clock.
+    let foreground_elements = group_bg_layers(&fg_member);
+    let foreground = if foreground_elements.is_empty() { foreground_composite } else { Vec::new() };
     // when the backdrop carries `_cambg` parallax layers, each backdrop/cambg LAYER (grouped
     // by symbol) becomes its own camera-relative plane with its own auto-derived pan rate (so
     // the sky, sun rays, trees, ... scroll at different rates, reading as depth — and the rays
@@ -1826,7 +2394,74 @@ fn render_art_layers(
 
     // background is already grouped into per-element layers (each RLE'd at the 30->60fps doubling);
     // the stage plane still needs the same RLE pass so a held source frame reads as a break.
-    StageArtSet { background, parallax, stage_frames: rle(stage_frames), foreground, foreground_occluders }
+    // ── bake the blended placements into everything beneath them ──────────────
+    // The mask is composited onto the art it sits over and then dropped, so the shipped stage
+    // carries the blend already applied. Exact for static art; anything that MOVES under the mask
+    // (fighters, hazards) is tinted in SSF2 and cannot be here, because the engine exposes no
+    // runtime blend mode. See `bake_hardlight`.
+    let (mut background, mut stage_frames) = (background, stage_frames);
+    let (mut foreground, mut foreground_elements) = (foreground, foreground_elements);
+    let mut foreground_occluders = foreground_occluders;
+    let mut foreground_is_blend_overlay = false;
+    let blend_insts: Vec<&Instance> = base_insts.iter()
+        .filter(|i| art_kind(i) == ArtKind::Foreground && is_blended(i)).collect();
+    if !blend_insts.is_empty() {
+        let n_blend = blend_insts.len();
+        let bounds = union_bounds(&blend_insts);
+        if let Some(mask) = composite_grp(blend_insts, bounds) {
+            // Solve the blend against the art beneath it and ship the result as a normal alpha
+            // overlay in the FOREGROUND, which is where SSF2 draws it: over everything, fighters
+            // included. Baking it into the art instead is exact but tints only what was baked, and
+            // the layer people actually watch has characters running around inside it.
+            let beneath: Vec<&Instance> = base_insts.iter().filter(|i| !is_blended(i)).collect();
+            let base_art = composite_grp(beneath, bounds);
+            if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok() {
+                match &base_art {
+                    None => eprintln!("[blend-base] no art beneath the mask to solve against"),
+                    Some(b) => {
+                        let cov = image::load_from_memory(&b.png).map(|i| {
+                            let im = i.to_rgba8();
+                            let n = im.pixels().len().max(1);
+                            100.0 * im.pixels().filter(|p| p[3] > 0).count() as f64 / n as f64
+                        }).unwrap_or(-1.0);
+                        eprintln!("[blend-base] base {}x{} at ({:.1},{:.1}) covers {cov:.1}% \
+                            (mask {}x{} at ({:.1},{:.1}))", b.w, b.h, b.x, b.y, mask.w, mask.h,
+                            mask.x, mask.y);
+                    }
+                }
+            }
+            let fitted = base_art.and_then(|base| fit_blend_overlay(&mask, &base));
+            let mode = match fitted {
+                Some(overlay) => {
+                    foreground.push(overlay);
+                    foreground_is_blend_overlay = true;
+                    "overlay (moving objects tinted too)"
+                }
+                // no art underneath to solve against: fall back to compositing the blend into
+                // whatever IS there, which is exact for that art and tints nothing else.
+                None => {
+                    for a in stage_frames.iter_mut() { bake_hardlight(a, &mask); }
+                    for l in background.iter_mut() {
+                        for a in l.frames.iter_mut() { bake_hardlight(a, &mask); }
+                    }
+                    for l in foreground_elements.iter_mut() {
+                        for a in l.frames.iter_mut() { bake_hardlight(a, &mask); }
+                    }
+                    for a in foreground_occluders.iter_mut() { bake_hardlight(a, &mask); }
+                    "baked into the art (static only)"
+                }
+            };
+            log::info!("stage art: {n_blend} blended placement(s) -> {mode}; the engine exposes no \
+                runtime blend mode, so a chromatic mask can only be approximated over moving art");
+            if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok() {
+                eprintln!("[blend-bake] {n_blend} placement(s); mask {}x{} at ({:.1},{:.1}) \
+                    -> {mode}; mask chroma {:.1}/255 (0 = greyscale)",
+                    mask.w, mask.h, mask.x, mask.y, mask_chroma(&mask));
+            }
+        }
+    }
+    StageArtSet { background, parallax, stage_frames: rle(stage_frames), foreground,
+        foreground_elements, foreground_occluders, foreground_is_blend_overlay, foreground_alpha }
 }
 
 /// Engine-added background layers: bitmaps in the stage library that NO shape fill, PlaceObject,
@@ -1864,7 +2499,7 @@ fn engine_added_bg_layers(
         }
     }
     for tags in sprites.values() {
-        for frame in build_frames(tags) { for (cid, _, _, _, _, _) in frame { note(cid, bitmaps, &mut referenced, &mut ref_dims); } }
+        for frame in build_frames(tags) { for (cid, _, _, _, _, _, _) in frame { note(cid, bitmaps, &mut referenced, &mut ref_dims); } }
     }
     for t in root_tags {
         if let swf::Tag::PlaceObject(po) = t {
@@ -2024,7 +2659,7 @@ fn engine_added_bg_layers(
             (x_fm, y_fm)
         });
         if let Some(art) = to_art(&bg_id, bg_x, bg_y) {
-            bg_layers.push(BgLayer { name: format!("engineLayer{li}"), frames: vec![art] });
+            bg_layers.push(BgLayer { name: format!("engineLayer{li}"), frames: vec![art], segments: Vec::new() });
         }
         // foreground = any same-size sibling whose deck row is clearly CUT OUT (a near parapet that
         // must draw IN FRONT of the fighter), at ITS OWN authored placement, falling back to the
@@ -2050,6 +2685,19 @@ fn blank_png() -> Vec<u8> {
     png
 }
 
+/// `imageops::resize` that skips the filter when the target size already matches.
+///
+/// The image crate runs the full sampling filter regardless of whether the dimensions
+/// change, and stage compositing calls it two to three times per placed instance — so
+/// every 1:1 placement was paying for a resample that produces its input. Compositing is
+/// about half of a stage parse and this is the hottest call in it.
+fn resize_to(img: &image::RgbaImage, tw: u32, th: u32) -> image::RgbaImage {
+    if img.width() == tw && img.height() == th {
+        return img.clone();
+    }
+    image::imageops::resize(img, tw, th, image::imageops::FilterType::Triangle)
+}
+
 fn composite_layer(
     art: &[&Instance],
     shape_defs: &BTreeMap<u16, &swf::Shape>,
@@ -2061,10 +2709,14 @@ fn composite_layer(
 
     // The bitmap id a shape fills with, if any (stage backgrounds are bitmap-filled
     // rects that `vector_raster` skips; we blit the bitmap into the shape's AABB).
-    let shape_bitmap = |sid: u16| -> Option<u16> {
+    let shape_bitmap = |sid: u16| -> Option<(u16, swf::Matrix, bool)> {
         let shape = shape_defs.get(&sid)?;
         shape.styles.fill_styles.iter().find_map(|f| match f {
-            swf::FillStyle::Bitmap { id, .. } if bitmaps.contains_key(id) => Some(*id),
+            // the fill MATRIX maps bitmap space onto the shape; without it the bitmap can only be
+            // stretched to the shape's box, which is wrong for every fill that tiles or is placed
+            // at an offset (see `bitmap_fill_tile`).
+            swf::FillStyle::Bitmap { id, matrix, is_repeating, .. } if bitmaps.contains_key(id) =>
+                Some((*id, *matrix, *is_repeating)),
             _ => None,
         })
     };
@@ -2088,42 +2740,43 @@ fn composite_layer(
         (i.aabb.w.round() as u32).clamp(1, 4096),
         (i.aabb.h.round() as u32).clamp(1, 4096),
     );
-    let mut drew = false;
-    for inst in art {
+    // Tile production (resize + mask rasterize + alpha multiply + flip) is independent per
+    // placed instance and is where a stage parse spends most of its time, so it runs across
+    // all cores here. Compositing STAYS serial and in list order below: overlay and the
+    // hard-light path both read-modify-write the shared canvas, so their order is the layer's
+    // draw order and must not change. Output is therefore identical to the serial version.
+    struct Tile {
+        img: image::RgbaImage,
+        ox: i64,
+        oy: i64,
+        blend: Option<swf::BlendMode>,
+    }
+
+    let make_tile = |inst: &&Instance| -> Option<Tile> {
         let (tw, th) = tw_th(inst);
+        if let Ok(want) = std::env::var("PEPTIDE_SHAPE_TRACE") {
+            if want == "all" || want.split(',').any(|x| x.trim().parse::<u16>() == Ok(inst.shape_id)) {
+                eprintln!("[shape-inst] shape {} at world=({:.0},{:.0}) aabb={:.0}x{:.0} \
+                    flip={:?} x_sign={} plane={:?}", inst.shape_id, inst.cx, inst.cy,
+                    inst.aabb.w, inst.aabb.h, inst.flip, inst.x_sign, inst.plane);
+            }
+        }
         // The placed tile at the AABB size: a bitmap fill clipped to the shape OUTLINE, else
         // the vector rasterization.
-        let scaled: Option<RgbaImage> = if let Some(bid) = shape_bitmap(inst.shape_id) {
-            let (w, h, rgba) = bitmaps.get(&bid).unwrap();
-            let Some(bmp) = RgbaImage::from_raw(*w, *h, rgba.clone()) else { continue };
-            let mut bmp = imageops::resize(&bmp, tw, th, imageops::FilterType::Triangle);
-            // clip the bitmap to the shape's path (not its rectangular AABB): rasterize the
-            // path with the bitmap fill swapped for solid white, and use that as an alpha
-            // mask. Without this an irregular bitmap-filled shape (e.g. a tree canopy) renders
-            // as a hard rectangle.
+        let scaled: Option<RgbaImage> = if shape_bitmap(inst.shape_id).is_some() {
+            // every bitmap fill in the shape, each through its own matrix and sub-paths
             let shape = shape_defs.get(&inst.shape_id).unwrap();
-            let mask_fills: Vec<swf::FillStyle> = shape.styles.fill_styles.iter().map(|f| match f {
-                swf::FillStyle::Bitmap { .. } => swf::FillStyle::Color(swf::Color { r: 255, g: 255, b: 255, a: 255 }),
-                other => other.clone(),
-            }).collect();
-            if let Some(mask) = crate::vector_raster::rasterize_shape(
-                &shape.shape_bounds, &mask_fills, &shape.styles.line_styles, &shape.shape,
-            ).and_then(|r| RgbaImage::from_raw(r.width, r.height, r.rgba)) {
-                let mask = imageops::resize(&mask, tw, th, imageops::FilterType::Triangle);
-                for (p, m) in bmp.pixels_mut().zip(mask.pixels()) {
-                    p[3] = ((p[3] as u32 * m[3] as u32) / 255) as u8;
-                }
-            }
+            let bmp = bitmap_fill_layers(shape, bitmaps, tw, th)?;
             Some(bmp)
         } else {
             let shape = shape_defs.get(&inst.shape_id).unwrap();
             crate::vector_raster::rasterize_shape(
                 &shape.shape_bounds, &shape.styles.fill_styles, &shape.styles.line_styles, &shape.shape,
             ).and_then(|r| RgbaImage::from_raw(r.width, r.height, r.rgba))
-                .map(|t| imageops::resize(&t, tw, th, imageops::FilterType::Triangle))
+                .map(|t| resize_to(&t, tw, th))
         };
-        let Some(mut scaled) = scaled else { continue };
-        if scaled.width() == 0 || scaled.height() == 0 { continue; }
+        let mut scaled = scaled?;
+        if scaled.width() == 0 || scaled.height() == 0 { return None; }
         // The tile is rasterized in source orientation and placed onto the axis-aligned AABB; a
         // mirrored placement (scaleX/scaleY < 0) must flip the tile so it lands the same way it
         // does in SSF2. For a single static shape this is invisible (the AABB is unchanged), but a
@@ -2135,7 +2788,24 @@ fn composite_layer(
         if fy { scaled = imageops::flip_vertical(&scaled); }
         let ox_px = (inst.aabb.left() - min_x).round() as i64;
         let oy_px = (inst.aabb.top() - min_y).round() as i64;
-        if inst.blend == Some(swf::BlendMode::HardLight) {
+        Some(Tile { img: scaled, ox: ox_px, oy: oy_px, blend: inst.blend })
+    };
+
+    // fan out over contiguous chunks so results come back already in list order
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(art.len()).max(1);
+    let chunk = art.len().div_ceil(threads);
+    let tiles: Vec<Option<Tile>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = art
+            .chunks(chunk)
+            .map(|part| scope.spawn(|| part.iter().map(&make_tile).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut drew = false;
+    for tile in tiles.into_iter().flatten() {
+        let Tile { img: scaled, ox: ox_px, oy: oy_px, blend } = tile;
+        if blend == Some(swf::BlendMode::HardLight) {
             // SSF2 draws this placement with HardLight (bowserscastle's lightmask gradient over
             // the lava). FM stage layers have no blend modes, so emulate in the bake: hard-light
             // into pixels this composite already painted; where the canvas is empty (the layer
@@ -2204,7 +2874,11 @@ fn extract_labeled_clip_anims(
                             swf::PlaceObjectAction::Replace(i) => format!("Replace({i})"),
                             swf::PlaceObjectAction::Modify => "Modify".into(),
                         };
-                        eprintln!("    f{frame} depth={} {act} mat={} ratio={:?}", po.depth, po.matrix.is_some(), po.ratio);
+                        let a = po.color_transform.map(|ct| {
+                            (f32::from(ct.a_multiply) as f64, f32::from(ct.a_add) as f64)
+                        });
+                        eprintln!("    f{frame} depth={} {act} mat={} ratio={:?} alpha={:?} blend={:?}",
+                            po.depth, po.matrix.is_some(), po.ratio, a, po.blend_mode);
                     }
                     swf::Tag::RemoveObject(r) => eprintln!("    f{frame} depth={} REMOVE", r.depth),
                     swf::Tag::FrameLabel(l) => eprintln!("    f{frame} LABEL {:?}", l.label.to_str_lossy(encoding_rs::WINDOWS_1252)),
@@ -2225,21 +2899,18 @@ fn extract_labeled_clip_anims(
     for (label, frame) in &labels {
         let f = *frame as usize;
         let Some(children) = clip_frames.get(f) else { continue };
-        // sub-animation length = the longest nested MOVIECLIP placed on this label's frame. a
-        // graphic-pinned child (PlacedChild.3: the placement carries a ratio — a Graphic symbol,
-        // e.g. the thwomp's Single Frame fall/idle) shows one fixed frame, never self-animates and
-        // never runs its frame scripts, so it doesn't drive the length (1 if everything is static).
+        // sub-animation length = the longest nested MOVIECLIP placed on this label's frame. A
+        // placement's `ratio` does NOT exclude it: ratio only means anything for a MorphShape, and
+        // Flash runs a sprite's own timeline regardless (see `walk_frame`).
         let sub_len = children.iter()
-            .filter(|(_, _, _, pinned, _, _)| pinned.is_none())
-            .filter_map(|(id, _, _, _, _, _)| sprite_frames.get(id).map(|fr| fr.len()))
+            .filter_map(|(id, _, _, _, _, _, _)| sprite_frames.get(id).map(|fr| fr.len()))
             .max().unwrap_or(1).max(1);
         // hold-vs-loop comes from the DRIVING nested clip's own timeline: a sub-clip that holds
         // carries a Flash-generated `_fla.` class (frame scripts) bound in SymbolClass. `stop()`
         // freezes where it fires; `gotoAndStop(target)` plays through then freezes at the target
         // (a label in the SUB-clip's own timeline, or a 1-based frame number).
         let driver_id = children.iter()
-            .filter(|(_, _, _, pinned, _, _)| pinned.is_none())
-            .filter_map(|(id, _, _, _, _, _)| sprite_frames.get(id).map(|fr| (*id, fr.len())))
+            .filter_map(|(id, _, _, _, _, _, _)| sprite_frames.get(id).map(|fr| (*id, fr.len())))
             .max_by_key(|(_, n)| *n).map(|(id, _)| id);
         let hold = driver_id
             .and_then(|id| sym_names.get(&id))
@@ -2274,7 +2945,7 @@ fn extract_labeled_clip_anims(
         // walk_frame itself pins graphic placements to their ratio-selected frame.
         let per_frame: Vec<Vec<Instance>> = (0..sub_len).map(|g| {
             let mut out = Vec::new();
-            walk_frame(children, Mat::id(), g, None, None, planes, sym_names, shape_defs, &sprite_frames, &mut out, 0, (0.0, 0.0), 0, None, &no_phase);
+            walk_frame(children, Mat::id(), g, None, None, planes, sym_names, shape_defs, &sprite_frames, &mut out, 0, (0.0, 0.0), 0, None, &no_phase, None, 1.0);
             out.retain(|i| shape_defs.contains_key(&i.shape_id));
             out
         }).collect();
@@ -2546,8 +3217,13 @@ fn walk<'a>(
 
         if std::env::var("PEPTIDE_STAGE_TREE").is_ok() {
             let kind = if sprites.contains_key(&id) { "MC" } else if shape_bounds.contains_key(&id) { "shape" } else { "?" };
-            eprintln!("{}d{} {kind} inst={:?} sym={:?} plane={:?} @({:.0},{:.0})",
-                "  ".repeat(rec), po.depth, inst_name.as_deref().unwrap_or(""), sym, my_plane.unwrap_or(""), world.tx, world.ty);
+            // frames tells a MOVING object from a still one, which is the whole question
+            // when auditing a stage: stage art is rasterized into one composite sprite, so
+            // a 1-frame clip having no separate Fraymakers object is correct, while a
+            // multi-frame clip baked into that composite has silently lost its animation.
+            let frames = sprites.get(&id).map(|t| build_frames(t).len()).unwrap_or(1);
+            eprintln!("{}d{} {kind} inst={:?} sym={:?} plane={:?} @({:.0},{:.0}) frames={}",
+                "  ".repeat(rec), po.depth, inst_name.as_deref().unwrap_or(""), sym, my_plane.unwrap_or(""), world.tx, world.ty, frames);
         }
 
         // record the stage origin from the root stageMC instance
@@ -2579,7 +3255,7 @@ fn walk<'a>(
                 x_sign: world.x_sign(), flip: world.flips(),
                 moving: here_moving,
                 hazard: here_hazard,
-                inst_anchor: (0.0, 0.0), inst_path: 0, blend: None, // geometry walk feeds collision/hazards, not art grouping
+                inst_anchor: (0.0, 0.0), inst_path: 0, blend: None, inst_clip: None, alpha: 1.0, // geometry walk feeds collision/hazards, not art grouping
             });
         }
         if let Some(child) = sprites.get(&id) {
@@ -2635,10 +3311,10 @@ mod hazard_classifier_tests {
         let insts = vec![
             Instance { shape_id: 1, inst_name: None, sym_name: "x".into(), plane: None,
                 aabb: Rect { x: 0.0, y: 0.0, w: 100.0, h: 20.0 }, cx: 50.0, cy: 10.0, x_sign: 1.0, flip: (false, false),
-                moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, blend: None },
+                moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, blend: None, inst_clip: None, alpha: 1.0 },
             Instance { shape_id: 2, inst_name: None, sym_name: "x".into(), plane: None,
                 aabb: Rect { x: 110.0, y: 0.0, w: 100.0, h: 20.0 }, cx: 160.0, cy: 10.0, x_sign: 1.0, flip: (false, false),
-                moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, blend: None },
+                moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, blend: None, inst_clip: None, alpha: 1.0 },
         ];
         let shapes = std::collections::BTreeMap::new();
         let bitmaps = std::collections::BTreeMap::new();

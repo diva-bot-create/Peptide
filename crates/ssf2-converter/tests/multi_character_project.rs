@@ -28,16 +28,16 @@ fn run_converter(ssf: &Path, out: &Path, extra: &[&str]) {
 }
 
 #[test]
+#[ignore = "full-conversion/art test: not part of the fast gate. Run with `cargo test -- --ignored`."]
 fn zelda_ssf_emits_one_merged_project() {
     let ssf = ssf_path("zelda");
     if !common::present(&ssf) { return; }
-    let out = tempfile::tempdir().expect("tempdir");
-    run_converter(&ssf, out.path(), &[]);
+    let Some(out) = common::shared_conversion("zelda") else { return };
 
-    let project = out.path().join("zelda");
+    let project = out.join("zelda");
     assert!(project.exists(),                                "characters/zelda must exist");
     assert!(project.join("zelda.fraytools").exists(),        ".fraytools at project root");
-    assert!(!out.path().join("sheik").exists(),              "sheik must NOT exist as a standalone project");
+    assert!(!out.join("sheik").exists(),              "sheik must NOT exist as a standalone project");
     assert!(!project.join("sheik.fraytools").exists(),       "sheik.fraytools must NOT exist");
 
     // Both characters in entities/ under <Pascal>.entity.
@@ -110,16 +110,16 @@ fn zelda_ssf_emits_one_merged_project() {
 }
 
 #[test]
+#[ignore = "full-conversion/art test: not part of the fast gate. Run with `cargo test -- --ignored`."]
 fn multi_char_project_uses_per_character_audio_subdirs() {
     // Stage C (docs/multi_character_projects_plan.md §3): in multi-char
     // projects library/audio/ becomes a folder per character. Single-char
     // projects keep the flat library/audio/*.wav layout (golden_sandbag).
     let ssf = ssf_path("zelda");
     if !common::present(&ssf) { return; }
-    let out = tempfile::tempdir().expect("tempdir");
-    run_converter(&ssf, out.path(), &[]);
+    let Some(out) = common::shared_conversion("zelda") else { return };
 
-    let audio = out.path().join("zelda/library/audio");
+    let audio = out.join("zelda/library/audio");
     assert!(audio.join("zelda").is_dir(), "library/audio/zelda/ subdir must exist");
     assert!(audio.join("sheik").is_dir(), "library/audio/sheik/ subdir must exist");
 
@@ -144,6 +144,7 @@ fn multi_char_project_uses_per_character_audio_subdirs() {
 }
 
 #[test]
+#[ignore = "needs the real SSF2 corpus (official content, never in this repo): not part of the default gate. Run with `cargo test -- --ignored`."]
 fn single_char_project_keeps_flat_audio_layout() {
     // Stage C contract: golden_sandbag's flat library/audio/*.wav layout
     // is unchanged for single-character projects. Verified directly via
@@ -151,10 +152,9 @@ fn single_char_project_keeps_flat_audio_layout() {
     // golden-hash check.
     let ssf = ssf_path("sandbag");
     if !common::present(&ssf) { return; }
-    let out = tempfile::tempdir().expect("tempdir");
-    run_converter(&ssf, out.path(), &[]);
+    let Some(out) = common::shared_conversion("sandbag") else { return };
 
-    let audio = out.path().join("sandbag/library/audio");
+    let audio = out.join("sandbag/library/audio");
     let entries: Vec<_> = std::fs::read_dir(&audio).unwrap()
         .filter_map(|e| e.ok()).map(|e| (e.file_type().unwrap(), e.file_name())).collect();
     // Should have .wav files directly, no per-char subdirs.
@@ -165,6 +165,7 @@ fn single_char_project_keeps_flat_audio_layout() {
 }
 
 #[test]
+#[ignore = "full-conversion/art test: not part of the fast gate. Run with `cargo test -- --ignored`."]
 fn rollback_flag_emits_per_character_projects() {
     // --per-character-projects reverts to the pre-Stage-B layout: each
     // character gets its own .fraytools project. This is the rollback

@@ -60,8 +60,18 @@ pub const COMMANDS: &[Cmd] = &[
           args: "",                              help: "synchronous custom-.fra load probe (diagnostic; spawn does this itself)" },
     Cmd { name: "console", aliases: &["c"],                 wire: 'c',
           args: "",                              help: "run the engine's debug console `help` command (RAN) — a side-effecting call hscript can't make, so it stays a wire byte" },
+    Cmd { name: "shot",    aliases: &["screenshot", "png"],  wire: '\0',
+          args: "[path]",                        help: "screenshot the LIVE frame from inside the engine to a PNG (default /tmp/peptide-shot.png). the object tree proves an object exists; this proves it was drawn. CAPTURES THE DISPLAY ROOT, NOT THE CAMERA -- on both engines it can show off-camera art and carries no camera zoom, so set the camera first before comparing frames or calling it \"what the player sees\"" },
     Cmd { name: "tree",    aliases: &["dump"],              wire: '\0',
           args: "[depth]",                       help: "dump the live object tree (name/class/position/size/frame per node) — the stage-triage ground truth. SSF2 walks the display list; depth defaults to 6" },
+    Cmd { name: "await",   aliases: &["settle", "playout"],  wire: '\0',
+          args: "[pN] [budgetFrames]",           help: "let the current animation PLAY OUT, watching the engine's own frame counter (never a wall-clock delay): returns when it completes / loops / changes / stalls. reports the outcome, frames actually seen, and end position. budget is a ceiling (a looping animation never finishes), default 240" },
+    Cmd { name: "record",  aliases: &["rec"],                   wire: '\0',
+          args: "[off]",                         help: "arm the engine's OWN per-frame recorder and clear its buffer (`record off` disarms). on SSF2 this is an injected ENTER_FRAME handler — the only way to observe it accurately, since polling samples slower than the animations run" },
+    Cmd { name: "trace",   aliases: &["frames"],                wire: '\0',
+          args: "[raw]",                         help: "read back the recorded frame history (`trace raw` dumps one line per frame with position, for measuring per-frame displacement/speed) (`<label>|<frame>|<x>|<y>;` per frame) in ONE round trip and stop recording" },
+    Cmd { name: "awaitmatch", aliases: &["ready", "awaitspawn"], wire: '\0',
+          args: "[pN] [tries]",                  help: "block until a character is actually READABLE (the match is up, not just spawn-acknowledged) — the deterministic replacement for sleeping after spawn. default 60 tries" },
     Cmd { name: "addCharacter", aliases: &["addchar", "add"], wire: 'n',
           args: "",                              help: "drop one more fighter into the LIVE match on demand (re-spawns the last roster char via the deferred-spawn path) — no relaunch (peptide todo #3)" },
     Cmd { name: "exit",    aliases: &["quit", "stop", "x"], wire: 'x',
@@ -348,6 +358,37 @@ pub enum Command {
     /// Dump the live object tree to the given depth — the stage-triage ground truth
     /// (every live game object with its name/class/position/size/frame).
     Tree(u32),
+    /// Screenshot the live frame to a PNG path, captured inside the engine.
+    Shot(std::path::PathBuf),
+    /// Watch a character's animation until it finishes, loops, changes, or stalls,
+    /// polling the ENGINE'S OWN frame counter. The frame-accurate replacement for
+    /// "sleep and hope": a wall-clock wait either observes a half-played animation or
+    /// spends most of its time idle, and which one it does changes with engine load.
+    /// `budget` bounds the watch (a looping animation never finishes) — a ceiling,
+    /// not a pace.
+    Await { idx: usize, budget: u32 },
+    /// Block until a character is readable — the match is genuinely up, not just
+    /// `spawn`-acknowledged. Replaces "sleep a few seconds after spawn", which loses
+    /// the first observation when the engine is slow and wastes the wait when it isn't.
+    AwaitMatch { idx: usize, tries: u32 },
+    /// One-shot readout of every player that actually EXISTS.
+    ///
+    /// Was a fixed eval over p0 AND p1, which reads a match with one player as four
+    /// garbage fields (SSF2 rendered them as `[object Character]`) and, once a missing
+    /// member became an error, failed outright. Enumerating instead means the readout is
+    /// correct for 1-4 players on both engines.
+    Info,
+    /// Arm (or disarm) the engine's own per-frame recorder, clearing its buffer.
+    Record { on: bool },
+    /// Read back the recorded frame history and stop recording.
+    ///
+    /// The two engines answer this from opposite directions, which is the whole reason
+    /// it's a trait method rather than an eval: SSF2 has no script interpreter, so an
+    /// injected ENTER_FRAME handler accumulates `<label>|<frame>|<x>|<y>;` in memory and
+    /// this reads the lot in ONE round trip. Fraymakers already PUSHES per-frame `ANIM:`
+    /// telemetry over its socket and its eval is fast enough to poll, so it says so
+    /// rather than pretending to have a buffer.
+    Trace { raw: bool },
     /// Drop one more fighter into the live match (peptide todo #3).
     AddCharacter,
     /// Cleanly shut the engine down.
@@ -431,14 +472,10 @@ pub fn parse(line: &str) -> Command {
                 }
                 return Command::Eval(format!("{player}.damage._damage = {val}"));
             }
-            "info" => {
-                return Command::Eval(
-                    "[p0.getX(), p0.getStateName(), p0.damage._damage, p0.getTeam(), \
-                     p1.getX(), p1.getStateName(), p1.damage._damage, p1.getTeam()]".into());
-            }
+            "info" => return Command::Info,
             "reset" => {
                 return Command::Eval(
-                    "p0.setXVelocity(0); p0.setYVelocity(0); p1.setXVelocity(0); p1.setYVelocity(0); \
+                    "p0.setXSpeed(0); p0.setYSpeed(0); p1.setXSpeed(0); p1.setYSpeed(0); \
                      p0.toState(CState.STAND); p1.toState(CState.STAND)".into());
             }
             "kill" => {
@@ -453,6 +490,47 @@ pub fn parse(line: &str) -> Command {
             "tree" => {
                 let depth = rest.first().and_then(|d| d.parse().ok()).unwrap_or(6);
                 return Command::Tree(depth);
+            }
+            "shot" | "screenshot" | "png" => {
+                return Command::Shot(rest.first().map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/peptide-shot.png")));
+            }
+            "await" | "settle" | "playout" => {
+                // await [pN] [budgetFrames] — both optional, either order-independent
+                // enough that a bare `await` is the common case.
+                let mut idx = 0usize;
+                let mut budget = 240u32;
+                for a in &rest {
+                    if let Some(n) = a.strip_prefix('p').and_then(|n| n.parse::<usize>().ok()) {
+                        idx = n;
+                    } else if let Ok(n) = a.parse::<u32>() {
+                        budget = n;
+                    } else {
+                        return Command::Client(format!(
+                            "await: don't understand {a:?}\nusage: await [pN] [budgetFrames]\n"));
+                    }
+                }
+                return Command::Await { idx, budget };
+            }
+            // Frame trace: `record` opens a window (clears the engine's buffer and arms
+            // it), `trace` closes it and reads the whole thing back in one round trip.
+            // This is how SSF2 is observed accurately — see Command::Trace.
+            "record" | "rec" => {
+                let on = !matches!(rest.first().map(|s| s.to_ascii_lowercase()).as_deref(), Some("off"));
+                return Command::Record { on };
+            }
+            "trace" | "frames" => return Command::Trace { raw: rest.first().is_some_and(|a| a.eq_ignore_ascii_case("raw")) },
+            "awaitmatch" | "ready" | "awaitspawn" => {
+                let mut idx = 0usize;
+                let mut tries = 60u32;
+                for a in &rest {
+                    if let Some(n) = a.strip_prefix('p').and_then(|n| n.parse::<usize>().ok()) {
+                        idx = n;
+                    } else if let Ok(n) = a.parse::<u32>() {
+                        tries = n;
+                    }
+                }
+                return Command::AwaitMatch { idx, tries };
             }
             "addCharacter" => return Command::AddCharacter,
             "exit" => return Command::Exit,
@@ -473,7 +551,11 @@ fn parse_scenario(rest: &[&str]) -> Command {
     if rest.len() < 2 {
         return Command::Client(USAGE.into());
     }
-    // "x,y" or "x,y,vx,vy" -> the per-player setup hscript (setX/setY [+ setXVelocity/setYVelocity]).
+    // "x,y" or "x,y,vx,vy" -> the per-player setup hscript (setX/setY [+ setXSpeed/setYSpeed]).
+    // setXSpeed/setYSpeed, NOT setXVelocity/setYVelocity: the latter do not exist on a
+    // Fraymakers character and fail with "Invalid function null". SSF2 lowers both
+    // spellings to its XSpeed/YSpeed property (vocab::SETTERS), so this spelling is the one
+    // that works on BOTH engines.
     fn body(slot: &str, who: &str) -> Result<String, String> {
         let n: Vec<&str> = slot.split(',').map(str::trim).collect();
         if n.len() != 2 && n.len() != 4 {
@@ -484,7 +566,7 @@ fn parse_scenario(rest: &[&str]) -> Command {
         }
         let mut s = format!("{who}.setX({}); {who}.setY({})", n[0], n[1]);
         if n.len() == 4 {
-            s.push_str(&format!("; {who}.setXVelocity({}); {who}.setYVelocity({})", n[2], n[3]));
+            s.push_str(&format!("; {who}.setXSpeed({}); {who}.setYSpeed({})", n[2], n[3]));
         }
         Ok(s)
     }
@@ -575,6 +657,14 @@ pub fn command_to_wire(cmd: &Command) -> Translated {
             Translated::Wire(wire)
         }
         Command::Eval(e) => Translated::Wire(if e.is_empty() { "e".into() } else { format!("e {e}") }),
+        // `await` is a HOST-side polling loop over the engine's frame counter, not a wire
+        // verb — there is nothing to send. It's executed by `run_command`, which owns the
+        // loop; reaching here means a caller translated it to wire by mistake.
+        Command::Info => Translated::Client(
+            "info is executed host-side (run_command), not sent to the engine\n".into()),
+        Command::Await { .. } | Command::AwaitMatch { .. }
+        | Command::Record { .. } | Command::Trace { .. } => Translated::Client(
+            "await/awaitmatch/record/trace are executed host-side (run_command), not sent to the engine\n".into()),
         Command::Hold(m) => Translated::Wire(format!("i {m}")),
         Command::Seq(masks) => Translated::Wire(masks.iter().map(|m| format!("i {m}")).collect::<Vec<_>>().join("\n")),
         Command::Scenario { setup, masks } => {
@@ -586,6 +676,7 @@ pub fn command_to_wire(cmd: &Command) -> Translated {
         // FM tree walk: the 'w' wire handler walks currentMatch.gameObjects in bytecode (hl ArrayObj
         // doesn't reflect length/index in hscript, so the walk can't be eval-side).
         Command::Tree(_) => Translated::Wire("w".into()),
+        Command::Shot(_) => Translated::Wire("y".into()),
         Command::AddCharacter => Translated::Wire("n".into()),
         Command::Exit => Translated::Wire("x".into()),
         Command::Load => Translated::Wire("l".into()),
@@ -1091,7 +1182,7 @@ mod tests {
             "e p0.setX(300); p0.setY(400); p1.setX(360); p1.setY(400); p0.toState(CState.STAND); p1.toState(CState.STAND)\ni 16\ni 16\ni 0"
         );
         // 4-tuple adds momentum (world-space velocity).
-        assert!(wire("scenario 300,400,5,0 360,400").contains("p0.setXVelocity(5); p0.setYVelocity(0)"));
+        assert!(wire("scenario 300,400,5,0 360,400").contains("p0.setXSpeed(5); p0.setYSpeed(0)"));
         // bad shapes are client-side errors (nothing sent to the engine).
         assert!(matches!(translate("scenario 300,400"), Translated::Client(_)));         // only one player
         assert!(matches!(translate("scenario 300 360,400"), Translated::Client(_)));     // p0 not x,y
@@ -1117,16 +1208,19 @@ mod tests {
     }
 
     #[test]
-    fn dmg_and_info_are_eval_wrappers() {
+    fn dmg_is_an_eval_wrapper_and_info_is_host_side() {
         assert_eq!(wire("dmg p1 80"), "e p1.damage._damage = 80");
-        assert!(wire("info").starts_with("e [p0.getX(), p0.getStateName()"));
         assert!(matches!(translate("dmg p1"), Translated::Client(_)));       // missing value
         assert!(matches!(translate("dmg p1 lots"), Translated::Client(_)));  // non-numeric
+        // `info` enumerates the players that exist, so it is computed host-side rather
+        // than sent as one fixed eval over p0 AND p1 (which misreports a 1-player match).
+        assert!(matches!(parse("info"), Command::Info));
+        assert!(matches!(translate("info"), Translated::Client(_)));
     }
 
     #[test]
     fn reset_and_kill_are_eval_wrappers() {
-        assert!(wire("reset").contains("p0.toState(CState.STAND)") && wire("reset").contains("setXVelocity(0)"));
+        assert!(wire("reset").contains("p0.toState(CState.STAND)") && wire("reset").contains("setXSpeed(0)"));
         assert_eq!(wire("kill p1"), "e p1.setY(p1.getY() + 3000)");
         assert!(matches!(translate("kill"), Translated::Client(_)));        // missing player
         assert!(matches!(translate("kill p1;evil"), Translated::Client(_))); // injection guard

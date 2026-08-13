@@ -409,6 +409,39 @@
       "replacement": "Common.setAutocancel($1)",
       "note": "autoCancel toggle maps to the Common helper"
     },
+    // ── Flash display PROPERTIES → Fraymakers Entity accessors ──
+    // SSF2 sets these as fields on a display object (`effect.scaleX = -effect.scaleX`).
+    // The FM objects those receivers map to (Vfx, and anything else extending Entity)
+    // expose accessors instead, so the field write is a runtime error the engine traps
+    // ("pxf.api.VfxApi does not have field scaleX") and the rest of that frame script
+    // dies with it. This is what makes converted effects sit at the wrong scale/angle.
+    //
+    // ASSIGNMENTS FIRST, then reads: the Rust regex crate has no lookahead, so the only
+    // way to tell `x.scaleX = v` from a read of `x.scaleX` is to consume the assignment
+    // form first. The read rule can't re-match what it produced (`.setScaleX(` contains
+    // no `.scaleX`), and a read nested in a rewritten RHS is still picked up.
+    //
+    // Deliberately NOT included: `.x` / `.y`. Point carries real `.x`/`.y` fields and is
+    // all over the decompiled code, so rewriting those would break more than it fixes.
+    { "pattern": "(?m)^(\\s*)([^\\n=;]+?)\\.scaleX\\s*=\\s*([^;]+);",
+      "replacement": "${1}${2}.setScaleX(${3});",
+      "note": "Flash scaleX write → Entity.setScaleX" },
+    { "pattern": "(?m)^(\\s*)([^\\n=;]+?)\\.scaleY\\s*=\\s*([^;]+);",
+      "replacement": "${1}${2}.setScaleY(${3});",
+      "note": "Flash scaleY write → Entity.setScaleY" },
+    { "pattern": "(?m)^(\\s*)([^\\n=;]+?)\\.rotation\\s*=\\s*([^;]+);",
+      "replacement": "${1}${2}.setRotation(${3});",
+      "note": "Flash rotation write → Entity.setRotation" },
+    { "pattern": "(?m)^(\\s*)([^\\n=;]+?)\\.alpha\\s*=\\s*([^;]+);",
+      "replacement": "${1}${2}.setAlpha(${3});",
+      "note": "Flash alpha write → Entity.setAlpha" },
+    { "pattern": "(?m)^(\\s*)([^\\n=;]+?)\\.visible\\s*=\\s*([^;]+);",
+      "replacement": "${1}${2}.setVisible(${3});",
+      "note": "Flash visible write → Entity.setVisible" },
+    { "pattern": "\\.scaleX\\b",   "replacement": ".getScaleX()",   "note": "Flash scaleX read → Entity.getScaleX" },
+    { "pattern": "\\.scaleY\\b",   "replacement": ".getScaleY()",   "note": "Flash scaleY read → Entity.getScaleY" },
+    { "pattern": "\\.rotation\\b", "replacement": ".getRotation()", "note": "Flash rotation read → Entity.getRotation" },
+
     // gotoAndPlay("LABEL") → playFrameLabel("LABEL"). Numeric form
     // gotoAndPlay(N) → playFrame(N) — included for completeness even though
     // no character currently uses it.
@@ -912,6 +945,15 @@
     { "category": "no_equivalent", "name": "stop", "note": "timeline navigation; no timeline in FM (AudioClip.stop() exists but requires a clip handle)" },
     { "category": "no_equivalent", "name": "killAttackboxes", "note": "no FM equivalent" },
     { "category": "no_equivalent", "name": "checkAtkilled", "note": "no FM equivalent" },
+    // Fraymakers has no item system, so the whole SSF2 item surface is commented out
+    // rather than mapped. This is a DELIBERATE non-goal, not an unfinished port: a custom
+    // item implementation is planned separately, and until it exists these calls have
+    // nothing to resolve to. Declaring them here keeps them out of the
+    // conversion_log `unknown` stream, which should only list things still worth chasing.
+    { "category": "no_equivalent", "name": "activateItem", "note": "no FM item system; custom implementation planned separately" },
+    { "category": "no_equivalent", "name": "deactivateItem", "note": "no FM item system; custom implementation planned separately" },
+    { "category": "no_equivalent", "name": "generateCharacterItem", "note": "no FM item system; custom implementation planned separately" },
+    { "category": "no_equivalent", "name": "dropItem", "note": "no FM item system; custom implementation planned separately" },
     { "category": "no_equivalent", "name": "pickupItem", "note": "no FM item system (FM has Assists)" },
     { "category": "no_equivalent", "name": "tossItem", "note": "no FM item system" },
     { "category": "no_equivalent", "name": "getItem", "note": "no FM item system" },

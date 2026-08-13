@@ -321,7 +321,14 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
             }
         }
         // a second ENTER_FRAME listener that logs Characters[0] physics each frame
-        ssf2_converter::abc_inject::inject_jump_probe(abc, SSF2_DOC_CLASS, &traj, 0)
+        ssf2_converter::abc_inject::inject_jump_probe(abc, SSF2_DOC_CLASS, &traj, 0)?;
+        // per-frame animation recorder: the engine PUSHES FRAME: lines over the same bridge
+        // socket, exactly as Fraymakers pushes ANIM: telemetry. Polling can't do this job —
+        // it races the move (a 7-frame attack is ~233ms, the same order as the round trip
+        // between sending input and starting to watch). See inject_frame_recorder.
+        ssf2_converter::abc_inject::inject_frame_recorder(abc, SSF2_DOC_CLASS, 0)?;
+        // engine-error telemetry, the SSF2 half of Fraymakers' SCRIPTERR channel
+        ssf2_converter::abc_inject::inject_error_reporter(abc, SSF2_DOC_CLASS)
     })?;
     macos_resign(&dst_app);
     Ok(dst_app)

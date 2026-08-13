@@ -1083,7 +1083,7 @@ fn boot_new(writer: SharedWriter, cleanup: SharedCleanup, conn: SharedConn,
     // sends `spawn <char>` on READY. Regular boot = full (non-headless) Title/UGC boot that
     // is just a live TCP bridge with no auto-spawn. Both keep active TCP.
     let bake = if quick && !char_name.is_empty() { Some(char_name.as_str()) } else { None };
-    match crate::ui::patch_and_launch_with_progress(Some(&on_progress), bake) {
+    match crate::ui::patch_and_launch_with_progress(Some(&on_progress), bake, None) {
         // 60s (was 30): a cold fast-boot can take longer than 30s to dial in, and a timeout
         // here disposes the guard — which KILLS the just-launched engine (looks like a crash).
         // The CLI session uses 45s; give the GUI even more headroom.
@@ -1096,7 +1096,7 @@ fn boot_new(writer: SharedWriter, cleanup: SharedCleanup, conn: SharedConn,
                 // policy as the CLI); a regular boot doesn't auto-launch.
                 let autostart = if quick {
                     crate::fastboot::command(crate::fastboot::Engine::Fraymakers,
-                        &crate::fastboot::BootOptions { char_name: Some(char_name.clone()), full: false })
+                        &crate::fastboot::BootOptions { char_name: Some(char_name.clone()), stage_name: None, full: false })
                 } else { None };
                 spawn_reader(reader, proxy.clone(), writer.clone(), autostart);
                 let _ = proxy.send_event(Ev::Js(format!(
@@ -1220,7 +1220,7 @@ fn boot_ssf2(cleanup: SharedCleanup, proxy: EventLoopProxy<Ev>, char_name: Optio
         // Same shared fastboot policy as the CLI + the Fraymakers GUI — only the transport
         // differs (SSF2 is synchronous RPC, so we fire it inline here rather than on a
         // READY line). `wait_ready` above is the SSF2 analogue of Fraymakers' READY.
-        let opts = crate::fastboot::BootOptions { char_name: Some(ch.clone()), full: false };
+        let opts = crate::fastboot::BootOptions { char_name: Some(ch.clone()), stage_name: None, full: false };
         if let Some(cmd) = crate::fastboot::command(crate::fastboot::Engine::Ssf2, &opts) {
             let _ = proxy.send_event(Ev::Line(format!("SYS:Engine ready — spawning {ch}…")));
             let mut target = crate::ssf2_target::Ssf2Target::new();

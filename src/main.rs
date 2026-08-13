@@ -1339,6 +1339,179 @@ fn connect_edit(
         .ok_or_else(|| anyhow::anyhow!("Match.projectiles field not found"))?;
     let structures_field = find_field(code, match_t, "structures")
         .ok_or_else(|| anyhow::anyhow!("Match.structures field not found"))?;
+    // The union. Swept in ADDITION to the specific collections above (not instead of them):
+    // it's the only place vfx show up, and converted animated backdrop elements are vfx, so
+    // without it the tree is blind to exactly the objects stage porting gets wrong.
+    let gameobjects_field = find_field(code, match_t, "gameObjects")
+        .ok_or_else(|| anyhow::anyhow!("Match.gameObjects field not found"))?;
+    // ---- the stage's display layers ----
+    // Vfx are NOT GameObjects (Vfx extends Entity), so they can never appear in any Match
+    // collection. Converted animated backdrop elements ARE vfx, reparented into one of the
+    // stage's eleven named layer containers, so the only way to see them is to walk those
+    // containers. That walk is also the like-for-like counterpart of the SSF2 display list.
+    //
+    // Reached by constructing a StageApi over the live stage entity and calling its getters
+    // DIRECTLY. The same calls are unreachable from the interpreter Peptide drives (ApiObject
+    // dispatch lands with a null receiver there) but are fine as typed bytecode calls.
+    let stage_api_ctor = require_fn(code, "__constructor__", Some("pxf.api.$StageApi"))?;
+    let stage_api_t = require_type(code, "pxf.api.StageApi")?;
+    let container_api_t = require_type(code, "pxf.api.ContainerApi")?;
+    let disp_container_t = require_type(code, "pxf.display.Container")?;
+    let capi_container_field = require_field(code, "pxf.api.ContainerApi", "__container__")?;
+    // Counted off the heaps object's own child array, not pxf.display.Container.numChildren:
+    // that field reads 0 even for the CHARACTERS layer, so it isn't maintained on the paths
+    // the engine actually adds children through.
+    let h2d_object_t = require_type(code, "h2d.Object")?;
+    let cont_display_field = require_field(code, "pxf.display.Container", "_displayObject")?;
+    let h2d_children_field = require_field(code, "h2d.Object", "children")?;
+    // ---- screenshot chain (the 'y' command) ----
+    // Structure is not sight: the walk above can prove an object exists, is visible, sized and
+    // positioned, and still say nothing about whether a single pixel of it reaches the screen.
+    // Heaps can read its own framebuffer back, so the engine takes its own screenshot and the
+    // PNG comes home over the existing socket as hex (the stock-icon path's trick) — no file
+    // written engine-side, and no dependence on the host being able to capture the window, which
+    // it cannot: a headless session's window has no capturable surface.
+    //
+    // This captures the SCENE, not the camera view, so the frame can contain art the camera
+    // crops away and carries no camera zoom. Same caveat on the SSF2 side. See the `shot` doc on
+    // DebugTarget: set the camera before comparing frames across engines.
+    let h2d_getscene = require_fn(code, "getScene", Some("h2d.Object"))?;
+    let scene_capturebitmap = require_fn(code, "captureBitmap", Some("h2d.Scene"))?;
+    let tile_gettexture = require_fn(code, "getTexture", Some("h2d.Tile"))?;
+    let tex_capturepixels = require_fn(code, "capturePixels", Some("h3d.mat.Texture"))?;
+    let pixels_topng = require_fn(code, "toPNG", Some("hxd.Pixels"))?;
+    let bytes_tohex = require_fn(code, "toHex", Some("haxe.io.Bytes"))?;
+    let h2d_scene_t = require_type(code, "h2d.Scene")?;
+    let h2d_bitmap_t = require_type(code, "h2d.Bitmap")?;
+    let h2d_tile_t = require_type(code, "h2d.Tile")?;
+    let bitmap_tile_field = require_field(code, "h2d.Bitmap", "tile")?;
+    let texture_t = require_type(code, "h3d.mat.Texture")?;
+    let pixels_t = require_type(code, "hxd.Pixels")?;
+    let iobytes_t = require_type(code, "haxe.io.Bytes")?;
+    // The optional args (capture layer / mip level / crop bounds, png level) are read off the
+    // callee's own signature rather than hardcoded: they are nullable primitives with no class
+    // name to resolve, and pinning their type indices would silently rot on an engine update.
+    // `require_fn` yields a FINDEX, which is not a position in `code.functions` — look the
+    // function up by findex before reading its signature.
+    let arg_t = |fun: usize, i: usize| -> anyhow::Result<usize> {
+        let f = code.functions.iter().find(|f| f.findex.0 == fun)
+            .ok_or_else(|| anyhow::anyhow!("no function with findex {fun}"))?;
+        code.types[f.t.0].get_type_fun()
+            .and_then(|tf| tf.args.get(i).map(|a| a.0))
+            .ok_or_else(|| anyhow::anyhow!("arg {i} of fn {fun} has no type"))
+    };
+    let cap_layer_t = arg_t(tex_capturepixels, 1)?;
+    let cap_bounds_t = arg_t(tex_capturepixels, 3)?;
+    let png_level_t = arg_t(pixels_topng, 1)?;
+    // Per-child readout, so a layer reports its actual CONTENTS rather than just a count.
+    // This is the Fraymakers counterpart of the SSF2 display-list walk: one row per object
+    // with the same facts (class, name, position, visibility), so the two engines' stages can
+    // be diffed object by object instead of compared by totals.
+    let h2d_x_field = require_field(code, "h2d.Object", "x")?;
+    let h2d_y_field = require_field(code, "h2d.Object", "y")?;
+    let h2d_vis_field = require_field(code, "h2d.Object", "visible")?;
+    // absX/absY: where the sprite ACTUALLY renders in absolute space. A display child's own
+    // x/y is local to its container, so it reads (0,0) and says nothing about placement; the
+    // absolute pair is what an SSF2 world position can be compared against, and what makes the
+    // stage-local -> absolute transform measurable instead of guessed.
+    let disp_absx_field = require_field(code, "pxf.display.HeapsContainer", "absX")?;
+    let disp_absy_field = require_field(code, "pxf.display.HeapsContainer", "absY")?;
+    // Pixel size, the figure SSF2 reports per display object. The entity's `dimensions`
+    // component is null in this engine, so it comes from the DISPLAY side instead:
+    // `h2d.Object.getSize(out)` returns a Bounds, and the size is the max/min difference.
+    let h2d_getsize = require_fn(code, "getSize", Some("h2d.Object"))?;
+    let bounds_t = require_type(code, "h2d.col.Bounds")?;
+    let b_xmin = require_field(code, "h2d.col.Bounds", "xMin")?;
+    let b_ymin = require_field(code, "h2d.col.Bounds", "yMin")?;
+    let b_xmax = require_field(code, "h2d.col.Bounds", "xMax")?;
+    let b_ymax = require_field(code, "h2d.col.Bounds", "yMax")?;
+    let h2d_name_field = require_field(code, "h2d.Object", "name")?;
+    // Child slots swept per layer. bowserscastle's busiest layer holds ~41, so 48 covers it;
+    // the group header carries the TRUE length either way, so a layer that outruns this reads
+    // as truncated rather than silently short.
+    let layer_child_idx: Vec<usize> = (0..48).map(|i| add_int(code, i)).collect();
+    // Display rows are emitted as FIELDS, not prose: the host renders them with the same
+    // `fmt_stage_node` the SSF2 walk uses, so one engine can't drift into its own layout and
+    // make the two stages undiffable. `N` marks a node row; fields are tab-separated.
+    let tree_kid_g = add_string_const(code, "N\t");
+    let tree_hidden_g = add_string_const(code, "0");
+    let tree_visible_g = add_string_const(code, "1");
+    let tree_unnamed_g = add_string_const(code, "");
+    let tree_space_g = add_string_const(code, "\t");   // field separator for N-rows
+    // ---- the tick stack ----
+    // Vfx are Entities but appear in NO Match collection, so a converted backdrop element is
+    // invisible to the collection sweep. Everything that updates per frame is on the tick
+    // stack, so that's where they are. Walked by class name ONLY: the list is heterogeneous
+    // (entities alongside systems and components), and calling an Entity accessor on a
+    // non-entity would take the engine down.
+    let tickstack_field = require_field(code, "pxf.core.Match", "tickStack")?;
+    let tickables_field = require_field(code, "pxf.core.TickStack", "m_tickables")?;
+    let tickstack_t = require_type(code, "pxf.core.TickStack")?;
+    let dllist_t = require_type(code, "pxf.util.DLinkedList")?;
+    let dlnode_t = require_type(code, "pxf.util.DLinkedListNode")?;
+    let dl_first_field = require_field(code, "pxf.util.DLinkedList", "first")?;
+    let dl_len_field = require_field(code, "pxf.util.DLinkedList", "length")?;
+    let dl_value_field = require_field(code, "pxf.util.DLinkedListNode", "value")?;
+    let dl_next_field = require_field(code, "pxf.util.DLinkedListNode", "next")?;
+    let tree_tick_g = add_string_const(code, "  [tickables] n=");
+    // Field names for DYNAMIC access. A tick-stack entry is a boxed `Dynamic`, and neither an
+    // unchecked nor a checked cast yields a usable Entity pointer from one (both read garbage:
+    // 3.1e-314 / NaN). DynGet reads a field off the dynamic BY NAME instead, and returns null
+    // for a field the object doesn't have — so it needs no type guard and can't crash the
+    // engine on a heterogeneous list. This is what makes the Fraymakers side able to report an
+    // animation clock at all, which is the axis the SSF2 walk already had.
+    let f_animation = add_string(code, "animation");
+    let f_currentframe = add_string(code, "currentFrame");
+    let f_totalframes = add_string(code, "totalFrames");
+    let f_currentanim = add_string(code, "currentAnimation");
+    let f_body = add_string(code, "body");
+    // Pixel size, so a record can be compared against SSF2's width/height.
+    //
+    // `dimensions` is the obvious source and it does NOT work: the component is declared on
+    // the entity but is null at runtime — `p0.dimensions` reads null through the interpreter
+    // while `p0.body.x` reads 328.315, so it isn't a reflection problem. Left wired (the
+    // fields simply come back empty) rather than removed, because the real source is
+    // `h2d.Object::getBounds()` on the display side, which is a METHOD call and so needs more
+    // than the DynGet field reads the rest of this row uses.
+    let f_dimensions = add_string(code, "dimensions");
+    let f_width = add_string(code, "width");
+    let f_height = add_string(code, "height");
+    let f_x = add_string(code, "x");
+    let f_y = add_string(code, "y");
+    // Hops to follow. bowserscastle's list is 295 entries and the first ~90 are all
+    // ItemSpawnPoints, so a short walk sees nothing but items (which aren't ported anyway)
+    // and truncates before the interesting entities. The header carries the true length, so
+    // a list longer than this still reads as truncated rather than silently short.
+    const TICK_HOPS: usize = 320;
+    // In VfxLayer order (back to front) — the same eleven the layer constants name.
+    const STAGE_LAYERS: [&str; 11] = [
+        "BACKGROUND_BEHIND", "BACKGROUND_STRUCTURES", "BACKGROUND_SHADOWS", "BACKGROUND_EFFECTS",
+        "CHARACTERS_BACK", "CHARACTERS", "CHARACTERS_FRONT",
+        "FOREGROUND_STRUCTURES", "FOREGROUND_SHADOWS", "FOREGROUND_EFFECTS", "FOREGROUND_FRONT",
+    ];
+    let layer_getters: Vec<usize> = [
+        "getBackgroundBehindContainer", "getBackgroundStructuresContainer",
+        "getBackgroundShadowsContainer", "getBackgroundEffectsContainer",
+        "getCharactersBackContainer", "getCharactersContainer", "getCharactersFrontContainer",
+        "getForegroundStructuresContainer", "getForegroundShadowsContainer",
+        "getForegroundEffectsContainer", "getForegroundFrontContainer",
+    ].iter().map(|n| require_fn(code, n, Some("pxf.api.StageApi"))).collect::<anyhow::Result<_>>()?;
+    // The live stage, bound into the interpreter scope as `stage` rather than walked (it's a
+    // single object, not a collection). The Fraymakers script API gives every entity script an
+    // ambient `self`/`match`/`camera`/`stage`, where `stage` is the API class — the one with
+    // getCurrentFrame/getTotalFrames and the per-layer display containers. So `stage` here is
+    // that same API object, reached entity -> script wrapper -> api. Binding the ENTITY instead
+    // looks like it works (it reflects) but is the wrong object: a stage entity carries no
+    // body/animation/stageStats components, so every interesting field reads null.
+    let stage_entity_t = require_type(code, "pxf.entity.Stage")?;
+    let stage_field = find_field(code, match_t, "stageEntity")
+        .ok_or_else(|| anyhow::anyhow!("Match.stageEntity field not found"))?;
+    // NOT bound: the stage's script-API object (pxf.api.StageApi), the sandbox an entity
+    // script sees as its ambient `stage`. It's the right conceptual surface and it can be
+    // constructed correctly here (`new StageApi(stageEntity)`, back-reference verified set),
+    // but its methods are not callable through the interpreter Peptide drives: every call
+    // lands in the engine with a null receiver. Entity methods (p0.getStateName()) work, API
+    // methods do not, so the sandbox has to be reached in bytecode the way `tree` is.
     let m_idx = add_int(code, 'm' as i32);
     let t_idx = add_int(code, 't' as i32);
     let m_ack_g = add_string_const(code, "M:JAB\n");
@@ -1373,6 +1546,7 @@ fn connect_edit(
     let damage_t = require_type(code, "pxf.components.Damage")?;
     // ---- 'w' (tree walk): symbols to read each gameObject's class + position ----
     let w_idx = add_int(code, 'w' as i32);
+    let y_idx = add_int(code, 'y' as i32);
     let output_t = require_type(code, "haxe.io.Output")?;
     let entity_t = require_type(code, "pxf.entity.Entity")?;
     let entity_getx = require_fn(code, "getX", Some("pxf.entity.Entity"))?;
@@ -1385,10 +1559,27 @@ fn connect_edit(
     let tree_comma_g = add_string_const(code, ",");
     let tree_close_g = add_string_const(code, ")\n");
     let tree_nomatch_g = add_string_const(code, "TREE: (no live match)\n");
+    let shot_hdr_g = add_string_const(code, "SHOT:");
+    let shot_fail_g = add_string_const(code, "SHOT: (no frame)\n");
     // slot-index constants for the UNROLLED walk (a bytecode loop whose body resolves/allocates
     // corrupts its counter at runtime — same phenomenon as the multiplayer extra-builds; unrolling
     // with fixed indices sidesteps it entirely).
-    let tree_slot_idx: Vec<usize> = (0..8).map(|i| add_int(code, i)).collect();
+    // Slot indices for the unrolled sweep. gameObjects is the UNION collection and on a real
+    // stage it runs long (characters + hazards + every structure + every vfx), so it gets a
+    // deeper set than the specific collections.
+    let tree_slot_idx: Vec<usize> = (0..24).map(|i| add_int(code, i)).collect();
+    // Per-collection group headers. They carry the collection's TRUE length, so a collection
+    // longer than its slot budget reads as truncated instead of silently short — and they make
+    // the gameObjects duplicates interpretable (a character appears in both its own collection
+    // and the union).
+    let tree_grp_g: Vec<usize> = ["characters", "customGameObjects", "projectiles", "structures", "gameObjects"]
+        .iter().map(|n| add_string_const(code, &format!("  [{n}] n="))).collect();
+    let tree_nl_g = add_string_const(code, "\n");
+    let tree_layer_g: Vec<usize> = STAGE_LAYERS.iter()
+        .map(|n| add_string_const(code, &format!("  [layer {n}] n="))).collect();
+    // bare layer names, stamped on each display row so an element carries its own depth slot
+    let tree_layername_g: Vec<usize> = STAGE_LAYERS.iter()
+        .map(|n| add_string_const(code, n)).collect();
     let char_body_f = require_field(code, "pxf.entity.Character", "body")?;
     let char_physics_f = require_field(code, "pxf.entity.Character", "physics")?;
     let char_damage_f = require_field(code, "pxf.entity.Character", "damage")?;
@@ -1428,6 +1619,7 @@ fn connect_edit(
     let eval_p3_g = add_string_const(code, "p3");  // bound to player-3 Character (null until 4 players)
     let eval_match_g = add_string_const(code, "match"); // bound to MatchController.currentMatch each eval
     let eval_chars_g = add_string_const(code, "characters"); // bound to the live character ArrayObj each eval
+    let eval_stage_ent_g = add_string_const(code, "stageEntity"); // the raw entity behind it (tooling)
     // The command implementations, in hscript (ported from bytecode). Loaded ONCE into
     // the interp after applyInterpreterGlobals; every friendly command calls into these.
     // commands.hsx holds the end-user-facing helpers; the host-owned matchStatus icon
@@ -1492,6 +1684,8 @@ fn connect_edit(
     eprintln!("scrub: pauseAnimationPlayback.f={pause_field} playFrame={play_frame}");
     let t_prefix_g = add_string_const(code, "T:");
     let anim_prefix_g = add_string_const(code, "ANIM:"); // per-frame state-change telemetry
+    let frame_prefix_g = add_string_const(code, "FRAME:"); // per-frame telemetry (timing parity)
+    let bar_g = add_string_const(code, "|");
     let t_nomatch_g = add_string_const(code, "T:NOMATCH\n");
     eprintln!("move/telemetry: Character t={char_entity_t} toState={to_state} getStateName={get_state_name} CState t={cstate_statics_t} g={cstate_global} JAB.field={jab_field} characters.field={characters_field}");
     // ---- 'l' command: synchronous custom-.fra load (headless, no worker thread) ----
@@ -1740,6 +1934,8 @@ fn connect_edit(
     let eval_regs_base = add_regs(f, &[hs_parser_t as usize, hs_interp_t as usize, hs_expr_t as usize, 9]);
     let (e_parser, e_interp, e_expr, e_result) =
         (Reg(eval_regs_base), Reg(eval_regs_base + 1), Reg(eval_regs_base + 2), Reg(eval_regs_base + 3));
+    // Scratch for the `stage` binding (a typed Field read needs a register of the field's type).
+    let stage_reg = Reg(add_regs(f, &[stage_entity_t]));
     // PlayerConfig scratch for post-start spawnPlayer of extra players.
     let cfg_pc_reg = Reg(add_regs(f, &[player_config_t]));
     // Scratch for the headless pre-match loading-screen factory set: the MatchController
@@ -2838,7 +3034,94 @@ fn connect_edit(
     // hl ArrayObj doesn't reflect length/index in hscript, so this is bytecode: read
     // currentMatch.gameObjects (length=field0, native array=field1) and emit one line per entity —
     // "  <class> @(x,y)\n" (class via Type.getClassName(Type.getClass(el)), pos via Entity.getX/Y).
-    let idx_w_check = ops.len();
+    // ---- 'y' command: the engine screenshots ITSELF and returns the PNG as hex ----
+    // Any display object reaches the scene, so this reuses the same StageApi -> container ->
+    // h2d.Object hop the walk uses, then asks Heaps to read its own framebuffer back.
+    let idx_y_check = ops.len();
+    ops.push(Opcode::Int { dst: rr(16), ptr: RefInt(y_idx) });
+    let idx_jne_y = ops.len();
+    ops.push(Opcode::JNotEq { a: r_c, b: rr(16), offset: 0 });            // not 'y' -> 'w' check
+    {
+        let mut a = Asm::new(f.regs.len() as u32);
+        let fail = a.label();
+        let end = a.label();
+        let r_out2 = a.reg(output_t);
+        let r_mc = a.reg(mc_statics_t);
+        let r_cm = a.reg(match_t);
+        let r_st = a.reg(stage_entity_t);
+        let r_api = a.reg(stage_api_t);
+        let r_capi = a.reg(container_api_t);
+        let r_cont = a.reg(disp_container_t);
+        let r_h2d = a.reg(h2d_object_t);
+        let r_scene = a.reg(h2d_scene_t);
+        let r_bmp = a.reg(h2d_bitmap_t);
+        let r_tile = a.reg(h2d_tile_t);
+        let r_tex = a.reg(texture_t);
+        let r_px = a.reg(pixels_t);
+        let r_bytes = a.reg(iobytes_t);
+        let r_hex = a.reg(str_t);
+        let r_lay = a.reg(cap_layer_t);
+        let r_bnd = a.reg(cap_bounds_t);
+        let r_lvl = a.reg(png_level_t);
+        let r_acc = a.reg(str_t);
+        let r_lbl = a.reg(str_t);
+        let r_ret2 = a.reg(9);
+        let r_void = a.reg(0);
+        a.op(Opcode::Field { dst: r_out2, obj: r_sock2, field: RefField(out_field) });
+        a.op(Opcode::GetGlobal { dst: r_mc, global: RefGlobal(mc_g) });
+        a.op(Opcode::Field { dst: r_cm, obj: r_mc, field: RefField(cm_field) });
+        a.jnull(r_cm, fail);
+        a.op(Opcode::Field { dst: r_st, obj: r_cm, field: RefField(stage_field) });
+        a.jnull(r_st, fail);
+        // stage -> its characters layer -> the heaps object that owns the scene
+        a.op(Opcode::New { dst: r_api });
+        a.op(Opcode::Call2 { dst: r_void, fun: RefFun(stage_api_ctor), arg0: r_api, arg1: r_st });
+        a.op(Opcode::Call1 { dst: r_capi, fun: RefFun(layer_getters[5]), arg0: r_api });
+        a.jnull(r_capi, fail);
+        a.op(Opcode::Field { dst: r_cont, obj: r_capi, field: RefField(capi_container_field) });
+        a.jnull(r_cont, fail);
+        a.op(Opcode::Field { dst: r_h2d, obj: r_cont, field: RefField(cont_display_field) });
+        a.jnull(r_h2d, fail);
+        a.op(Opcode::Call1 { dst: r_scene, fun: RefFun(h2d_getscene), arg0: r_h2d });
+        a.jnull(r_scene, fail);
+        // captureBitmap(null target) allocates its own render target sized to the scene
+        a.op(Opcode::Null { dst: r_tile });
+        a.op(Opcode::Call2 { dst: r_bmp, fun: RefFun(scene_capturebitmap), arg0: r_scene, arg1: r_tile });
+        a.jnull(r_bmp, fail);
+        a.op(Opcode::Field { dst: r_tile, obj: r_bmp, field: RefField(bitmap_tile_field) });
+        a.jnull(r_tile, fail);
+        a.op(Opcode::Call1 { dst: r_tex, fun: RefFun(tile_gettexture), arg0: r_tile });
+        a.jnull(r_tex, fail);
+        // read the framebuffer back: whole surface (null layer / mip / crop)
+        a.op(Opcode::Null { dst: r_lay });
+        a.op(Opcode::Null { dst: r_bnd });
+        a.op(Opcode::Call4 { dst: r_px, fun: RefFun(tex_capturepixels), arg0: r_tex, arg1: r_lay, arg2: r_lay, arg3: r_bnd });
+        a.jnull(r_px, fail);
+        a.op(Opcode::Null { dst: r_lvl });
+        a.op(Opcode::Call2 { dst: r_bytes, fun: RefFun(pixels_topng), arg0: r_px, arg1: r_lvl });
+        a.jnull(r_bytes, fail);
+        a.op(Opcode::Call1 { dst: r_hex, fun: RefFun(bytes_tohex), arg0: r_bytes });
+        a.jnull(r_hex, fail);
+        a.op(Opcode::GetGlobal { dst: r_acc, global: RefGlobal(shot_hdr_g) });
+        a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_hex });
+        a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_nl_g) });
+        a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+        a.op(Opcode::Null { dst: r_lbl });
+        a.op(Opcode::Call3 { dst: r_ret2, fun: RefFun(write_str), arg0: r_out2, arg1: r_acc, arg2: r_lbl });
+        a.jalways(end);
+        a.place(fail);
+        a.op(Opcode::GetGlobal { dst: r_acc, global: RefGlobal(shot_fail_g) });
+        a.op(Opcode::Null { dst: r_lbl });
+        a.op(Opcode::Call3 { dst: r_ret2, fun: RefFun(write_str), arg0: r_out2, arg1: r_acc, arg2: r_lbl });
+        a.place(end);
+        a.op(Opcode::Call1 { dst: r_ret2, fun: RefFun(flush), arg0: r_out2 });
+        let (a_ops, a_regs) = a.finish();
+        add_regs(f, &a_regs);
+        ops.extend(a_ops);
+    }
+    let y_skip = (ops.len() - idx_jne_y - 1) as i32;
+    if let Opcode::JNotEq { offset, .. } = &mut ops[idx_jne_y] { *offset = y_skip; }
+
     ops.push(Opcode::Int { dst: rr(16), ptr: RefInt(w_idx) });
     let idx_jne_w = ops.len();
     ops.push(Opcode::JNotEq { a: r_c, b: rr(16), offset: 0 });            // not 'w' -> 'l' check (patched)
@@ -2850,6 +3133,7 @@ fn connect_edit(
         let r_mc   = a.reg(mc_statics_t);
         let r_cm   = a.reg(match_t);
         let r_go   = a.reg(38);              // ArrayObj
+        let r_ts   = a.reg(tickstack_t);     // Match.tickStack
         let r_len  = a.reg(3);
         let r_i    = a.reg(3);
         let r_arr  = a.reg(11);              // native array
@@ -2871,14 +3155,37 @@ fn connect_edit(
         a.op(Opcode::GetGlobal { dst: r_acc, global: RefGlobal(tree_hdr_g) });
         a.op(Opcode::Null { dst: r_lbl });
         a.op(Opcode::Call3 { dst: r_ret2, fun: RefFun(write_str), arg0: r_out2, arg1: r_acc, arg2: r_lbl });
-        // sweep characters + custom game objects + projectiles; gameObjects alone isn't the union.
-        // UNROLLED over fixed slot indices (8 per collection): a bytecode loop whose body makes
-        // resolve/alloc calls corrupts its counter at runtime (the looped version dropped
-        // characters[1] and over-ran customGameObjects[2], killing the handler on an out-of-bounds
-        // GetArray) — the same phenomenon the multiplayer extra-builds hit; fixed indices + forward
-        // jumps sidestep it. 8 slots cover any triage roster (4 players + assists / a stage's CGOs).
-        for fld in [characters_field, cgo_field, proj_field, structures_field] {
-            for &slot_idx in &tree_slot_idx {
+        // Sweep the specific collections AND the gameObjects union. gameObjects alone isn't the
+        // union of the specific ones, and the specific ones don't cover vfx, so both are needed;
+        // entries that appear twice are labelled by their group header.
+        // UNROLLED over fixed slot indices: a bytecode loop whose body makes resolve/alloc calls
+        // corrupts its counter at runtime (the looped version dropped characters[1] and over-ran
+        // customGameObjects[2], killing the handler on an out-of-bounds GetArray) — the same
+        // phenomenon the multiplayer extra-builds hit; fixed indices + forward jumps sidestep it.
+        for (grp, (fld, slots)) in [
+            (characters_field, 8usize), (cgo_field, 8), (proj_field, 8),
+            (structures_field, 16), (gameobjects_field, 24),
+        ].into_iter().enumerate() {
+            // group header: "  [<name>] n=<true length>\n"
+            {
+                let skip_hdr = a.label();
+                a.op(Opcode::GetGlobal { dst: r_mc, global: RefGlobal(mc_g) });
+                a.op(Opcode::Field { dst: r_cm, obj: r_mc, field: RefField(cm_field) });
+                a.jnull(r_cm, skip_hdr);
+                a.op(Opcode::Field { dst: r_go, obj: r_cm, field: RefField(fld) });
+                a.jnull(r_go, skip_hdr);
+                a.op(Opcode::Field { dst: r_len, obj: r_go, field: RefField(0) });
+                a.op(Opcode::GetGlobal { dst: r_acc, global: RefGlobal(tree_grp_g[grp]) });
+                a.op(Opcode::ToDyn { dst: r_dyn, src: r_len });
+                a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dyn });
+                a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_nl_g) });
+                a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                a.op(Opcode::Null { dst: r_lbl });
+                a.op(Opcode::Call3 { dst: r_ret2, fun: RefFun(write_str), arg0: r_out2, arg1: r_acc, arg2: r_lbl });
+                a.place(skip_hdr);
+            }
+            for &slot_idx in &tree_slot_idx[..slots] {
                 let skip = a.label();
                 // re-derive the collection chain fresh per slot (nothing persists across calls).
                 a.op(Opcode::GetGlobal { dst: r_mc, global: RefGlobal(mc_g) });
@@ -2904,7 +3211,11 @@ fn connect_edit(
                 a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_at_g) });
                 a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
                 // x = el.getX()
-                a.op(Opcode::UnsafeCast { dst: r_ent, src: r_el });
+                // SafeCast, not UnsafeCast: a tickable's `value` is Dynamic, and reinterpreting
+                // that as an object pointer reads garbage (it produced 3.1e-314 / NaN). The
+                // class-name guard above has already established this is a Vfx, so the checked
+                // cast succeeds.
+                a.op(Opcode::SafeCast { dst: r_ent, src: r_el });
                 a.op(Opcode::Call1 { dst: r_f, fun: RefFun(entity_getx), arg0: r_ent });
                 a.op(Opcode::ToDyn { dst: r_dyn, src: r_f });
                 a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dyn });
@@ -2912,7 +3223,7 @@ fn connect_edit(
                 a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_comma_g) });
                 a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
                 // y = el.getY() (el survives the calls; re-cast for the typed call)
-                a.op(Opcode::UnsafeCast { dst: r_ent, src: r_el });
+                a.op(Opcode::SafeCast { dst: r_ent, src: r_el });
                 a.op(Opcode::Call1 { dst: r_f, fun: RefFun(entity_gety), arg0: r_ent });
                 a.op(Opcode::ToDyn { dst: r_dyn, src: r_f });
                 a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dyn });
@@ -2924,6 +3235,251 @@ fn connect_edit(
                 a.place(skip);
             }
         }
+        // ---- the stage's display layers (the FM counterpart of the SSF2 display list) ----
+        // One line per named layer with its child count, so a converted backdrop element that
+        // never got created, or landed in the wrong layer, is visible as a count mismatch.
+        {
+            let r_st   = a.reg(stage_entity_t);
+            let r_api  = a.reg(stage_api_t);
+            let r_capi = a.reg(container_api_t);
+            let r_cont = a.reg(disp_container_t);
+            let r_h2d  = a.reg(h2d_object_t);
+            let r_kids = a.reg(38);              // ArrayObj
+            let r_bool = a.reg(7);               // visible flag
+            let r_bounds = a.reg(bounds_t);
+            let r_f2 = a.reg(6);
+            let r_void = a.reg(0);
+            for (li, getter) in layer_getters.iter().enumerate() {
+                let skip = a.label();
+                a.op(Opcode::GetGlobal { dst: r_mc, global: RefGlobal(mc_g) });
+                a.op(Opcode::Field { dst: r_cm, obj: r_mc, field: RefField(cm_field) });
+                a.jnull(r_cm, skip);
+                a.op(Opcode::Field { dst: r_st, obj: r_cm, field: RefField(stage_field) });
+                a.jnull(r_st, skip);
+                // a fresh api handle per layer — nothing persists across the calls in between
+                a.op(Opcode::New { dst: r_api });
+                a.op(Opcode::Call2 { dst: r_void, fun: RefFun(stage_api_ctor), arg0: r_api, arg1: r_st });
+                a.op(Opcode::Call1 { dst: r_capi, fun: RefFun(*getter), arg0: r_api });
+                a.jnull(r_capi, skip);
+                a.op(Opcode::Field { dst: r_cont, obj: r_capi, field: RefField(capi_container_field) });
+                a.jnull(r_cont, skip);
+                a.op(Opcode::Field { dst: r_h2d, obj: r_cont, field: RefField(cont_display_field) });
+                a.jnull(r_h2d, skip);
+                a.op(Opcode::Field { dst: r_kids, obj: r_h2d, field: RefField(h2d_children_field) });
+                a.jnull(r_kids, skip);
+                a.op(Opcode::Field { dst: r_len, obj: r_kids, field: RefField(0) });   // children.length
+                a.op(Opcode::Field { dst: r_arr, obj: r_kids, field: RefField(1) });   // children.array
+                a.op(Opcode::GetGlobal { dst: r_acc, global: RefGlobal(tree_layer_g[li]) });
+                a.op(Opcode::ToDyn { dst: r_dyn, src: r_len });
+                a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dyn });
+                a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_nl_g) });
+                a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                a.op(Opcode::Null { dst: r_lbl });
+                a.op(Opcode::Call3 { dst: r_ret2, fun: RefFun(write_str), arg0: r_out2, arg1: r_acc, arg2: r_lbl });
+
+                // one row per child: "      <class> \"<name>\" @(x,y)[ HIDDEN]"
+                for &kid_idx in &layer_child_idx {
+                    let next_kid = a.label();
+                    a.op(Opcode::Int { dst: r_i, ptr: RefInt(kid_idx) });
+                    a.jslt(r_i, r_len, next_kid);          // slot < len -> read it
+                    a.jalways(skip);                       // past the end: whole layer done
+                    a.place(next_kid);
+                    a.op(Opcode::GetArray { dst: r_el, array: r_arr, index: r_i });
+                    let after = a.label();
+                    a.jnull(r_el, after);
+                    a.op(Opcode::UnsafeCast { dst: r_h2d, src: r_el });
+                    // class
+                    a.op(Opcode::Call1 { dst: r_cls, fun: RefFun(type_getclass), arg0: r_el });
+                    a.op(Opcode::Call1 { dst: r_str, fun: RefFun(type_getclassname), arg0: r_cls });
+                    a.op(Opcode::GetGlobal { dst: r_acc, global: RefGlobal(tree_kid_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                    // name (may be null -> "-")
+                    a.op(Opcode::Field { dst: r_str, obj: r_h2d, field: RefField(h2d_name_field) });
+                    let have_name = a.label();
+                    a.jnotnull(r_str, have_name);
+                    a.op(Opcode::GetGlobal { dst: r_str, global: RefGlobal(tree_unnamed_g) });
+                    a.place(have_name);
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                    // x, y as fields
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    a.op(Opcode::Field { dst: r_f, obj: r_h2d, field: RefField(h2d_x_field) });
+                    a.op(Opcode::ToDyn { dst: r_dyn, src: r_f });
+                    a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dyn });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    a.op(Opcode::Field { dst: r_f, obj: r_h2d, field: RefField(h2d_y_field) });
+                    a.op(Opcode::ToDyn { dst: r_dyn, src: r_f });
+                    a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dyn });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                    // an invisible object is a real porting outcome, so say so
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    a.op(Opcode::Field { dst: r_bool, obj: r_h2d, field: RefField(h2d_vis_field) });
+                    let vis_done = a.label();
+                    let vis_set = a.label();
+                    a.jtrue(r_bool, vis_set);
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_hidden_g) });
+                    a.jalways(vis_done);
+                    a.place(vis_set);
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_visible_g) });
+                    a.place(vis_done);
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    // No animation clock on a display child: it's a transform wrapper. The
+                    // per-element clock comes from the tick-stack walk below, which reaches
+                    // the Vfx entities themselves.
+                    // frame/total/label are empty for a display child (a transform wrapper
+                    // has no clock); the SIZE slots carry absX/absY instead, which is the one
+                    // thing a display child knows that the entity doesn't: where it actually
+                    // renders. The LAYER is stamped last. Field positions stay identical to a
+                    // tickable row so ONE host parser reads both.
+                    for _ in 0..3 {
+                        a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                        a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    }
+                    // pixel size, from the display object's own bounds
+                    a.op(Opcode::Null { dst: r_bounds });
+                    a.op(Opcode::Call2 { dst: r_bounds, fun: RefFun(h2d_getsize), arg0: r_h2d, arg1: r_bounds });
+                    for (lo, hi) in [(b_xmin, b_xmax), (b_ymin, b_ymax)] {
+                        a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                        a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                        let bskip = a.label();
+                        a.jnull(r_bounds, bskip);
+                        a.op(Opcode::Field { dst: r_f, obj: r_bounds, field: RefField(hi) });
+                        a.op(Opcode::Field { dst: r_f2, obj: r_bounds, field: RefField(lo) });
+                        a.op(Opcode::Sub { dst: r_f, a: r_f, b: r_f2 });
+                        a.op(Opcode::ToDyn { dst: r_dyn, src: r_f });
+                        a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dyn });
+                        a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                        a.place(bskip);
+                    }
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_layername_g[li]) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    // absolute render position, its own pair of fields
+                    for fld in [disp_absx_field, disp_absy_field] {
+                        a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                        a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                        a.op(Opcode::Field { dst: r_f, obj: r_h2d, field: RefField(fld) });
+                        a.op(Opcode::ToDyn { dst: r_dyn, src: r_f });
+                        a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dyn });
+                        a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                    }
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_nl_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    a.op(Opcode::Null { dst: r_lbl });
+                    a.op(Opcode::Call3 { dst: r_ret2, fun: RefFun(write_str), arg0: r_out2, arg1: r_acc, arg2: r_lbl });
+                    a.place(after);
+                }
+                a.place(skip);
+            }
+        }
+        // ---- the tick stack: where the Vfx actually live ----
+        {
+            let r_list = a.reg(dllist_t);
+            let r_node = a.reg(dlnode_t);
+            let r_dynb = a.reg(9);   // body, as Dynamic
+            let r_dyna = a.reg(9);   // animation component, as Dynamic
+            let r_dynv = a.reg(9);   // a field value, as Dynamic
+            let done = a.label();
+
+            a.op(Opcode::GetGlobal { dst: r_mc, global: RefGlobal(mc_g) });
+            a.op(Opcode::Field { dst: r_cm, obj: r_mc, field: RefField(cm_field) });
+            a.jnull(r_cm, done);
+            a.op(Opcode::Field { dst: r_ts, obj: r_cm, field: RefField(tickstack_field) });
+            a.jnull(r_ts, done);
+            a.op(Opcode::Field { dst: r_list, obj: r_ts, field: RefField(tickables_field) });
+            a.jnull(r_list, done);
+
+            // header with the TRUE length
+            a.op(Opcode::Field { dst: r_len, obj: r_list, field: RefField(dl_len_field) });
+            a.op(Opcode::GetGlobal { dst: r_acc, global: RefGlobal(tree_tick_g) });
+            a.op(Opcode::ToDyn { dst: r_dyn, src: r_len });
+            a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dyn });
+            a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+            a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_nl_g) });
+            a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+            a.op(Opcode::Null { dst: r_lbl });
+            a.op(Opcode::Call3 { dst: r_ret2, fun: RefFun(write_str), arg0: r_out2, arg1: r_acc, arg2: r_lbl });
+
+            // UNROLLED hops. A bytecode loop whose body makes resolve/alloc calls corrupts its
+            // own counter here (same failure the collection sweep and the multiplayer builds
+            // hit), so this walks fixed hops with forward jumps only.
+            a.op(Opcode::Field { dst: r_node, obj: r_list, field: RefField(dl_first_field) });
+            for _ in 0..TICK_HOPS {
+                a.jnull(r_node, done);
+                a.op(Opcode::Field { dst: r_el, obj: r_node, field: RefField(dl_value_field) });
+                let step = a.label();
+                a.jnull(r_el, step);
+                a.op(Opcode::Call1 { dst: r_cls, fun: RefFun(type_getclass), arg0: r_el });
+                a.op(Opcode::Call1 { dst: r_str, fun: RefFun(type_getclassname), arg0: r_cls });
+                a.op(Opcode::GetGlobal { dst: r_acc, global: RefGlobal(tree_kid_g) });
+                a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                // name field: unused for tickables, kept so the row shape matches the display
+                // walk and both parse with the same host-side reader.
+                a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                // x, y via body (null-safe: a non-entity simply yields empty fields)
+                a.op(Opcode::DynGet { dst: r_dynb, obj: r_el, field: RefString(f_body) });
+                for fname in [f_x, f_y] {
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    let bskip = a.label();
+                    a.jnull(r_dynb, bskip);
+                    a.op(Opcode::DynGet { dst: r_dynv, obj: r_dynb, field: RefString(fname) });
+                    a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dynv });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                    a.place(bskip);
+                }
+                // visible: not tracked per tickable; emit the field so the shape holds
+                a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_visible_g) });
+                a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                // the animation clock — frame, total, label
+                a.op(Opcode::DynGet { dst: r_dyna, obj: r_el, field: RefString(f_animation) });
+                for fname in [f_currentframe, f_totalframes, f_currentanim] {
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    let askip = a.label();
+                    a.jnull(r_dyna, askip);
+                    a.op(Opcode::DynGet { dst: r_dynv, obj: r_dyna, field: RefString(fname) });
+                    a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dynv });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                    a.place(askip);
+                }
+                // pixel size, from the dimensions component (null-safe, like the rest)
+                a.op(Opcode::DynGet { dst: r_dynb, obj: r_el, field: RefString(f_dimensions) });
+                for fname in [f_width, f_height] {
+                    a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_space_g) });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                    let dskip = a.label();
+                    a.jnull(r_dynb, dskip);
+                    a.op(Opcode::DynGet { dst: r_dynv, obj: r_dynb, field: RefString(fname) });
+                    a.op(Opcode::Call1 { dst: r_str, fun: RefFun(std_string), arg0: r_dynv });
+                    a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_str });
+                    a.place(dskip);
+                }
+                // No layer field here: the engine leaves its layer containers UNNAMED, so
+                // walking Vfx -> view -> rootContainer -> parent -> name comes back empty.
+                // The layer is known at patch time by the display walk instead (it visits one
+                // container at a time), so it's stamped on those rows and joined to this
+                // clock by position.
+                a.op(Opcode::GetGlobal { dst: r_lbl, global: RefGlobal(tree_nl_g) });
+                a.op(Opcode::Call2 { dst: r_acc, fun: RefFun(str_add), arg0: r_acc, arg1: r_lbl });
+                a.op(Opcode::Null { dst: r_lbl });
+                a.op(Opcode::Call3 { dst: r_ret2, fun: RefFun(write_str), arg0: r_out2, arg1: r_acc, arg2: r_lbl });
+                a.place(step);
+                a.op(Opcode::Field { dst: r_node, obj: r_node, field: RefField(dl_next_field) });
+            }
+            a.place(done);
+        }
+
         // re-fetch the output (r_out2 may be stale after the writes) and flush once.
         a.op(Opcode::Field { dst: r_out2, obj: r_sock2, field: RefField(out_field) });
         a.op(Opcode::Call1 { dst: r_ret2, fun: RefFun(flush), arg0: r_out2 });
@@ -3706,6 +4262,27 @@ fn connect_edit(
         ops.push(Opcode::GetGlobal { dst: rr(14), global: RefGlobal(name_g) });
         ops.push(Opcode::Call3 { dst: r_ret, fun: RefFun(hs_setvar), arg0: e_interp, arg1: rr(14), arg2: rr(28) });
     }
+    // ---- bind stageEntity = the live stage entity (null if no match) ----
+    // Deliberately NOT named `stage`: the script API's ambient `stage` is the StageApi
+    // sandbox, a different object with a smaller surface, and calling one `stage` would
+    // imply a parity with converted scripts that doesn't hold (see the note at stage_field).
+    // This is the raw entity, for tooling that needs what's actually in the match rather
+    // than what content is allowed to touch — placement diffing against SSF2's display list.
+    ops.push(Opcode::Null { dst: rr(28) });                                            // default null
+    ops.push(Opcode::GetGlobal { dst: rr(43), global: RefGlobal(mc_g) });
+    ops.push(Opcode::Field { dst: rr(44), obj: rr(43), field: RefField(cm_field) });   // currentMatch
+    let idx_st_jnomatch = ops.len();
+    ops.push(Opcode::JNull { reg: rr(44), offset: 0 });                                // no match -> null
+    ops.push(Opcode::Field { dst: stage_reg, obj: rr(44), field: RefField(stage_field) });
+    let idx_st_jnostage = ops.len();
+    ops.push(Opcode::JNull { reg: stage_reg, offset: 0 });                             // no stage -> null
+    ops.push(Opcode::ToDyn { dst: rr(28), src: stage_reg });
+    let idx_st_set = ops.len();
+    for j in [idx_st_jnomatch, idx_st_jnostage] {
+        if let Opcode::JNull { offset, .. } = &mut ops[j] { *offset = idx_st_set as i32 - j as i32 - 1; }
+    }
+    ops.push(Opcode::GetGlobal { dst: rr(14), global: RefGlobal(eval_stage_ent_g) });
+    ops.push(Opcode::Call3 { dst: r_ret, fun: RefFun(hs_setvar), arg0: e_interp, arg1: rr(14), arg2: rr(28) });
     // ---- crash-proof eval: parse + run inside a Trap. On ANY error (parse OR runtime)
     // log to the engine (Sys.println -> engine log) AND return "ERR: <msg>" to Peptide.
     // Uses exprReturn (throws on error, unlike interpretScript which swallows) with the
@@ -3836,7 +4413,7 @@ fn connect_edit(
     if let Opcode::JSLte { offset, .. } = &mut ops[idx_q_jm_empty] { *offset = idx_q_truly_none as i32 - idx_q_jm_empty as i32 - 1; }
     if let Opcode::JAlways { offset, .. } = &mut ops[idx_q_jm_done] { *offset = n - idx_q_jm_done as i32 - 1; }
     // k-command jumps ('k' no-match now routes to the 'l' check, not L_ORIG)
-    if let Opcode::JNotEq { offset, .. } = &mut ops[idx_jne_k] { *offset = idx_w_check as i32 - idx_jne_k as i32 - 1; }
+    if let Opcode::JNotEq { offset, .. } = &mut ops[idx_jne_k] { *offset = idx_y_check as i32 - idx_jne_k as i32 - 1; }
     if let Opcode::JNotEq { offset, .. } = &mut ops[idx_jne_w] { *offset = idx_l_check as i32 - idx_jne_w as i32 - 1; }
     // l-command jumps ('l' no-match -> m-check; getPXFResource null -> L:FAIL; done -> m-check)
     if let Opcode::JNotEq { offset, .. } = &mut ops[idx_jne_l] { *offset = idx_m_check as i32 - idx_jne_l as i32 - 1; }
@@ -3989,6 +4566,15 @@ fn connect_edit(
     // on a change, no per-frame polling). Pinpoints which move was active at a crash.
     inject_anim_telemetry(code, to_state, g_sock, out_field, write_str, flush,
         get_state_name, str_add, anim_prefix_g, nl_g, sock_t, out_t, str_t, enc_t)?;
+    // PER-FRAME telemetry, the mirror of the SSF2 recorder. `ANIM:` above fires on a state
+    // CHANGE, which can't answer "how many frames did that move actually take" — the
+    // question the SSF2/Fraymakers timing comparison is built on. This emits
+    // "FRAME:<state>" every frame for the driven player, exactly as SSF2's injected
+    // ENTER_FRAME handler pushes FRAME: over its bridge socket, so both engines report the
+    // same quantity by the same mechanism and the host run-length-encodes either one.
+    inject_frame_telemetry(code, g_sock, out_field, write_str, flush,
+        get_state_name, str_add, frame_prefix_g, nl_g, sock_t, out_t, str_t, enc_t,
+        char_anim_f, anim_name_f, anim_t, bar_g, entity_getx, entity_gety, std_string)?;
     // Engine-side script-error surfacing. The engine runs every character/assist/mode/stage
     // script through ApiScript.interpretScript, which builds a rich error (Std.string + line
     // via posInfos + origin) and calls Tildebugger.error — but ONLY when ApiUtilities.
@@ -4176,6 +4762,107 @@ fn inject_anim_telemetry(
     if let Opcode::JNull { offset, .. } = &mut ops[4] { *offset = skip - 4 - 1; }
     insert_ops_end(f, ops);
     eprintln!("connect_edit: anim telemetry hooked into Character.toState@{to_state}");
+    Ok(())
+}
+
+/// Append PER-FRAME `FRAME:<stateName>` telemetry to `Character.updateGameInput`.
+///
+/// The Fraymakers half of the timing-parity pair. SSF2 gets the same treatment from
+/// `abc_inject::inject_frame_recorder` (an ENTER_FRAME handler pushing FRAME: over its
+/// bridge socket); this is the HashLink equivalent, so both engines report frames the same
+/// way and the host can run-length-encode either stream into "<anim> xN".
+///
+/// Why per-frame rather than reusing the `ANIM:` hook on `toState`: that one is
+/// event-driven and fires on a state CHANGE, which tells you the order of moves but not how
+/// long each one lasted. Frame COUNT is the whole question — the converter's timing model is
+/// a 30→60fps doubling, and confirming it needs the number of frames a move actually
+/// occupied in each engine.
+///
+/// Why not poll from the host instead: polling races the move. A short attack lasts a few
+/// hundred milliseconds, the same order as the round trip between sending the input and
+/// starting to watch, so the watcher can arrive after it's over — measured on SSF2, where a
+/// concurrent poll saw only `stand` in a window where the engine recorded a 7-frame attack.
+///
+/// `updateGameInput` runs on EVERY character each frame, so this is gated to one player by
+/// team (the same gate `inject_input_override` uses, and the same default) — otherwise a
+/// 4-player match would emit four interleaved streams.
+#[allow(clippy::too_many_arguments)]
+fn inject_frame_telemetry(
+    code: &mut Bytecode, g_sock: usize, out_field: usize, write_str: usize,
+    flush: usize, get_state_name: usize, str_add: usize, frame_prefix_g: usize, nl_g: usize,
+    sock_t: usize, out_t: usize, str_t: usize, enc_t: usize,
+    char_anim_f: usize, anim_name_f: usize, anim_t: usize, bar_g: usize,
+    entity_getx: usize, entity_gety: usize, std_string: usize,
+) -> anyhow::Result<()> {
+    use hlbc::types::{RefField, RefFun, RefGlobal, RefInt};
+    let upd = require_fn(code, "updateGameInput", Some("pxf.entity.Character"))?;
+    let getteam = require_fn(code, "getTeam", Some("pxf.entity.Character"))?;
+    let team = std::env::var("PEPTIDE_INPUT_TEAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let team_c = add_int(code, team);
+    let fidx = function_index_by_findex(code, upd)
+        .ok_or_else(|| anyhow::anyhow!("Character.updateGameInput@{upd} not found"))?;
+    let f = &mut code.functions[fidx];
+    // 6 = Float, 9 = Dynamic: POSITION rides the same line as the animation, so a frame's
+    // telemetry carries where the entity was as well as what it was playing. SSF2's recorder
+    // already reports `<label>|<frame>|<x>|<y>`; without the same here, per-frame displacement
+    // can only be measured on one engine, and the speed/scale multipliers can't be derived from
+    // observation at all -- which is what pushed measurement back onto wall-clock polling.
+    let base = add_regs(f, &[3, 3, sock_t, out_t, str_t, str_t, enc_t, 0, anim_t, str_t, 6, 9, str_t]);
+    let (r_team, r_zero, r_sock, r_out, r_name, r_msg, r_null, r_ret, r_anim, r_aname) =
+        (Reg(base), Reg(base + 1), Reg(base + 2), Reg(base + 3), Reg(base + 4),
+         Reg(base + 5), Reg(base + 6), Reg(base + 7), Reg(base + 8), Reg(base + 9));
+    let (r_f, r_dyn, r_num) = (Reg(base + 10), Reg(base + 11), Reg(base + 12));
+    let mut ops = vec![
+        Opcode::Call1 { dst: r_team, fun: RefFun(getteam), arg0: Reg(0) },      // 0
+        Opcode::Int { dst: r_zero, ptr: RefInt(team_c) },                       // 1
+        Opcode::JEq { a: r_team, b: r_zero, offset: 1 },                        // 2 -> run
+        Opcode::JAlways { offset: 0 },                                          // 3 -> end
+        Opcode::GetGlobal { dst: r_sock, global: RefGlobal(g_sock) },           // 4
+        Opcode::JNull { reg: r_sock, offset: 0 },                               // 5 -> end
+        Opcode::Field { dst: r_out, obj: r_sock, field: RefField(out_field) },  // 6
+        // ANIMATION name first — that's the unit SSF2's frame LABEL corresponds to.
+        // A Fraymakers STATE spans several animations (one SSF2 "Jab" timeline splits
+        // into jab1/jab2/jab3 by internal FrameLabel; see AGENT_CONTEXT "animations" and
+        // src/anim_splitter.rs), so keying frames on the state would count a whole chain
+        // as one run and could never line up with SSF2's per-label counts.
+        Opcode::Field { dst: r_anim, obj: Reg(0), field: RefField(char_anim_f) },// 7
+        Opcode::JNull { reg: r_anim, offset: 0 },                               // 8 -> end
+        Opcode::Field { dst: r_aname, obj: r_anim, field: RefField(anim_name_f) },// 9
+        Opcode::JNull { reg: r_aname, offset: 0 },                              // 10 -> end
+        Opcode::Call1 { dst: r_name, fun: RefFun(get_state_name), arg0: Reg(0) },// 11
+        Opcode::JNull { reg: r_name, offset: 0 },                               // 12 -> end
+        Opcode::GetGlobal { dst: r_msg, global: RefGlobal(frame_prefix_g) },    // 13
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_aname }, // 14
+        Opcode::GetGlobal { dst: r_aname, global: RefGlobal(bar_g) },           // 15
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_aname }, // 16
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_name }, // 17
+        // |<x>|<y> — the same fields SSF2's recorder emits, so both streams are diffable
+        Opcode::GetGlobal { dst: r_name, global: RefGlobal(bar_g) },
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_name },
+        Opcode::Call1 { dst: r_f, fun: RefFun(entity_getx), arg0: Reg(0) },
+        Opcode::ToDyn { dst: r_dyn, src: r_f },
+        Opcode::Call1 { dst: r_num, fun: RefFun(std_string), arg0: r_dyn },
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_num },
+        Opcode::GetGlobal { dst: r_name, global: RefGlobal(bar_g) },
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_name },
+        Opcode::Call1 { dst: r_f, fun: RefFun(entity_gety), arg0: Reg(0) },
+        Opcode::ToDyn { dst: r_dyn, src: r_f },
+        Opcode::Call1 { dst: r_num, fun: RefFun(std_string), arg0: r_dyn },
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_num },
+        Opcode::GetGlobal { dst: r_name, global: RefGlobal(nl_g) },             // 18
+        Opcode::Call2 { dst: r_msg, fun: RefFun(str_add), arg0: r_msg, arg1: r_name }, // 19
+        Opcode::Null { dst: r_null },                                           // 20
+        Opcode::Call3 { dst: r_ret, fun: RefFun(write_str), arg0: r_out, arg1: r_msg, arg2: r_null }, // 21
+        Opcode::Call1 { dst: r_ret, fun: RefFun(flush), arg0: r_out },          // 22
+    ];
+    let end = ops.len() as i32;
+    if let Opcode::JAlways { offset } = &mut ops[3] { *offset = end - 3 - 1; }
+    if let Opcode::JNull { offset, .. } = &mut ops[5] { *offset = end - 5 - 1; }
+    if let Opcode::JNull { offset, .. } = &mut ops[8] { *offset = end - 8 - 1; }
+    if let Opcode::JNull { offset, .. } = &mut ops[10] { *offset = end - 10 - 1; }
+    if let Opcode::JNull { offset, .. } = &mut ops[12] { *offset = end - 12 - 1; }
+    insert_ops_end(f, ops);
+    eprintln!("connect_edit: per-frame FRAME: telemetry hooked into Character.updateGameInput@{upd} (team {team})");
     Ok(())
 }
 

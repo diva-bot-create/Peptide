@@ -2345,6 +2345,48 @@ pub(crate) fn extract_timeline_hold(abc: &AbcFile, class_name: &str) -> Option<T
     best.map(|(_, h)| h)
 }
 
+/// What a clip's own timeline does at the end of a labelled segment, from the Flash frame script
+/// on that frame. These are what make a multi-label clip a STATE MACHINE rather than a loop: the
+/// segments are chained (or branched between) by them, and a segment no jump ever reaches is dead
+/// during normal play — playing the clip end to end shows animations the source never shows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LabelJump {
+    /// `gotoAndPlay("target")`, unconditional.
+    Always(String),
+    /// `if (safeRandom() > t) gotoAndPlay("target")`: taken `pct` percent of the time, otherwise
+    /// playback runs on into whatever frame follows.
+    Chance { pct: u32, target: String },
+}
+
+/// Every `gotoAndPlay` a Flash timeline class performs, by 1-based frame. Universal: any SSF2 clip
+/// whose segments are chained this way, not just backdrop art.
+pub(crate) fn extract_label_jumps(abc: &AbcFile, class_name: &str) -> Vec<(u32, LabelJump)> {
+    let Some(class) = abc.classes.iter().find(|c| c.name == class_name) else { return Vec::new() };
+    let goto_re = regex::Regex::new(r#"gotoAndPlay\("([^"]+)"\)"#).unwrap();
+    // the SSF2 RNG is uniform [0,1), so `> t` fires with probability 1-t and `< t` with t.
+    let rand_re = regex::Regex::new(r"safeRandom\(\)\s*([<>])\s*([0-9]*\.?[0-9]+)").unwrap();
+    let mut out = Vec::new();
+    for t in &class.instance_methods {
+        let Some(n) = t.name.strip_prefix("frame").and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let Some(body) = abc.method_bodies.iter().find(|b| b.method_idx == t.method_idx) else { continue };
+        let code = decompiler::decompile_method(body, abc, &t.name, &[]);
+        let Some(g) = goto_re.captures(&code) else { continue };
+        let target = g[1].to_string();
+        // a random test anywhere in the same frame script is taken to guard the jump: these
+        // scripts are a couple of statements long, so there is nothing else for it to guard.
+        let jump = match rand_re.captures(&code).and_then(|c| {
+            let thr = c[2].parse::<f64>().ok()?;
+            Some(if &c[1] == ">" { 1.0 - thr } else { thr })
+        }) {
+            Some(p) => LabelJump::Chance { pct: (p * 100.0).round().clamp(0.0, 100.0) as u32, target },
+            None => LabelJump::Always(target),
+        };
+        out.push((n, jump));
+    }
+    out.sort_by_key(|(f, _)| *f);
+    out
+}
+
 pub(crate) fn extract_force_attack_labels(abc: &AbcFile, class_name: &str) -> Vec<String> {
     let Some(class) = abc.classes.iter().find(|c| c.name == class_name) else { return vec![] };
     let mut v = ForceAttackVisitor::default();

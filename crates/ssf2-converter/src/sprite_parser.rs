@@ -603,6 +603,33 @@ pub fn parse_sprite_boxes_from_swf(
     log::info!("sprite_parser: {}/{} animations have box data after fallbacks",
         result.len(), ssf2_to_fm.len());
 
+    // debug (`PEPTIDE_DUMP_BOX_FRAMES`): the SOURCE active-frame range of each animation's
+    // attack boxes, the counterpart of the emitted entity's HIT_BOX keyframes. Animation
+    // LENGTHS are checked by timing_parity.py; this is the other half of frame data — which
+    // frames a move can actually hit on, i.e. its startup / active / recovery. Reported as
+    // source (30fps) frames, so the emitted Fraymakers range should be twice it.
+    if std::env::var("PEPTIDE_DUMP_BOX_FRAMES").is_ok() {
+        for (fm_name, d) in &result {
+            // Count BOX-frames, not frames: a frame carrying two hitboxes contributes two.
+            // The emitted entity sums keyframe lengths across EVERY HIT_BOX layer, so
+            // counting unique frames here compares two different units and reports a
+            // two-box move as 4.00x when it is exactly right.
+            // Hitbox AND GrabBox: the emitted side counts HIT_BOX + GRAB_BOX (SSF2 grab
+            // boxes are re-typed to Fraymakers' GRAB_BOX), so the source side has to count
+            // the same set or a grab reads as wildly mismatched in whichever direction the
+            // asymmetry happens to fall.
+            let per_frame: Vec<(u16, usize)> = d.frames.iter()
+                .map(|(f, boxes)| (*f, boxes.iter()
+                    .filter(|b| matches!(b.box_type, BoxType::Hitbox | BoxType::GrabBox)).count()))
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            if per_frame.is_empty() { continue; }
+            let box_frames: usize = per_frame.iter().map(|(_, n)| *n).sum();
+            eprintln!("[box-frames] {fm_name} total={} active={} first={} last={}",
+                d.total_frames, box_frames, per_frame[0].0, per_frame[per_frame.len() - 1].0);
+        }
+    }
+
     Ok(result)
 }
 

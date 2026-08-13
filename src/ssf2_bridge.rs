@@ -23,6 +23,69 @@ use std::time::{Duration, Instant};
 /// Path for the per-frame jump-probe trajectory CSV. Computed at call time so it
 /// resolves to the platform temp dir on both macOS (`/tmp/`) and Windows (`%TEMP%`).
 /// Uses forward slashes so Flash's `FileStream` accepts the path on Windows too.
+/// The frames the engine has PUSHED since the last `record`.
+///
+/// Mirrors the Fraymakers side, where the engine pushes `ANIM:` telemetry over the harness
+/// socket and the host's stream pump routes it by prefix. SSF2's injected recorder
+/// (`abc_inject::inject_frame_recorder`) pushes `FRAME:<label>|<frame>|<x>|<y>` on the same
+/// socket the command protocol uses; the response reader is seq-matched, so these arrive as
+/// non-matching lines and are routed here instead of dropped.
+static FRAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Animation-label TRANSITIONS derived from the pushed frame stream. The session used to
+/// get this by polling the engine every 300ms, which existed only because the bridge was
+/// request/response with nothing engine-initiated. The engine pushes a label every frame
+/// now, so a change is simply the previous line's label differing from this one.
+static ANIM_CHANGES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Engine-side errors pushed as `SCRIPTERR:` lines (see abc_inject::inject_error_reporter).
+static ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Drain the engine errors seen since the last call.
+pub fn errors_take() -> Vec<String> {
+    std::mem::take(&mut *ERRORS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+static LAST_LABEL: Mutex<String> = Mutex::new(String::new());
+
+/// Drain the animation transitions seen since the last call.
+pub fn anim_changes_take() -> Vec<String> {
+    std::mem::take(&mut *ANIM_CHANGES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Route one engine-pushed line. Returns true if it was consumed as telemetry (and so must
+/// not be treated as a command response).
+fn route_pushed(line: &str) -> bool {
+    // Engine errors are unsolicited telemetry, exactly like Fraymakers' — they must not be
+    // mistaken for a command reply, and they belong in the log where the script-error scan
+    // reads them.
+    if line.starts_with("SCRIPTERR:") {
+        ERRORS.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
+        return true;
+    }
+    if let Some(rest) = line.strip_prefix("FRAME:") {
+        // label is the first field; a change is an animation transition
+        let label = rest.split('|').next().unwrap_or("").trim().to_string();
+        if !label.is_empty() {
+            let mut last = LAST_LABEL.lock().unwrap_or_else(|e| e.into_inner());
+            if *last != label {
+                *last = label.clone();
+                ANIM_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).push(label);
+            }
+        }
+        let mut f = FRAMES.lock().unwrap();
+        // Bounded: a session left recording must not grow without limit. 20k frames is
+        // ~11 minutes of SSF2 at 30fps, far more than any single measurement window.
+        if f.len() < 20_000 { f.push(rest.to_string()); }
+        return true;
+    }
+    false
+}
+
+/// Clear the buffer — opens a recording window.
+pub fn frames_clear() { FRAMES.lock().unwrap().clear(); }
+
+/// Take everything pushed since the last clear.
+pub fn frames_take() -> Vec<String> { FRAMES.lock().unwrap().clone() }
+
 pub fn traj_path() -> String {
     std::env::temp_dir()
         .join("peptide_ssf2_traj.csv")
@@ -36,9 +99,13 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// it goes away). All `request()`s share it; the Mutex also serializes them, so the
 /// matchStatus poll and a console command can't interleave on the one socket.
 struct SockConn {
-    reader: BufReader<TcpStream>,
     writer: TcpStream,
 }
+
+/// Command replies, forwarded by the reader thread. Requests are serialized by the
+/// `CONN` lock (one in flight at a time), so a single channel is enough — `request`
+/// drains it until it sees its own seq.
+static REPLIES: Mutex<Option<std::sync::mpsc::Receiver<String>>> = Mutex::new(None);
 static CONN: Mutex<Option<SockConn>> = Mutex::new(None);
 
 /// Bind the loopback listener BEFORE launching SSF2 (the engine connects from its
@@ -59,8 +126,28 @@ pub fn accept_engine(listener: &TcpListener, secs: u64) -> Result<()> {
                 stream.set_nonblocking(false)?;
                 let _ = stream.set_nodelay(true);
                 let writer = stream.try_clone()?;
-                *CONN.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(SockConn { reader: BufReader::new(stream), writer });
+                // A DEDICATED READER THREAD, the same shape as `bridge.rs`'s Fraymakers
+                // pump. Without it the socket is only drained while a command is in
+                // flight, so engine-pushed telemetry would sit in the kernel buffer until
+                // someone happened to ask something — and the animation feed had to be a
+                // 300ms poll instead of coming off the stream.
+                let (tx, rx) = std::sync::mpsc::channel::<String>();
+                *REPLIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        match r.read_line(&mut line) {
+                            Ok(0) | Err(_) => break, // EOF / error — engine gone
+                            Ok(_) => {
+                                let l = line.trim_end_matches(['\r', '\n']);
+                                // route engine-pushed telemetry; everything else is a reply
+                                if !route_pushed(l) && tx.send(l.to_string()).is_err() { break; }
+                            }
+                        }
+                    }
+                });
+                *CONN.lock().unwrap_or_else(|e| e.into_inner()) = Some(SockConn { writer });
                 return Ok(());
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -123,28 +210,24 @@ pub fn request(command: &str, timeout: Duration) -> Result<String> {
         bail!("SSF2 write failed (connection gone): {e}");
     }
 
-    // read reply lines until one matches our seq (or timeout / EOF).
-    let _ = conn.reader.get_ref().set_read_timeout(Some(timeout));
+    // Take replies off the reader thread until one matches our seq. Telemetry never
+    // reaches this channel — the thread routes it — so anything non-matching here is a
+    // stale reply from a timed-out earlier request.
     let prefix = format!("{seq} ");
     let deadline = Instant::now() + timeout;
+    let rx_guard = REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+    let rx = rx_guard.as_ref().ok_or_else(|| anyhow::anyhow!("no SSF2 reader"))?;
     loop {
-        let mut line = String::new();
-        match conn.reader.read_line(&mut line) {
-            Ok(0) => { *guard = None; bail!("SSF2 connection closed"); } // EOF — engine gone
-            Ok(_) => {
-                if let Some(rest) = line.trim_end_matches(['\r', '\n']).strip_prefix(&prefix) {
-                    return Ok(rest.to_string());
-                }
-                // a non-matching line (stale) — keep reading until the deadline
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { bail!("no response for {command:?} within {timeout:?}"); }
+        match rx.recv_timeout(left) {
+            Ok(line) => {
+                if let Some(rest) = line.strip_prefix(&prefix) { return Ok(rest.to_string()); }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 bail!("no response for {command:?} within {timeout:?}");
             }
-            Err(e) => { *guard = None; bail!("SSF2 read failed (connection gone): {e}"); }
-        }
-        if Instant::now() >= deadline {
-            bail!("no response for {command:?} within {timeout:?}");
+            Err(_) => { *guard = None; bail!("SSF2 connection closed"); }
         }
     }
 }
@@ -200,30 +283,18 @@ fn probe_responsive() -> bool {
 /// Reads the persistent connection until a bare `READY` line arrives (accumulating across
 /// read timeouts so a split line isn't dropped) or `total` elapses. Returns true on READY.
 pub fn wait_for_ready(total: Duration) -> bool {
-    let mut guard = CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = match guard.as_mut() {
-        Some(c) => c,
-        None => return false,
-    };
-    let _ = conn.reader.get_ref().set_read_timeout(Some(Duration::from_millis(500)));
+    // READY arrives on the reader thread's channel like any other unsolicited line, so
+    // this drains replies looking for it rather than owning the socket itself.
     let deadline = Instant::now() + total;
-    let mut line = String::new();
+    let guard = REPLIES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(rx) = guard.as_ref() else { return false };
     loop {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        match conn.reader.read_line(&mut line) {
-            Ok(0) => return false, // EOF — engine gone
-            Ok(_) => {
-                if line.trim_end_matches(['\r', '\n']) == "READY" {
-                    return true;
-                }
-                line.clear(); // some other unsolicited line — discard, await READY
-            }
-            // timeout: any partial bytes stay in `line` to be completed next read
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => return false, // connection gone
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { return false; }
+        match rx.recv_timeout(left) {
+            Ok(line) => { if line.trim() == "READY" { return true; } }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
+            Err(_) => return false, // reader thread gone
         }
     }
 }
@@ -350,28 +421,17 @@ pub fn session(args: &[String]) -> Result<()> {
         }
     }
 
-    // ANIM state tracking, parity with the Fraymakers session: FM's engine PUSHES
-    // per-frame ANIM telemetry over its socket; SSF2's bridge is synchronous RPC
-    // (nothing engine-initiated), so poll player 0's animation from the same
-    // single-writer loop the commands run on and log a deduped `ANIM:` line on
-    // every change. A failed read (no match yet, mid-load) backs the poll off so
-    // boot/load never stalls command dispatch.
-    let mut last_anim = String::new();
-    let mut next_poll = std::time::Instant::now();
+    // ANIM state tracking, now genuinely the same shape as the Fraymakers session: the
+    // engine PUSHES a label every frame and the reader thread routes it, so a transition is
+    // just consecutive labels differing. This replaced a 300ms reflection poll that existed
+    // only because the bridge used to be request/response with nothing engine-initiated —
+    // the poll both cost a round trip and could miss a state that came and went between
+    // samples.
     let anim_tick = move || {
-        let now = std::time::Instant::now();
-        if now < next_poll { return false; }
-        let target = crate::ssf2_target::Ssf2Target::new();
-        match target.current_anim(0) {
-            Some(anim) => {
-                next_poll = now + Duration::from_millis(300);
-                if anim != last_anim {
-                    last_anim = anim.clone();
-                    slog(&format!("ANIM:{}", anim.to_uppercase()));
-                }
-            }
-            None => { next_poll = now + Duration::from_secs(3); }
+        for label in anim_changes_take() {
+            slog(&format!("ANIM:{}", label.to_uppercase()));
         }
+        for e in errors_take() { slog(&e); }
         false
     };
 

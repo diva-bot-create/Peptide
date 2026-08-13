@@ -29,57 +29,36 @@ impl Ssf2Target {
     fn op(&self, wire: &str) -> Result<String> { request(wire, T) }
 
     // ── live display-tree walk (the `tree` command) ────────────────────────
+    //
+    // The walk itself lives in the ENGINE now (the TREE verb): one round trip returns every
+    // record, so all that's left host-side is rendering them. The previous host-driven walks
+    // cost hundreds of round trips and, more importantly, were not atomic.
 
-    /// Point the reflection cursor at the display node addressed by `path`
-    /// (child indices from the document root).
-    fn nav_node(&self, path: &[u32]) -> Result<()> {
-        self.op("ROOT")?;
-        for i in path { self.op(&format!("CALL1\tgetChildAt\t{i}"))?; }
-        Ok(())
-    }
-
-    /// Read one property of the node at `path`. Re-navigates first (a GET moves
-    /// the cursor onto the property). `"?"` on any error so a node that lacks the
-    /// property (e.g. `currentFrame` on a Bitmap) doesn't abort the walk.
-    fn node_prop(&self, path: &[u32], prop: &str) -> String {
-        let r = (|| -> Result<String> {
-            self.nav_node(path)?;
-            self.op(&format!("GET\t{prop}"))?;
-            self.op("READ")
-        })();
-        r.unwrap_or_else(|_| "?".into())
-    }
-
-    /// Recursive node visit: print this node's line, then its children (bounded by
-    /// `max_depth` and a per-container child cap so a huge particle pool can't run away).
-    fn walk_node(&self, path: &mut Vec<u32>, max_depth: u32, out: &mut String) -> Result<()> {
-        self.nav_node(path)?;
-        let class = self.op("READ").unwrap_or_else(|_| "?".into());
-        let name = self.node_prop(path, "name");
-        let x = self.node_prop(path, "x");
-        let y = self.node_prop(path, "y");
-        let w = self.node_prop(path, "width");
-        let h = self.node_prop(path, "height");
-        let vis = self.node_prop(path, "visible");
-        let frame = self.node_prop(path, "currentFrame");
-        let total = self.node_prop(path, "totalFrames");
-        let label = self.node_prop(path, "currentFrameLabel");
-        let indent = "  ".repeat(path.len());
-        let idx = path.last().map(|i| format!("[{i}] ")).unwrap_or_default();
-        let anim = if frame != "?" && frame != "undefined" {
-            format!(" frame={frame}/{total}{}", if label != "?" && label != "null" && label != "undefined" { format!(" '{label}'") } else { String::new() })
-        } else { String::new() };
-        out.push_str(&format!("{indent}{idx}{class} \"{name}\" @({x},{y}) {w}x{h} vis={vis}{anim}\n"));
-        if (path.len() as u32) < max_depth {
-            let n: u32 = self.node_prop(path, "numChildren").parse().unwrap_or(0);
-            for i in 0..n.min(48) {
-                path.push(i);
-                self.walk_node(path, max_depth, out)?;
-                path.pop();
-            }
-            if n > 48 { out.push_str(&format!("{indent}  … {} more children elided\n", n - 48)); }
-        }
-        Ok(())
+    /// Render an already-read record in the shared stage-node format at `depth`.
+    fn render_record(f: &[String], depth: usize) -> String {
+        let g = |i: usize| f.get(i).cloned().unwrap_or_else(|| "?".into());
+        let absent = |v: &str| v == "?" || v == "null" || v == "undefined" || v.is_empty();
+        let num = |v: &str| v.parse::<f64>().unwrap_or(0.0);
+        let (name, w, h, vis) = (g(1), g(4), g(5), g(6));
+        let (frame, total, label) = (g(8), g(9), g(10));
+        let node = crate::debug_target::StageNode {
+            depth,
+            class: g(0),
+            name: (!absent(&name)).then(|| name.clone()),
+            x: num(&g(2)),
+            y: num(&g(3)),
+            size: (!absent(&w) && !absent(&h)).then(|| (num(&w), num(&h))),
+            visible: vis != "false",
+            frame: (!absent(&frame)).then(|| (num(&frame) as i64, num(&total) as i64)),
+            label: (!absent(&label)).then(|| label.clone()),
+            layer: None,
+            // the node's WORLD bounding-box top-left. Its own x/y is a registration point,
+            // which is not where the art starts — this is the reference Fraymakers' rasterised
+            // image top-left can actually be compared against.
+            abs: (!absent(&g(11)) && !absent(&g(12)))
+                .then(|| (num(&g(11)), num(&g(12)))),
+        };
+        crate::debug_target::fmt_stage_node(&node)
     }
 }
 
@@ -558,10 +537,37 @@ impl DebugTarget for Ssf2Target {
     /// stateful), reading each node's class/name/position/size/visibility/frame.
     /// Display `.x/.y` here are PARENT-RELATIVE display coords; game-space coords
     /// live on the game objects' capital fields (`.X`/`.Y`), readable via `e`.
+    // Draws the DISPLAY ROOT (the same receiver the tree walk starts from), so like the
+    // Fraymakers side this can include art the camera never shows -- see the trait doc.
+    // SSF2 writes the PNG itself rather than shipping it back: hex-encoding a ByteArray needs
+    // a loop, and a backward branch fails AVM2 verification and takes the dispatcher down with
+    // it. Same verb, same artefact on disk — only the transport differs, which is the whole
+    // point of the seam.
+    fn shot(&mut self, path: &std::path::Path) -> Result<String> {
+        // SSF2 renders at its native 1280x720 view; the engine can't read the size off the
+        // dispatcher's receiver, so it comes over the wire with the path.
+        let reply = self.op(&format!("SHOT\t{}\t1280\t720", path.display()))?;
+        if reply.contains("SHOT:ok") {
+            let n = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            return Ok(format!("SHOT: wrote {} ({} bytes)", path.display(), n));
+        }
+        anyhow::bail!("ssf2 could not capture a frame: {}", reply.trim())
+    }
+
     fn tree(&mut self, depth: u32) -> Result<String> {
+        // ONE round trip: the engine walks its own display list recursively (the TREE verb)
+        // and returns every record at once. Besides being fast, it's ATOMIC — the host-driven
+        // walks took long enough that the live display list shifted mid-traversal, so the same
+        // object could appear more than once and others could be missed.
+        let reply = self.op(&format!("TREE\t{}", depth.max(1)))?;
         let mut out = String::new();
-        let mut path: Vec<u32> = Vec::new();
-        self.walk_node(&mut path, depth.max(1), &mut out)?;
+        for rec in reply.split(";;").filter(|r| !r.trim().is_empty()) {
+            let f: Vec<String> = rec.split('|').map(|s| s.trim().to_string()).collect();
+            // field 0 is the depth the engine recorded; the rest is the standard record
+            let d: usize = f.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            out.push_str(&Self::render_record(&f[1..], d));
+            out.push('\n');
+        }
         Ok(out)
     }
 
@@ -598,6 +604,50 @@ impl DebugTarget for Ssf2Target {
 
     /// SSF2 matchStatus: cheap when idle (short-circuit if no live match), else the
     /// composed `<id>|<dmg>|<anim>` feed read live from the engine.
+    /// SSF2 has no script interpreter, so `animFeed(i)` can't be evaluated as hscript;
+    /// the same fields are read by reflection instead and returned in the same shape.
+    fn char_anim(&mut self, idx: usize) -> Result<Option<crate::debug_target::AnimState>> {
+        if !self.match_live() { return Ok(None); }
+        Ok(crate::debug_target::AnimState::parse(&self.compose_anim_feed(idx)?))
+    }
+
+    /// Open a recording window by TRUNCATING the file the injected ENTER_FRAME recorder
+    /// appends to (`abc_inject::inject_frame_recorder`). The recorder always runs; the
+    /// host decides what counts as a window, which means no engine-side gate and no
+    /// engine round trip at all. `on: false` is a no-op — there's nothing to disarm.
+    fn record(&mut self, on: bool) -> Result<String> {
+        if on { crate::ssf2_bridge::frames_clear(); }
+        Ok(crate::debug_target::fmt_record(on))
+    }
+
+    /// Close the window: read every frame the engine recorded since `record`.
+    ///
+    /// This is the whole point. The engine is present at every frame and writes one line
+    /// per frame, so a 14-frame attack yields 14 lines no matter how slow the host is —
+    /// where polling for the same thing sampled about once per 14 frames and reported
+    /// `frames_seen=0`. Reading is a file read, not an engine round trip.
+    fn frame_trace(&mut self, raw: bool) -> Result<String> {
+        // A no-op round trip first: the engine's pushes only reach the host when the
+        // response reader is draining the socket, so ask it something to flush whatever
+        // has queued up since the last command.
+        let _ = self.eval_quiet("match.characterCount()");
+        let pushed = crate::ssf2_bridge::frames_take();
+        if raw { return Ok(crate::debug_target::fmt_trace_raw(&pushed)); }
+        let runs = crate::debug_target::rle_frames(&pushed);
+        // end position of each run; both engines' streams carry position per frame now
+        let end_of = |upto: usize| pushed.get(upto.saturating_sub(1))
+            .and_then(|l| { let f: Vec<&str> = l.split('|').collect();
+                if f.len() >= 4 { Some(format!(" end=({},{})", f[2], f[3])) } else { None } })
+            .unwrap_or_default();
+        let mut seen = 0usize;
+        let ends: Vec<Option<String>> = runs.iter().map(|(_, n)| {
+            seen += n;
+            let e = end_of(seen);
+            if e.is_empty() { None } else { Some(e) }
+        }).collect();
+        Ok(crate::debug_target::fmt_trace(pushed.len(), &runs, &ends))
+    }
+
     fn match_status(&mut self) -> Result<Option<String>> {
         if !self.match_live() { return Ok(None); }
         let feed = self.compose_match_status()?;
@@ -633,8 +683,35 @@ impl Ssf2Target {
     /// Run a sequence of navigation ops, then READ (or, for an assignment that
     /// already emitted SETP, just confirm).
     fn run_ops(&self, ops: &[String], read: bool) -> Result<String> {
+        // A MISSING MEMBER MUST NOT LOOK LIKE DATA. SSF2's reflection leaves the cursor
+        // where it was when a property doesn't exist, so `p0.nonexistent` READs back as
+        // `[object Character]` — the receiver — and reads exactly like a real value. That
+        // silently produced wrong answers repeatedly: an injected slot that reported NaN,
+        // `CurrentAnimation.currentFrame` echoing `[object HitBoxAnimation]`, and `info`
+        // rendering a missing p1 as four `[object Character]` fields.
+        //
+        // Detect it precisely rather than by guessing at the shape of the reply: READ once
+        // BEFORE the final GET and once after, and if the cursor didn't move while an
+        // object is on it, the member is absent. One extra round trip per eval (sub-ms),
+        // and only when the expression ends in a property get.
+        let ends_in_get = read && ops.last().is_some_and(|o| o.starts_with("GET\t"));
         let mut last = String::new();
-        for op in ops { last = self.op(op)?; }
+        for (i, op) in ops.iter().enumerate() {
+            if ends_in_get && i + 1 == ops.len() {
+                let before = self.op("READ").unwrap_or_default();
+                self.op(op)?;
+                let after = self.op("READ")?;
+                if after == before && after.starts_with("[object ") {
+                    let member = op.split('\t').nth(1).unwrap_or("?");
+                    return Err(anyhow!(
+                        "no member {member:?} on {after} (the cursor did not move — SSF2 \
+                         reflection leaves it in place for a missing property, so this \
+                         would otherwise read back as the receiver)"));
+                }
+                return Ok(after);
+            }
+            last = self.op(op)?;
+        }
         if read { self.op("READ") } else { Ok(last) }
     }
 
@@ -741,21 +818,61 @@ impl Ssf2Target {
             let sane = |s: String| if s == "null" || s == "undefined" || s.is_empty() { None } else { Some(s) };
             let id   = self.eval_quiet(&format!("{base}.getLinkageID()")).ok().and_then(sane).unwrap_or_else(|| "?".into());
             let dmg  = self.eval_quiet(&format!("{base}.getDamage()")).ok().and_then(sane).unwrap_or_else(|| "0".into());
-            let anim = self.eval_quiet(&format!("{base}.CurrentAnimation.Name")).ok().and_then(sane).unwrap_or_else(|| "?".into());
+            // The FRAME LABEL is the animation name. `CurrentAnimation.Name` is the
+            // MovieClip symbol ("mario_stand"), which is a Flash symbol name and must never
+            // be surfaced as an animation identity (AGENT_CONTEXT: refer to SSF2 animations
+            // by xframe/label only). It also disagrees with Fraymakers, which reports the
+            // bare "stand", so a widget fed by both engines showed two names for one state.
+            // No fallback to the symbol name on purpose: an unknown label reads as "?",
+            // which is honest, where a symbol name is confidently wrong.
+            let anim = self.eval_quiet(&format!("{base}.MC.currentLabel")).ok().and_then(sane)
+                .unwrap_or_else(|| "?".into());
             out.push_str(&format!("{id}|{dmg}|{anim}"));
         }
         Ok(out)
     }
 
-    /// A character's current animation name, read live (None when there's no
-    /// match or the read fails). The Fraymakers session gets per-frame `ANIM:`
-    /// telemetry PUSHED by the engine; SSF2's bridge is synchronous RPC with
-    /// nothing engine-initiated, so the session POLLS this instead to surface
-    /// the same state-change feed in the log and overlay.
-    pub fn current_anim(&self, idx: usize) -> Option<String> {
-        let sane = |s: String| if s == "null" || s == "undefined" || s.is_empty() { None } else { Some(s) };
-        self.eval_quiet(&format!("match.getCharacter({idx}).CurrentAnimation.Name"))
-            .ok().and_then(sane)
+    /// `commands.hsx::animFeed`: the animation CLOCK for one character, in the shared
+    /// `<anim>|<frame>|<total>|<x>|<y>|<state>` shape, read live off the character's
+    /// MovieClip. Three ways the two engines disagree, all reconciled here so a
+    /// cross-engine frame comparison actually compares the same thing:
+    ///
+    /// * **identity** — `currentLabel` is the timeline label ("stand"), which is what
+    ///   Fraymakers reports as `currentAnimation`. `CurrentAnimation.Name` is the
+    ///   hitbox-animation name ("mario_stand") and would never match.
+    /// * **origin** — SSF2 MovieClip frames are 1-based, Fraymakers' are 0-based.
+    /// * **total** — SSF2's `totalFrames` is the length of the character's WHOLE
+    ///   timeline (every animation concatenated, e.g. 95), not of the current
+    ///   animation; Fraymakers reports the current animation's length. There's no
+    ///   cheap SSF2 equivalent, so this reports `-1` (unknown) and lets the watcher
+    ///   end on a label change or a frame wrap instead of on a frame count. Reporting
+    ///   SSF2's number here would make every animation look like it ended early.
+    ///
+    /// Position is the character's own `X`/`Y` fields, not `getX()` (which carries an
+    /// offset).
+    ///
+    /// SAMPLING RATE — the reason a frame COUNT off this is not trustworthy. Every field
+    /// is a separate synchronous reflection round trip over file-IPC, so one sample costs
+    /// several, and measured against a live match a sample lands roughly every ~14 SSF2
+    /// frames. A 14-frame attack is therefore over between two samples: `await` reports
+    /// which animation played (correct) but `frames_seen=0` (useless). `state` is dropped
+    /// from the sample for that reason — nothing decides on it, and it was pure latency.
+    /// Comparing frame counts against Fraymakers needs ENGINE-SIDE recording (have SSF2
+    /// log its own label+frame each tick, then read the trace), not faster polling.
+    fn compose_anim_feed(&self, idx: usize) -> Result<String> {
+        let base = format!("match.getCharacter({idx})");
+        let sane = |s: String| {
+            let t = s.trim().to_string();
+            if t == "null" || t == "undefined" || t.is_empty() { None } else { Some(t) }
+        };
+        let Some(anim) = self.eval_quiet(&format!("{base}.MC.currentLabel")).ok().and_then(sane)
+        else { return Ok(String::new()) };
+        let num = |e: &str| self.eval_quiet(e).ok().and_then(sane)
+            .and_then(|s| s.parse::<f64>().ok());
+        let frame = num(&format!("{base}.MC.currentFrame")).map(|f| f - 1.0).unwrap_or(-1.0);
+        let x = num(&format!("{base}.X")).unwrap_or(0.0);
+        let y = num(&format!("{base}.Y")).unwrap_or(0.0);
+        Ok(format!("{anim}|{frame}|-1|{x}|{y}|?"))
     }
 
     /// Like `eval`, but never recurses into the commands.hsx interceptor and is

@@ -124,6 +124,26 @@ macro_rules! sym {
 /// `connect_edit` — keep them in step. Names are case-sensitive and must match the
 /// engine exactly (e.g. static classes are `$`-prefixed: `pxf.io.$ResourceManager`).
 pub const MANIFEST: &[Symbol] = &[
+    // ── Screenshot (`shot`) ─────────────────────────────────────────────────
+    // Heaps reads its own framebuffer back, so the engine photographs itself and the
+    // PNG comes home as hex on the command socket. This is what makes a claim about
+    // what is ON SCREEN checkable: the object walk proves an object exists, is visible,
+    // sized and positioned, and none of that is evidence a pixel of it was drawn.
+    // Critical: without any of them the `shot` verb has no capture path at all.
+    sym!(fn "getScene" in "h2d.Object",          "screenshot", "reach the scene from any display object", true),
+    sym!(fn "captureBitmap" in "h2d.Scene",      "screenshot", "render the live scene to a texture", true),
+    sym!(fn "getTexture" in "h2d.Tile",          "screenshot", "the captured tile's texture", true),
+    sym!(fn "capturePixels" in "h3d.mat.Texture", "screenshot", "read the framebuffer back to pixels", true),
+    sym!(fn "toPNG" in "hxd.Pixels",             "screenshot", "encode the frame engine-side", true),
+    sym!(fn "toHex" in "haxe.io.Bytes",          "screenshot", "ship the PNG over the text socket", true),
+    sym!(type "h2d.Scene",                       "screenshot", "capture target scene", true),
+    sym!(type "h2d.Bitmap",                      "screenshot", "what captureBitmap returns", true),
+    sym!(type "h2d.Tile",                        "screenshot", "the captured bitmap's tile", true),
+    sym!(type "h3d.mat.Texture",                 "screenshot", "texture the pixels are read from", true),
+    sym!(type "hxd.Pixels",                      "screenshot", "decoded frame before PNG encode", true),
+    sym!(type "haxe.io.Bytes",                   "screenshot", "encoded PNG bytes", true),
+    sym!(field "tile" of "h2d.Bitmap",           "screenshot", "bitmap -> tile hop", true),
+
     // ── Socket bridge ───────────────────────────────────────────────────────
     // The TCP handshake + command loop. Without ANY of these Peptide cannot talk
     // to the engine at all, so every one is critical.

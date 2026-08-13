@@ -169,7 +169,7 @@ fn io_err(msg: &str) -> std::io::Error {
 pub fn patch_and_launch() -> std::io::Result<(u16, String, Cleanup)> {
     // Terminal/CLI keeps the headless fast-boot (bake the config char).
     let c = crate::config::Config::load().char_name();
-    patch_and_launch_with_progress(None, Some(&c))
+    patch_and_launch_with_progress(None, Some(&c), None)
 }
 
 /// Like `patch_and_launch`, but streams the patcher's manifest-preflight progress to
@@ -187,6 +187,11 @@ pub fn patch_and_launch_with_progress(
     // Quick boot, and Quick then sends an explicit `spawn <char>` from the page once
     // READY. (Full boot also avoids the headless filtered-load null-namespace crash.)
     bake_char: Option<&str>,
+    // A stage to bake alongside the char. The patcher's custom-stage self-bootstrap keys off
+    // the BAKED name (it stats custom/<stage>/<stage>.fra at patch time), so a converted stage
+    // only ever loads when it's baked here — naming it at runtime in `spawn <char> <stage>`
+    // leaves it unregistered and `setupStage` gets null. `None` = the configured stage.
+    bake_stage: Option<&str>,
 ) -> std::io::Result<(u16, String, Cleanup)> {
     // Read launch settings through the persisted config (env vars still win —
     // see Config's resolver methods — then the saved config, then defaults).
@@ -214,7 +219,7 @@ pub fn patch_and_launch_with_progress(
                 fra.display());
         }
     }
-    let stage = cfg.stage();
+    let stage = bake_stage.map(str::to_string).unwrap_or_else(|| cfg.stage());
     let assist = cfg.assist();
 
     let seed = pseudo_seed();

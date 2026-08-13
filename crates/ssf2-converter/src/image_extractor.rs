@@ -215,6 +215,10 @@ pub fn extract_images_from_swf(
     ssf2_to_fm: &BTreeMap<String, String>,
     xform_map: &BTreeMap<String, crate::sprite_parser::XframeTransform>,
 ) -> Result<ImageExtractionResult> {
+    // Sprite PNGs are queued and encoded across all cores at the end (see PngBatch) rather
+    // than one at a time inline, which is where a third of a conversion's CPU used to go.
+    let mut pngs = PngBatch::default();
+
     // Build symbol table: char_id → class_name
     let mut symbols: BTreeMap<u16, String> = BTreeMap::new();
     for tag in &swf.tags {
@@ -294,7 +298,7 @@ pub fn extract_images_from_swf(
                     Ok(rgba_data) => {
                         let filename = format!("{}.png", sanitize_name(&sym));
                         let png_path = sprites_dir.join(&filename);
-                        write_png(&png_path, w, h, &rgba_data)?;
+                        pngs.push(png_path.clone(), w, h, rgba_data)?;
 
                         images.insert(id, ExtractedImage {
                             bitmap_id: id,
@@ -320,7 +324,7 @@ pub fn extract_images_from_swf(
                     Ok((w, h, rgba_data)) => {
                         let filename = format!("{}.png", sanitize_name(&sym));
                         let png_path = sprites_dir.join(&filename);
-                        write_png(&png_path, w, h, &rgba_data)?;
+                        pngs.push(png_path.clone(), w, h, rgba_data)?;
 
                         images.insert(id, ExtractedImage {
                             bitmap_id: id,
@@ -386,7 +390,7 @@ pub fn extract_images_from_swf(
                 ) {
                     let sym = format!("{}_vec_{}", char_name, shape.id);
                     let filename = format!("{}.png", sanitize_name(&sym));
-                    write_png(&sprites_dir.join(&filename), r.width, r.height, &r.rgba)?;
+                    pngs.push(sprites_dir.join(&filename), r.width, r.height, r.rgba.clone())?;
                     images.insert(shape.id, ExtractedImage {
                         bitmap_id: shape.id, symbol_name: sym, width: r.width, height: r.height,
                         png_path: format!("library/sprites/{}", filename),
@@ -402,7 +406,7 @@ pub fn extract_images_from_swf(
                 if let Some(r) = crate::vector_raster::rasterize_morph(m, ratio) {
                     let sym = format!("{}_vec_{}", char_name, m.id);
                     let filename = format!("{}.png", sanitize_name(&sym));
-                    write_png(&sprites_dir.join(&filename), r.width, r.height, &r.rgba)?;
+                    pngs.push(sprites_dir.join(&filename), r.width, r.height, r.rgba.clone())?;
                     images.insert(m.id, ExtractedImage {
                         bitmap_id: m.id, symbol_name: sym, width: r.width, height: r.height,
                         png_path: format!("library/sprites/{}", filename),
@@ -429,6 +433,11 @@ pub fn extract_images_from_swf(
     // Apply same fallbacks as sprite_parser for animations with no image data
     apply_image_fallbacks(&mut anim_images);
     log::info!("Animation image mappings: {} animations (after fallbacks)", anim_images.len());
+
+    // Every queued sprite must be on disk BEFORE the shear pre-render: that pass re-opens
+    // the sprites it bakes from, so anything still sitting in the batch would be invisible
+    // to it and its baked output would silently go missing.
+    pngs.flush()?;
 
     // 5. Pre-render frames whose world matrix contains shear — FrayTools
     //    keyframes can't express shear, so the shear is baked into a new
@@ -1386,6 +1395,67 @@ fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
         .context("Failed to create image buffer")?;
     img.save(path)?;
     Ok(())
+}
+
+/// Sprite PNGs queued up and encoded across all cores instead of one at a time.
+///
+/// PNG encode (deflate + row filtering) is about a THIRD of a conversion's CPU and every
+/// sprite is independent, so encoding them serially leaves every other core idle. Deferring
+/// is safe because nothing reads a sprite back while the SWF walk is still running.
+///
+/// Queued pixel data is raw RGBA, which is far larger than the encoded file, so the batch
+/// flushes itself once it is holding more than `FLUSH_BYTES` — a big character can't balloon
+/// memory, and the parallelism is preserved because each flush still has many images in it.
+#[derive(Default)]
+pub(crate) struct PngBatch {
+    jobs: Vec<(std::path::PathBuf, u32, u32, Vec<u8>)>,
+    queued_bytes: usize,
+}
+
+impl PngBatch {
+    /// Roughly 64 MB of raw RGBA in flight before an automatic flush.
+    const FLUSH_BYTES: usize = 64 * 1024 * 1024;
+
+    fn push(&mut self, path: std::path::PathBuf, width: u32, height: u32, rgba: Vec<u8>) -> Result<()> {
+        self.queued_bytes += rgba.len();
+        self.jobs.push((path, width, height, rgba));
+        if self.queued_bytes >= Self::FLUSH_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Encode + write everything queued, across `available_parallelism` threads. Workers pull
+    /// from a shared cursor so one enormous sprite can't leave the other threads idle.
+    fn flush(&mut self) -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        if self.jobs.is_empty() {
+            return Ok(());
+        }
+        let jobs = std::mem::take(&mut self.jobs);
+        self.queued_bytes = 0;
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(jobs.len());
+        let cursor = AtomicUsize::new(0);
+        let failure: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some((path, w, h, rgba)) = jobs.get(i) else { break };
+                    if let Err(e) = write_png(path, *w, *h, rgba) {
+                        let mut slot = failure.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                    }
+                });
+            }
+        });
+        match failure.into_inner().unwrap() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 fn sanitize_name(name: &str) -> String {

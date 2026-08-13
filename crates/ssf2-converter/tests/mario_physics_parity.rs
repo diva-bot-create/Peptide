@@ -6,7 +6,6 @@
 //!
 //! Skipped silently when the SSF2 corpus isn't on disk (matches `golden_sandbag.rs`).
 
-use ssf2_converter::{run_conversion, ConvertOptions};
 use std::path::PathBuf;
 
 mod common;
@@ -35,16 +34,14 @@ fn stat(body: &str, field: &str) -> f64 {
 }
 
 #[test]
+#[ignore = "full-conversion/art test: not part of the fast gate. Run with `cargo test -- --ignored`."]
 fn mario_movement_stats_match_ssf2_ground_truth() {
     let ssf = mario_ssf_path();
     if !common::present(&ssf) { return; }
 
-    let out = tempfile::tempdir().expect("tempdir");
-    let mut opts = ConvertOptions::new(&ssf);
-    opts.output = out.path().to_path_buf();
-    run_conversion(opts).expect("run_conversion for mario.ssf");
+    let Some(out) = common::shared_conversion("mario") else { return };
 
-    let cs = out.path().join("mario/library/scripts/Mario/CharacterStats.hx");
+    let cs = out.join("mario/library/scripts/Mario/CharacterStats.hx");
     let body = std::fs::read_to_string(&cs)
         .unwrap_or_else(|e| panic!("read {}: {e}", cs.display()));
 

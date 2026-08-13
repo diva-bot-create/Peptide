@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::interpreter::{translate, gloss, Translated};
 
@@ -55,6 +55,13 @@ struct CliStreamSink<'a, F: FnMut(&str, &str)> {
 }
 impl<F: FnMut(&str, &str)> CliStreamSink<'_, F> {
     fn pretty(line: &str) -> String {
+        // A display-walk row arrives as FIELDS (`N\t…`). Render it with the shared
+        // stage-node formatter, the same one the SSF2 walk uses, so the session shows one
+        // comparable shape rather than raw engine output — and so this driver can't disagree
+        // with the run_command driver about what `tree` looks like.
+        if line.trim_start().starts_with("N\t") {
+            return format!("<< {}", crate::debug_target::fmt_fm_tree(line).trim_end());
+        }
         match gloss(line) {
             Some(g) => format!("<< {line:<28} ({g})"),
             None => format!("<< {line}"),
@@ -92,9 +99,21 @@ pub fn serve(port: u16, token: Option<&str>) {
     // socket -> stdout; signal once the engine reports READY. Keep a small ring of
     // the last meaningful events so a crash dump can show what was happening.
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    // Eval replies are also forwarded here so a host-side command can READ engine state
+    // instead of sleeping. `await` polls the animation clock over this channel; without
+    // it the only way to "wait for an animation" is a wall-clock guess, which observes a
+    // half-played animation under load and idles the rest of the time.
+    let (eval_tx, eval_rx) = mpsc::channel::<String>();
     thread::spawn(move || {
         let mut history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         pump_engine_lines(reader, &ready_tx, |raw, pretty| {
+            if let Some(v) = raw.strip_prefix("E:") { let _ = eval_tx.send(v.to_string()); }
+            // A frame comes back as hex on this same channel. Decode it HERE rather than
+            // logging it: it is megabytes of hex, and the useful artefact is the file.
+            if let Some(hex) = raw.strip_prefix("SHOT:") {
+                println!("{}", crate::debug_target::write_shot(hex));
+                return;
+            }
             println!("{pretty}");
             if raw.starts_with(|c: char| c.is_ascii_uppercase()) && raw.contains(':') {
                 history.push_back(raw.to_string());
@@ -130,6 +149,116 @@ pub fn serve(port: u16, token: Option<&str>) {
     let mut first = true;
     for line in stdin.lock().lines() {
         let Ok(raw) = line else { break };
+        // `await` / `awaitmatch` are executed HERE, host-side, by polling the engine's
+        // own animation clock — neither has a wire verb. This is the pacing primitive:
+        // a caller sends a state, then `await`, and the next command doesn't go out until
+        // the animation has actually played (or looped / stalled), whatever that took in
+        // wall-clock terms.
+        let parsed = crate::interpreter::parse(&raw);
+        // `record`/`trace` are pure host-side buffer operations over the FRAME: telemetry
+        // the engine pushes — no wire verb, nothing to ask the engine.
+        // record/trace are pure host-side buffer ops over the pushed FRAME: telemetry.
+        // Rendering goes through the SHARED formatters so this path can't drift from the
+        // trait path — the divergence that made `tree` answer differently per driver.
+        // `shot` rides the wire like any other verb; the host only has to remember where the
+        // frame it asked for should land, since the reply arrives on the reader thread.
+        if let crate::interpreter::Command::Shot(ref path) = parsed {
+            crate::debug_target::set_shot_path(path);
+        }
+        if let crate::interpreter::Command::Record { on } = parsed {
+            if on { crate::debug_target::fm_frames_clear(); }
+            for l in crate::debug_target::fmt_record(on).lines() { println!("<< {l}"); }
+            first = false;
+            continue;
+        }
+        // `info` enumerates live players, which needs the reply channel — same host-side
+        // shape as record/trace.
+        if matches!(parsed, crate::interpreter::Command::Info) {
+            let w = &mut write_half;
+            for idx in 0..4 {
+                if !send_wire(w, &format!("e animFeed({idx})")) { break; }
+                let deadline = Instant::now() + Duration::from_millis(1200);
+                let mut sample = None;
+                while Instant::now() < deadline {
+                    match eval_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(v) => { if let Some(s) = crate::debug_target::AnimState::parse(&v) {
+                            sample = Some(s); break; } }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(_) => break,
+                    }
+                }
+                if let Some(s) = sample {
+                    println!("<< p{idx}: anim={} frame={}/{} pos=({:.1},{:.1}) state={}",
+                             s.anim, s.frame, s.total, s.x, s.y, s.state);
+                }
+            }
+            first = false;
+            continue;
+        }
+        if let crate::interpreter::Command::Trace { raw } = parsed {
+            let frames = crate::debug_target::fm_frames_take();
+            if raw {
+                for l in crate::debug_target::fmt_trace_raw(&frames).lines() { println!("<< {l}"); }
+                first = false;
+                continue;
+            }
+            let runs = crate::debug_target::rle_frames(&frames);
+            for l in crate::debug_target::fmt_trace(frames.len(), &runs, &[]).lines() {
+                println!("<< {l}");
+            }
+            first = false;
+            continue;
+        }
+        if matches!(parsed, crate::interpreter::Command::Await { .. }
+                          | crate::interpreter::Command::AwaitMatch { .. })
+        {
+            let idx = match parsed {
+                crate::interpreter::Command::Await { idx, .. }
+                | crate::interpreter::Command::AwaitMatch { idx, .. } => idx,
+                _ => 0,
+            };
+            let w = &mut write_half;
+            // One sampler for both: ask for the clock, then take the next reply that is
+            // actually a sample. Replies from EARLIER commands are still queued (`E:true`
+            // from the toState that got us here), so returning the first thing off the
+            // channel reads a stale value and the watch gives up before it starts.
+            let mut sample = || {
+                if !send_wire(w, &format!("e animFeed({idx})")) {
+                    return Ok(None);
+                }
+                let deadline = Instant::now() + Duration::from_millis(1500);
+                while Instant::now() < deadline {
+                    match eval_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(v) => {
+                            if let Some(s) = crate::debug_target::AnimState::parse(&v) {
+                                return Ok(Some(s));
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(_) => return Ok(None),
+                    }
+                }
+                Ok(None)
+            };
+            let msg = match parsed {
+                crate::interpreter::Command::AwaitMatch { tries, .. } => {
+                    match crate::debug_target::await_live(sample, tries) {
+                        Ok(live) => crate::debug_target::fmt_ready(live.as_ref(), idx, tries),
+                        Err(e) => format!("MATCHREADY:error {e}"),
+                    }
+                }
+                crate::interpreter::Command::Await { budget, .. } => {
+                    match crate::debug_target::watch_animation(&mut sample, budget, 3) {
+                        Ok(w) => crate::debug_target::fmt_await(&w, idx),
+                        Err(e) => format!("AWAIT:error {e}"),
+                    }
+                }
+                _ => unreachable!(),
+            };
+            println!("<< {msg}");
+            first = false;
+            continue;
+        }
         // Translate the friendly command into the engine wire line; `help` is
         // handled here and never reaches the engine.
         match translate(&raw) {
@@ -282,7 +411,85 @@ fn slog(log: &Arc<Mutex<std::fs::File>>, s: &str) {
 }
 
 /// Translate one queued command and send it to the engine, logging the action.
-fn process_cmd(writer: &mut TcpStream, raw: &str, log: &Arc<Mutex<std::fs::File>>) {
+/// Run a command that executes HOST-SIDE (record / trace / await / awaitmatch), returning the
+/// lines to report, or `None` if this command isn't one of them.
+///
+/// One home for both drivers. `serve` (the interactive terminal) had these inline while the
+/// session daemon only LOGGED them and dropped them -- so every `peptide tell "await …"` and
+/// `tell "record"` through a session was a silent no-op that printed a reassuring line, and
+/// frame-accurate measurement quietly degraded to wall-clock polling. Anything host-side has to
+/// work identically on both paths or the pacing primitive isn't actually available where the
+/// work happens.
+fn run_host_side(
+    writer: &mut TcpStream, raw: &str, eval_rx: &mpsc::Receiver<String>,
+) -> Option<Vec<String>> {
+    use crate::interpreter::Command;
+    let parsed = crate::interpreter::parse(raw);
+    // record/trace are pure buffer operations over the FRAME: telemetry the engine pushes.
+    if let Command::Record { on } = parsed {
+        if on { crate::debug_target::fm_frames_clear(); }
+        return Some(crate::debug_target::fmt_record(on).lines().map(str::to_string).collect());
+    }
+    if let Command::Trace { raw } = parsed {
+        let frames = crate::debug_target::fm_frames_take();
+        if raw {
+            return Some(crate::debug_target::fmt_trace_raw(&frames).lines().map(str::to_string).collect());
+        }
+        let runs = crate::debug_target::rle_frames(&frames);
+        return Some(crate::debug_target::fmt_trace(frames.len(), &runs, &[])
+            .lines().map(str::to_string).collect());
+    }
+    if !matches!(parsed, Command::Await { .. } | Command::AwaitMatch { .. }) { return None; }
+    let idx = match parsed {
+        Command::Await { idx, .. } | Command::AwaitMatch { idx, .. } => idx,
+        _ => 0,
+    };
+    // One sampler for both: ask for the clock, then take the next reply that is actually a
+    // sample. Replies from EARLIER commands are still queued, so returning the first thing off
+    // the channel reads a stale value and the watch gives up before it starts.
+    let mut sample = || {
+        if !send_wire(writer, &format!("e animFeed({idx})")) { return Ok(None); }
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            match eval_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(v) => {
+                    if let Some(s) = crate::debug_target::AnimState::parse(&v) { return Ok(Some(s)); }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => return Ok(None),
+            }
+        }
+        Ok(None)
+    };
+    let msg = match parsed {
+        Command::AwaitMatch { tries, .. } => match crate::debug_target::await_live(sample, tries) {
+            Ok(live) => crate::debug_target::fmt_ready(live.as_ref(), idx, tries),
+            Err(e) => format!("MATCHREADY:error {e}"),
+        },
+        Command::Await { budget, .. } => match crate::debug_target::watch_animation(&mut sample, budget, 3) {
+            Ok(w) => crate::debug_target::fmt_await(&w, idx),
+            Err(e) => format!("AWAIT:error {e}"),
+        },
+        _ => unreachable!(),
+    };
+    Some(vec![msg])
+}
+
+fn process_cmd(
+    writer: &mut TcpStream, raw: &str, log: &Arc<Mutex<std::fs::File>>,
+    eval_rx: &mpsc::Receiver<String>,
+) {
+    // `shot` rides the wire like any other verb; the host only has to remember where the frame
+    // it asked for should land, because the reply arrives on the reader thread.
+    if let crate::interpreter::Command::Shot(ref p) = crate::interpreter::parse(raw) {
+        crate::debug_target::set_shot_path(p);
+    }
+    // host-side verbs (record/trace/await) actually RUN here now; they used to be logged and
+    // dropped, which silently removed frame-accurate pacing from every session.
+    if let Some(lines) = run_host_side(writer, raw, eval_rx) {
+        for l in lines { slog(log, &format!("<< {l}")); }
+        return;
+    }
     match translate(raw) {
         Translated::Client(text) => slog(log, &format!(">> (client) {}", text.trim_end())),
         Translated::Wire(wire) => {
@@ -363,7 +570,10 @@ pub fn session(args: &[String]) {
             Some(roster.split(',').next().unwrap_or(&roster).trim().to_string())
         };
         autostart = bake.is_some();
-        match crate::ui::patch_and_launch_with_progress(None, bake.as_deref()) {
+        // `--stage` bakes a stage the same way `--char` bakes a character, which is what
+        // makes a converted stage loadable at all (see patch_and_launch_with_progress).
+        let bake_stage = arg_val(args, "--stage");
+        match crate::ui::patch_and_launch_with_progress(None, bake.as_deref(), bake_stage.as_deref()) {
             Ok((port, token, guard)) => {
                 eprintln!("peptide session: engine launched on :{port}; waiting for it to dial in…");
                 match crate::ui::reawait(port, &token, 45) {
@@ -399,14 +609,25 @@ pub fn session(args: &[String]) {
     let done = Arc::new(AtomicBool::new(false));
     let resdiag = Arc::new(Mutex::new(Vec::<String>::new()));
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (eval_tx, eval_rx) = mpsc::channel::<String>();
     {
         let log = Arc::clone(&log);
         let done = Arc::clone(&done);
         let resdiag = Arc::clone(&resdiag);
         thread::spawn(move || {
             pump_engine_lines(reader, &ready_tx, |raw, pretty| {
+                // eval replies feed the host-side commands (await polls the animation clock over
+                // this); without it `await` can never sample and silently does nothing.
+                if let Some(v) = raw.strip_prefix("E:") { let _ = eval_tx.send(v.to_string()); }
                 if raw.starts_with("RESDIAG") || raw.contains("resource id:") {
                     if let Ok(mut v) = resdiag.lock() { v.push(raw.to_string()); }
+                }
+                // A captured frame comes back as hex on this same stream. Decode it to the
+                // requested PNG instead of logging it: the payload is megabytes of hex and the
+                // artefact people want is the file.
+                if let Some(hex) = raw.strip_prefix("SHOT:") {
+                    slog(&log, &format!("<< {}", crate::debug_target::write_shot(hex)));
+                    return;
                 }
                 slog(&log, pretty);
             });
@@ -445,7 +666,7 @@ pub fn session(args: &[String]) {
         let opts = crate::fastboot::BootOptions::from_cli(args);
         if let Some(cmd) = crate::fastboot::command(crate::fastboot::Engine::Fraymakers, &opts) {
             slog(&log, &format!("[session] quick boot — auto-launching ({cmd})"));
-            process_cmd(&mut writer, &cmd, &log);
+            process_cmd(&mut writer, &cmd, &log, &eval_rx);
         }
     }
     // Shared control-file tail loop (see `session::tail_control`). Stop when the engine
@@ -462,7 +683,7 @@ pub fn session(args: &[String]) {
             }
         },
         |raw| {
-            process_cmd(&mut writer, raw, &log);
+            process_cmd(&mut writer, raw, &log, &eval_rx);
             true
         },
     );
