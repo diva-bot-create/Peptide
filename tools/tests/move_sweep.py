@@ -105,7 +105,8 @@ MOVES = [
     ("tilt_forward",     "ground", {"fm": "right+attack:2", "ssf2": "right:6 right+attack:2"}),
     ("tilt_up",          "ground", {"fm": "up+attack:2",    "ssf2": "up:6 up+attack:2"}),
     ("tilt_down",        "ground", {"fm": "down+attack:2",  "ssf2": "down:6 down+attack:2"}),
-    ("dash_attack",      "ground", "dash+right:8 right+attack:2"),
+    ("dash_attack",      "ground", {"fm":   "dash+right:8 right+attack:2",
+                                    "ssf2": "right:2 none:1 right:6 right+attack:2"}),
     ("strong_forward",   "ground", {"fm": "right:1 right+attack:3", "ssf2": "right+attack:2"}),
     ("strong_up",        "ground", {"fm": "up:1 up+attack:3",        "ssf2": "up+attack:2"}),
     ("strong_down",      "ground", {"fm": "down:1 down+attack:3",    "ssf2": "down+attack:2"}),
@@ -130,13 +131,17 @@ MOVES = [
     ("special_down_air", "air",    "down+special:2"),
     # motions -- the physics itself, rather than a move
     ("walk",             "ground", "right:40"),
-    ("dash",             "ground", "dash+right:12"),
-    ("run",              "ground", "dash+right:40"),
+    # SSF2 has no dash button: it dashes on a double-tap of the direction.
+    # No `dash` row: Fraymakers has a distinct dash animation and SSF2 goes straight walk -> run,
+    # so there is no same-move pair to compare. `run` below covers the same motion on both.
+    ("run",              "ground", {"fm": "dash+right:40", "ssf2": "right:1 none:2 right:38"}),
     ("jump",             "ground", "jump:4"),
     ("fall",             "air",    ""),
-    ("shield",           "ground", "shield:6"),
-    ("roll_forward",     "ground", "shield:1 shield+right:3"),
-    ("spot_dodge",       "ground", "shield:1 shield+down:3"),
+    ("shield",           "ground", {"fm": "shield:6", "ssf2": "shield:8"}),
+    # The shield has to be UP before the direction means "dodge" rather than "walk", and SSF2
+    # wants longer to register it than Fraymakers does.
+    ("roll_forward",     "ground", {"fm": "shield:1 shield+right:3", "ssf2": "shield:4 shield+right:8"}),
+    ("spot_dodge",       "ground", {"fm": "shield:1 shield+down:3",  "ssf2": "shield:4 shield+down:8"}),
     ("crouch",           "ground", "down:8"),
     ("stand_turn",       "ground", "left:4"),
 ]
@@ -340,6 +345,9 @@ def summarize(name, kind, cap):
         "kind": kind,
         "animation": played,
         "animations": [a for a, _ in core],
+        # Every animation the capture saw, with its length. The pairing across engines is made
+        # later, from the converter's mapping, so both sides have to keep their options.
+        "seen": [[a, n] for a, n in anims],
         "frames": frames,
         "travel_x": abs(end[0]) if end else 0.0,   # every scenario starts the character at x=0
         "end_y": end[1] if end else None,
@@ -366,6 +374,40 @@ def sweep(engine, only=None):
         json.dump(out, f, indent=1)
     print(f"\nwrote {path}")
     return out
+
+
+
+def best_pair(a, b):
+    """Find the SSF2 animation and the Fraymakers animation(s) that are the same move.
+
+    The converter says what each SSF2 animation becomes, so walk the SSF2 side, map each name, and
+    look for it on the Fraymakers side. Fraymakers may have SPLIT it into several (walk becomes
+    walk_in/walk_loop/walk_out), and the move's duration is all of them, so they are summed.
+    """
+    fm_seen = b.get("seen") or []
+    # A capture is bracketed by the state the character rests in, and that state is usually the
+    # LONGEST thing in it -- the character stands for far longer than it jabs. Pairing on length
+    # alone therefore matches `stand` against `stand` for every move in the sweep and calls it a
+    # comparison. The move is what happened BETWEEN the resting states.
+    candidates = [(sa, sn) for sa, sn in (a.get("seen") or []) if sa.lower() not in RESTING]
+    if not candidates:
+        candidates = a.get("seen") or []
+    best = None
+    for sa, sn in candidates:
+        want = expected_fm_name(sa)
+        if not want:
+            continue
+        parts = [(fa, fn) for fa, fn in fm_seen
+                 if (fa.lower() == want or fa.lower().startswith(want))
+                 and not (fa.lower() in RESTING and want not in RESTING)]
+        if not parts:
+            continue
+        total = sum(fn for _, fn in parts)
+        # Prefer the longest SSF2 animation that has a counterpart: it is the move, not the
+        # shield it started from.
+        if best is None or sn > best[1]:
+            best = (sa, sn, parts[0][0] if len(parts) == 1 else f"{parts[0][0]}+{len(parts)-1}", total)
+    return best
 
 
 def compare():
@@ -400,6 +442,14 @@ def compare():
         # Only compare a move both engines actually performed. An input that reached different
         # moves is a gap in how the move is driven, not a conversion defect, and counting it as
         # one buries the defects that are real.
+        # Pair the two captures using the converter's OWN mapping rather than whichever animation
+        # happened to be longest. A capture is usually several animations -- SSF2 shields before it
+        # rolls, and the conversion splits a walk into walk_in/walk_loop/walk_out -- so the
+        # question is which SSF2 animation and which Fraymakers animations are the same thing.
+        pair = best_pair(a, b)
+        if pair:
+            a = dict(a, animation=pair[0], frames=pair[1])
+            b = dict(b, animation=pair[2], frames=pair[3])
         agree = names_agree(a.get("animation"), b.get("animation"))
         if not a["resolved"] or not b["resolved"] or agree is None:
             skipped += 1
