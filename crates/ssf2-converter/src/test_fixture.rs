@@ -31,6 +31,13 @@ use swf::{
 pub const FLOOR_Y: f64 = 400.0;
 /// Floor half-width: the walkable span is `-FLOOR_HALF_W ..= FLOOR_HALF_W`.
 pub const FLOOR_HALF_W: f64 = 600.0;
+/// Drawn thickness of each surface. The art bitmaps are authored at exactly these sizes, so the
+/// picture and the thing a fighter stands on are the same rectangle by construction.
+pub const FLOOR_W: f64 = FLOOR_HALF_W * 2.0;
+pub const FLOOR_H: f64 = 40.0;
+pub const PLATFORM_HALF_W: f64 = 200.0;
+pub const PLATFORM_W: f64 = PLATFORM_HALF_W * 2.0;
+pub const PLATFORM_H: f64 = 20.0;
 /// Soft platform's top surface, above the floor.
 pub const PLATFORM_Y: f64 = 140.0;
 /// How high above the floor a character can be dropped from and still be inside the blast box.
@@ -48,6 +55,52 @@ fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Rectangle<Twips> {
 
 /// A solid-colour rectangle shape. The colour only matters for eyeballing a screenshot; the
 /// converter reads geometry, not paint.
+/// A bitmap, as SSF2 ships art: zlib-compressed premultiplied ARGB rows.
+fn bitmap_tag(id: u16, w: u16, h: u16, argb: &[u8]) -> Tag<'static> {
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(argb).expect("zlib write to a Vec cannot fail");
+    let data = enc.finish().expect("zlib finish to a Vec cannot fail");
+    Tag::DefineBitsLossless(swf::DefineBitsLossless {
+        version: 2,
+        id,
+        format: swf::BitmapFormat::Rgb32,
+        width: w,
+        height: h,
+        data: std::borrow::Cow::Owned(data),
+    })
+}
+
+/// Flat ARGB pixels for a band of art: a body colour with a lighter top edge, so the top surface
+/// a fighter stands on is visible in a screenshot rather than a featureless block.
+fn band_pixels(w: u16, h: u16, body: [u8; 3], edge: [u8; 3]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w as usize * h as usize * 4);
+    for y in 0..h {
+        let c = if y < 3 { edge } else { body };
+        for _ in 0..w { out.extend_from_slice(&[255, c[0], c[1], c[2]]); }
+    }
+    out
+}
+
+/// A rectangle filled with a BITMAP rather than a flat colour, which is how SSF2 stages carry
+/// their art. The matrix maps bitmap PIXELS onto shape twips, so a bitmap authored at the
+/// rectangle's own pixel size lands 1:1 at 20 twips per pixel.
+fn bitmap_rect(id: u16, bmp: u16, x0: f64, y0: f64, x1: f64, y1: f64) -> Tag<'static> {
+    let matrix = swf::Matrix {
+        a: swf::Fixed16::from_f64(20.0), b: swf::Fixed16::ZERO,
+        c: swf::Fixed16::ZERO, d: swf::Fixed16::from_f64(20.0),
+        tx: px(x0), ty: px(y0),
+    };
+    let mut tag = rect_shape(id, x0, y0, x1, y1, swf::Color { r: 0, g: 0, b: 0, a: 255 });
+    if let Tag::DefineShape(shape) = &mut tag {
+        shape.styles.fill_styles = vec![swf::FillStyle::Bitmap {
+            id: bmp, matrix, is_smoothed: false, is_repeating: false,
+        }];
+    }
+    tag
+}
+
 fn rect_shape(id: u16, x0: f64, y0: f64, x1: f64, y1: f64, colour: swf::Color) -> Tag<'static> {
     // A single edge delta is bit-limited (measured: ~3276px is the ceiling before the writer
     // rejects it with "excessive value for bits written"), and the blast box is deliberately far
@@ -149,8 +202,8 @@ pub fn build_fixture_swf() -> Vec<u8> {
         // file as AVM1, skips the ABC, and every symbol link silently binds to nothing.
         Tag::FileAttributes(swf::FileAttributes::IS_ACTION_SCRIPT_3),
         // --- collision geometry, inside a `terrain` clip (the parser's collision container) ---
-        rect_shape(1, -FLOOR_HALF_W, FLOOR_Y, FLOOR_HALF_W, FLOOR_Y + 40.0, grey),
-        rect_shape(2, -200.0, PLATFORM_Y, 200.0, PLATFORM_Y + 20.0, blue),
+        rect_shape(1, -FLOOR_HALF_W, FLOOR_Y, FLOOR_HALF_W, FLOOR_Y + FLOOR_H, grey),
+        rect_shape(2, -PLATFORM_HALF_W, PLATFORM_Y, PLATFORM_HALF_W, PLATFORM_Y + PLATFORM_H, blue),
         // --- boundaries. The blast box is huge on purpose: that is what buys a long fall. ---
         rect_shape(3, -BLAST_HALF_W, -BLAST_HALF_H, BLAST_HALF_W, BLAST_HALF_H, mark),
         // The camera box is the blast box. A fixture is for WATCHING a fighter fall, and a camera
@@ -231,8 +284,25 @@ pub fn build_fixture_swf() -> Vec<u8> {
     terrain.push(Tag::ShowFrame);
     tags.push(Tag::DefineSprite(swf::Sprite { id: 10, num_frames: 1, tags: terrain }));
 
-    // A fixture has no art on purpose, but both layers still have to EXIST.
-    tags.push(Tag::DefineSprite(swf::Sprite { id: 12, num_frames: 1, tags: vec![Tag::ShowFrame] }));
+    // The ART, carried as BITMAPS in the background layer, which is where a stage keeps what a
+    // player actually sees. Collision clips are separate and hidden; art is what is drawn. That
+    // split is the shipped convention and it is also what makes this fixture test the converter's
+    // art path rather than its fallback: a stage with no art converts to a placeholder drawn from
+    // the collision, which looks like art and proves nothing about the pipeline that reads it.
+    let floor_px = band_pixels(FLOOR_W as u16, FLOOR_H as u16, [88, 96, 112], [136, 146, 166]);
+    let plat_px = band_pixels(PLATFORM_W as u16, PLATFORM_H as u16, [64, 108, 178], [122, 168, 226]);
+    tags.push(bitmap_tag(60, FLOOR_W as u16, FLOOR_H as u16, &floor_px));
+    tags.push(bitmap_tag(61, PLATFORM_W as u16, PLATFORM_H as u16, &plat_px));
+    tags.push(bitmap_rect(62, 60, -FLOOR_HALF_W, FLOOR_Y, FLOOR_HALF_W, FLOOR_Y + FLOOR_H));
+    tags.push(bitmap_rect(63, 61, -PLATFORM_HALF_W, PLATFORM_Y, PLATFORM_HALF_W, PLATFORM_Y + PLATFORM_H));
+    tags.push(Tag::DefineSprite(swf::Sprite {
+        id: 12,
+        num_frames: 1,
+        // Named clear of the collision vocabulary. "platform", "terrain" and "ground" all CLASSIFY
+        // a clip, so calling a piece of art `art_platform` hands it to the collision walk and it
+        // never reaches the art path at all.
+        tags: vec![place(62, Some("art_lower"), 1), place(63, Some("art_upper"), 2), Tag::ShowFrame],
+    }));
     tags.push(Tag::DefineSprite(swf::Sprite { id: 13, num_frames: 1, tags: vec![Tag::ShowFrame] }));
     tags.push(Tag::DefineSprite(swf::Sprite {
         id: 11,

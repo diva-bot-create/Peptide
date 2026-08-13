@@ -630,16 +630,22 @@ fn render_placeholder(model: &StageModel) -> StageArt {
     let min_y = rects.iter().map(|r| r.top()).fold(f64::MAX, f64::min) - margin;
     let max_x = rects.iter().map(|r| r.right()).fold(f64::MIN, f64::max) + margin;
     let max_y = rects.iter().map(|r| r.bottom()).fold(f64::MIN, f64::max) + margin;
-    let w = ((max_x - min_x).ceil() as u32).clamp(1, 4096);
-    let h = ((max_y - min_y).ceil() as u32).clamp(1, 4096);
+    // Drawn in SOURCE units, not FM units. Every stage image is placed at the stage scale, so a
+    // raster already measured in FM units gets that scale applied a SECOND time: the art comes out
+    // `scale` too wide and slides off its own collision, which reads as collision covering only
+    // part of the shape and a floor line that does not sit on the floor. The collision geometry is
+    // in FM units, so divide by the scale here and let the one placement put it back.
+    let s = if model.scale > 0.0 { model.scale } else { 1.0 };
+    let w = (((max_x - min_x) / s).ceil() as u32).clamp(1, 4096);
+    let h = (((max_y - min_y) / s).ceil() as u32).clamp(1, 4096);
     let mut img = RgbaImage::new(w, h);
     for p in &model.platforms {
         let r = &p.rect;
         let color = if p.drop_through { Rgba([120, 160, 220, 235]) } else { Rgba([90, 100, 120, 255]) };
-        let x0 = ((r.left() - min_x).max(0.0)) as u32;
-        let y0 = ((r.top() - min_y).max(0.0)) as u32;
-        let x1 = ((r.right() - min_x).min(w as f64)) as u32;
-        let y1 = ((r.bottom() - min_y).min(h as f64)) as u32;
+        let x0 = (((r.left() - min_x) / s).max(0.0)) as u32;
+        let y0 = (((r.top() - min_y) / s).max(0.0)) as u32;
+        let x1 = (((r.right() - min_x) / s).min(w as f64)) as u32;
+        let y1 = (((r.bottom() - min_y) / s).min(h as f64)) as u32;
         for y in y0..y1 {
             for x in x0..x1 {
                 img.put_pixel(x, y, color);
@@ -653,6 +659,8 @@ fn render_placeholder(model: &StageModel) -> StageArt {
             .write_image(img.as_raw(), w, h, image::ExtendedColorType::Rgba8)
             .expect("encode placeholder png");
     }
+    // Position stays in FM units: a placement's x/y are already parent-space coordinates and only
+    // the image's PIXELS are scaled. Size is what had to change, not where it sits.
     StageArt { png, x: min_x, y: min_y, w, h, hold: 1 }
 }
 
