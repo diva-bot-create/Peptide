@@ -126,6 +126,35 @@ dimensions below are the rest.
   startup/active/recovery. the live half is the `record`/`trace` frame recorder (both
   engines push per-frame telemetry); it confirms the emitted lengths actually play that
   way, on a sample rather than the whole roster.
+- **most animations run one SOURCE frame long, and it is not yet clear which.** the live sweep
+  (`tools/tests/move_sweep.py both`) measured sandbag and mario on the fixture in both engines.
+  the doubling itself is right: emitted length is exactly the sliced range x2 every time, and the
+  moves whose duration is decided by SCRIPT rather than by animation length match SSF2 exactly
+  (sandbag special_down 19->38, special_side_air 32->64, both 2.00). but most animations that play
+  to their own end come out one source frame long:
+
+  | char | move | ssf2 plays | fm | fm/2 |
+  | --- | --- | --- | --- | --- |
+  | sandbag | jab1 | 13 | 28 | 14 |
+  | sandbag | tilt_up | 12 | 26 | 13 |
+  | sandbag | aerial_forward | 14 | 30 | 15 |
+  | sandbag | aerial_down | 19 | 40 | 20 |
+  | mario | tilt_up | 13 | 28 | 14 |
+  | mario | aerial_forward | 29 | 60 | 30 |
+  | mario | aerial_down | 19 | 40 | 20 |
+  | mario | **jab1** | **7** | **14** | **7** |
+
+  nine of fourteen measurements are +1 and the rest are exact, so a blanket "trim one frame" is
+  wrong: it would break mario's jab, which already matches. two explanations have been tried and
+  killed by the data. it is not simply the last frame being a duplicate of the one before it
+  (mario's jab ends in a duplicate and is exact; mario's aerial_neutral does not and is +1), and
+  it is not the whole source animation being emitted (the sliced range is already shorter than
+  what the extractor reads).
+
+  what it looks like is SSF2 leaving an animation a frame before its slice ends, on a condition
+  that varies per move. the next step is the per-frame trace rather than the totals: both engines
+  push the frame index, so the question "which frame does SSF2 leave on" is answerable directly
+  instead of inferred from a length.
 - **special-angle sentinels.** SSF2 sentinel angles (`-1`/`-2`/`-3`…) are preserved
   faithfully, we just haven't mapped them to FM's special-angle codes yet. needs the
   SSF2-sentinel → FM-angle table.

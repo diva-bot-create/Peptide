@@ -443,9 +443,12 @@ def compare():
 # two separate sittings is one where the two halves can quietly disagree about which build, which
 # stage or which character they were looking at.
 
+# Which character to sweep. The fixture is the same on both sides, so the only thing that has to
+# be said twice is the name each engine knows the character by.
+CHAR = os.environ.get("PEPTIDE_SWEEP_CHAR", "sandbag")
 ENGINE_BOOT = {
-    "fm":   ["session", "--char", "sandbag", "--stage", "peptidefixturessf2"],
-    "ssf2": ["ssf2", "session", "--char", "sandbag", "--stage", "peptidefixture"],
+    "fm":   ["session", "--char", CHAR, "--stage", "peptidefixturessf2"],
+    "ssf2": ["ssf2", "session", "--char", CHAR, "--stage", "peptidefixture"],
 }
 BOOT_READY = {"fm": "auto-launching|READY|CRASH", "ssf2": "auto-launching|never settled"}
 
