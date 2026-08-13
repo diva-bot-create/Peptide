@@ -331,10 +331,20 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         ssf2_converter::abc_inject::inject_error_reporter(abc, SSF2_DOC_CLASS)?;
         // and the load-time half: a package the engine refuses names itself instead of
         // failing silently, which is the only signal a custom-content author ever gets
-        ssf2_converter::abc_inject::inject_load_error_reporter(abc)?;
+        ssf2_converter::abc_inject::inject_load_error_reporter(abc, SSF2_DOC_CLASS)?;
         // and the surface nothing was watching: an error thrown by a package's OWN code as it
         // loads goes to the loader, not the app, and unhandled there it ends the process
-        ssf2_converter::abc_inject::inject_package_error_reporter(abc)?;
+        ssf2_converter::abc_inject::inject_package_error_reporter(abc, SSF2_DOC_CLASS)?;
+        if std::env::var("PEPTIDE_PROBE_LOAD").is_ok() {
+            for (class, method, is_static, subject) in [
+                ("ResourceManager", "validateResource", true, Some("ID")),
+                ("ResourceManager", "handleLoaded", true, Some("ID")),
+                ("ResourceManager", "cacheLibrary", true, Some("ID")),
+            ] {
+                ssf2_converter::abc_inject::inject_method_probe(
+                    abc, SSF2_DOC_CLASS, class, method, is_static, subject)?;
+            }
+        }
         // make the physics fixture askable by id. the engine's id-to-file map comes from a
         // manifest it carries, so a package outside that manifest is never opened; this adds
         // the one entry without rewriting the manifest or touching any shipped data file.

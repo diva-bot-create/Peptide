@@ -194,6 +194,12 @@ pub fn build_fixture_swf() -> Vec<u8> {
     stage_body.push(Tag::ShowFrame);
     tags.push(Tag::DefineSprite(swf::Sprite { id: 11, num_frames: 1, tags: stage_body }));
     tags.push(place(11, Some("stageMC"), 1));
+    // Frame one ends here, and the class bindings land on frame two. That is the layout every
+    // shipped package has, and it is not decoration: the player finishes a load when the frame
+    // carrying the document class has been constructed. With everything crammed into a single
+    // frame the load simply never completed -- no error, no timeout, just a loading screen that
+    // spun forever, which is the hardest failure of the lot to attribute to anything.
+    tags.push(Tag::ShowFrame);
 
     let stage_symbol = format!("stage_{FIXTURE_ID}");
     beacons.push((11, stage_symbol));
@@ -222,7 +228,7 @@ pub fn build_fixture_swf() -> Vec<u8> {
         version: 21,
         stage_size: rect(-800.0, -600.0, 800.0, 600.0),
         frame_rate: Fixed8::from_f32(30.0),
-        num_frames: 1,
+        num_frames: 2,
     };
     let mut out = Vec::new();
     swf::write_swf(&header, &tags, &mut out).expect("fixture swf");
@@ -251,6 +257,8 @@ pub const FIXTURE_ID: &str = "peptidefixture";
 const OP_GETLOCAL0: u8 = 0xd0;
 const OP_GETLOCAL1: u8 = 0xd1;
 const OP_GETLOCAL2: u8 = 0xd2;
+const OP_GETSCOPEOBJECT: u8 = 0x65;
+const OP_PUSHFALSE: u8 = 0x27;
 const OP_GETPROPERTY: u8 = 0x66;
 const OP_SETPROPERTY: u8 = 0x61;
 const OP_RETURNVALUE: u8 = 0x48;
@@ -274,6 +282,9 @@ const NS_PACKAGE: u8 = 0x16;
 /// Where a package keeps what it registered about itself, and what it declares to the game.
 const PROPS_SLOT: &str = "m_peptideProps";
 const META_SLOT: &str = "MetaData";
+
+/// What the game calls on a stage while a match runs.
+const STAGE_CALLBACKS: [&str; 2] = ["initialize", "update"];
 
 /// The package API version this fixture is written against, as the game declares it.
 const API_VERSION_MAJOR: u8 = 0;
@@ -375,6 +386,8 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     let s_camera = str_(&mut abc, "camera");
     let s_x_start = str_(&mut abc, "x_start");
     let s_y_start = str_(&mut abc, "y_start");
+    let s_autopan = str_(&mut abc, "autoPanMultiplier");
+    let s_backgrounds = str_(&mut abc, "backgrounds");
 
     // ── the stub hierarchy the real definitions take over at load time ──
     let mut specs: Vec<ClassSpec> = Vec::new();
@@ -482,13 +495,27 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
     // creates classes -- a class must name its base before that base exists as a class object.
     let mn_base = { let n = abc.intern_string("SSF2BaseAPIObject"); abc.intern_qname(pub_ns, n) };
     let mn_asset = { let n = abc.intern_string("SSF2Asset"); abc.intern_qname(pub_ns, n) };
+    // The stage base a package builds on. A package built with the official tooling carries a
+    // client-side copy of this layer compiled in; this file has no such copy, which is the one
+    // gap it cannot author around. Naming the game's own class instead does NOT work: a loaded
+    // package cannot see it, so the reference resolves to nothing and the package is refused.
     let mn_ssf2stage = { let n = abc.intern_string("SSF2Stage"); abc.intern_qname(pub_ns, n) };
     let mn_fixture_cls = { let n = abc.intern_string(FIXTURE_ID); abc.intern_qname(pub_ns, n) };
-    let _ = mn_base;
 
     declare(&mut specs, "SSF2Stage", "", mn_base, 0, plain_ctor(0), 2, 1);
+
     // A stage is constructed WITH an argument and hands it to super; a 0-arg version is rejected.
-    declare(&mut specs, FIXTURE_ID, "", mn_ssf2stage, 1, plain_ctor(1), 3, 2);
+    // It also has to answer the calls the game drives a stage with. A fixture has no behaviour of
+    // its own -- that is the point of it -- but "no behaviour" still has to be something callable,
+    // because a missing method is not treated as nothing to do, it is an error mid-match.
+    let noop_m = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_RETURNVOID];
+    specs.push(ClassSpec {
+        name: FIXTURE_ID, package: String::new(), super_mn: mn_ssf2stage, param_count: 1,
+        ctor: plain_ctor(1), max_stack: 3, local_count: 2, slots: vec![],
+        methods: STAGE_CALLBACKS.iter().map(|n| MethodSpec {
+            name: n, param_count: 0, code: noop_m.clone(), max_stack: 2, local_count: 1,
+        }).collect(),
+    });
 
     // ── Main: the package's identity, registered field by field ──
     let mut m = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETLOCAL0];
@@ -527,13 +554,19 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
         op1(m, OP_FINDPROPSTRICT, mn_fixture_cls);
         op1(m, OP_GETPROPERTY, mn_fixture_cls);
     });
-    // camera: { x_start: 0, y_start: 0 } -- the fixture is centred on its own origin
+    // camera: the fixture is centred on its own origin and has no parallax layers. The empty
+    // fields are not padding: the game reaches into them without checking, so a camera block
+    // that omits them is one it walks off the end of.
     pair(&mut m, s_camera, &|m| {
         op1(m, OP_PUSHSTRING, s_x_start);
         m.push(OP_PUSHBYTE); m.push(0);
         op1(m, OP_PUSHSTRING, s_y_start);
         m.push(OP_PUSHBYTE); m.push(0);
-        op1(m, OP_NEWOBJECT, 2);
+        op1(m, OP_PUSHSTRING, s_autopan);
+        m.push(OP_PUSHFALSE);
+        op1(m, OP_PUSHSTRING, s_backgrounds);
+        op1(m, OP_NEWARRAY, 0);
+        op1(m, OP_NEWOBJECT, 4);
     });
     m.push(OP_RETURNVOID);
     declare(&mut specs, "Main", "", mn_asset, 0, m, 12, 1);
@@ -609,7 +642,11 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
 
         // Declaring the trait reserves the name; the class OBJECT only exists once this script's
         // initialiser builds it against its base.
-        let mut init = vec![OP_GETLOCAL0, OP_PUSHSCOPE];
+        // `initproperty` at the end stores INTO something, so the thing it stores into has to be
+        // on the stack under the value: the script's own global object, which `getscopeobject 0`
+        // pushes. Leaving it out is a stack underflow, and the player rejects the package for it
+        // with no clue which method is at fault -- the whole file simply never finishes loading.
+        let mut init = vec![OP_GETLOCAL0, OP_PUSHSCOPE, OP_GETSCOPEOBJECT, 0];
         op1(&mut init, OP_FINDPROPSTRICT, spec.super_mn);
         op1(&mut init, OP_GETPROPERTY, spec.super_mn);
         init.push(OP_DUP);
@@ -623,7 +660,7 @@ fn build_fixture_abc(symbols: &[(u16, String)]) -> Vec<u8> {
             param_types: vec![], return_type: 0, name: 0, flags: 0, options: vec![], param_names: vec![],
         });
         abc.add_body(MethodBody {
-            method: script_init, max_stack: 3, local_count: 1, init_scope_depth: 0, max_scope_depth: 2,
+            method: script_init, max_stack: 4, local_count: 1, init_scope_depth: 0, max_scope_depth: 2,
             code: init, exceptions: vec![], traits: vec![],
         });
         abc.scripts.push(ScriptInfo {

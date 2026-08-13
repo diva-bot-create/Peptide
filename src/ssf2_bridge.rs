@@ -372,7 +372,11 @@ pub fn session(args: &[String]) -> Result<()> {
         None
     } else {
         let ch = opts.char_name.clone().unwrap_or_else(|| cfg.char_name());
-        if ch.trim().is_empty() { None } else { Some((ch, cfg.ssf2_stage())) }
+        // `--stage` overrides the configured stage for the bake as well as the launch, which is
+        // what BootOptions promises. Ignoring it here baked one stage and launched another, so a
+        // stage named on the command line was never queued and never loaded.
+        let stage = opts.stage_name.clone().unwrap_or_else(|| cfg.ssf2_stage());
+        if ch.trim().is_empty() { None } else { Some((ch, stage)) }
     };
     let app = crate::ssf2::install_patched(
         port, fastboot.as_ref().map(|(c, s)| (c.as_str(), s.as_str())))?;

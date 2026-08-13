@@ -54,6 +54,7 @@ const OP_PUSHSHORT: u8 = 0x25;
 /// to guard MovieClip-only / container-only properties in the NODE verb — reading
 /// `currentFrame` off a Bitmap throws (display classes are sealed), which would abort the
 /// whole command through the dispatcher's try and answer "ERR:" for an otherwise fine node.
+const NS_PRIVATE: u8 = 0x05;
 const OP_ISTYPE: u8 = 0xB2;
 const OP_ISTYPELATE: u8 = 0xB3;
 const OP_IFGE: u8 = 0x18;
@@ -79,7 +80,7 @@ pub const PEPTIDE_LOAD_LOG: &str = "peptideLoadLog";
 pub const SSF2_RESOURCE_CLASS: &str = "Resource";
 pub const SSF2_RESOURCE_FILE_FIELD: &str = "CurrentFileName";
 pub const SSF2_RESOURCE_ERROR_METHODS: [&str; 2] = ["initialLoadError", "loadError"];
-pub const SSF2_RESOURCE_LOADER_FIELD: &str = "m_loader";
+pub const SSF2_RESOURCE_LOADER_FIELD: &str = "getLoader";
 pub const SSF2_RESOURCE_LOAD_METHOD: &str = "load";
 
 /// Where an extra package is registered from, and the table that doubles as its one-shot guard.
@@ -1748,6 +1749,16 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
         abc.add_instance_method_trait(ci, mn_pwalk, pw);
     }
 
+    // The buffer every error reporter writes into is declared HERE, alongside the socket, because
+    // this runs on every boot. Declaring it on the menu path instead left it missing on a fast
+    // boot, so each reporter threw on a property that did not exist -- and reported its own
+    // failure in place of the one it was watching, which is the worst way for a diagnostic to break.
+    {
+        let s = abc.intern_string(PEPTIDE_LOAD_LOG);
+        let mn = abc.intern_qname(pub_ns, s);
+        abc.add_instance_slot(ci, mn);
+    }
+
     // ctor: this.peptideSock = new Socket(); addEventListener("socketData", this.peptideOnData);
     //       connect(host, port)  — dial into the host's loopback server. connect() coerces
     //       the port String to int; the handler fires only when the host sends data.
@@ -1914,7 +1925,7 @@ pub fn inject_ready_signal(abc: &mut Abc, doc_class_local: &str) -> anyhow::Resu
     let (pkg, local) = doc_class_local.rsplit_once('.').unwrap_or(("", doc_class_local));
     let doc_ns = { let s = abc.intern_string(pkg); abc.intern_namespace(NS_PACKAGE, s) };
     let mn_main = { let s = abc.intern_string(local); abc.intern_qname(doc_ns, s) };
-    let mn_root = q(abc, pub_ns, "ROOT");            // Main.ROOT = the document instance
+    let mn_root = doc_root_qname(abc, doc_class_local); // the document's singleton of itself
     let mn_sock = q(abc, pub_ns, "peptideSock");     // the bridge socket (instance slot)
     let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
     let mn_flush = q(abc, pub_ns, "flush");
@@ -1925,7 +1936,6 @@ pub fn inject_ready_signal(abc: &mut Abc, doc_class_local: &str) -> anyhow::Resu
 
     // one-shot flag slot on the document instance (defaults to undefined → falsy)
     abc.add_instance_slot(doc_ci, mn_readysent);
-    abc.add_instance_slot(doc_ci, mn_loadlog);
 
     // hook DisclaimerMenu.checkDisclaimer — the recurring check that runs while the boot
     // disclaimer video plays (resolved by NAME, version-resilient; it's an instance method).
@@ -2401,6 +2411,34 @@ pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Re
     Ok(())
 }
 
+/// Resolve the singleton the document keeps of itself.
+///
+/// It lives in a PRIVATE namespace, not the public one, and the private namespace's name is the
+/// class's own fully qualified name in `package:Class` form. A public lookup does not merely
+/// return nothing, it throws -- and inside a reporter that is disastrous, because the handler
+/// fails while handling and what reaches the log is its own error instead of the one it was
+/// watching. Every silent diagnostic in this file traced back to exactly that.
+fn doc_root_qname(abc: &mut Abc, doc_class: &str) -> u32 {
+    let (pkg, local) = doc_class.rsplit_once('.').unwrap_or(("", doc_class));
+    let private = abc.intern_string(&format!("{pkg}:{local}"));
+    let ns = abc.intern_namespace(NS_PRIVATE, private);
+    let n = abc.intern_string("ROOT");
+    abc.intern_qname(ns, n)
+}
+
+/// Resolve the document class as a package-qualified name.
+///
+/// It is NOT in the public namespace, and a lookup that assumes it is throws. That is a
+/// particularly nasty mistake inside a reporter: the handler fails while handling, so what
+/// reaches the log is the reporter's own error and the real one is never seen.
+fn doc_class_qname(abc: &mut Abc, doc_class: &str) -> u32 {
+    let (pkg, local) = doc_class.rsplit_once('.').unwrap_or(("", doc_class));
+    let p = abc.intern_string(pkg);
+    let ns = abc.intern_namespace(NS_PACKAGE, p);
+    let n = abc.intern_string(local);
+    abc.intern_qname(ns, n)
+}
+
 /// Report every package that fails to load, over the same `SCRIPTERR` channel engine errors use.
 ///
 /// A malformed package does not announce itself. The game asks for a data file, the player refuses
@@ -2413,14 +2451,14 @@ pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Re
 /// error text before the game's own handling runs. Nothing is suppressed -- the original body still
 /// executes exactly as before, and the report is skipped whenever the bridge socket is not up, so
 /// an unpatched or pre-connection load behaves as it always did.
-pub fn inject_load_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
+pub fn inject_load_error_reporter(abc: &mut Abc, doc_class: &str) -> anyhow::Result<()> {
     let ci = abc.find_class_by_name(SSF2_RESOURCE_CLASS)
         .ok_or_else(|| anyhow::anyhow!("{SSF2_RESOURCE_CLASS} not found"))?;
 
     let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
     let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
-    let mn_main = q(abc, pub_ns, "Main");
-    let mn_root = q(abc, pub_ns, "ROOT");
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
     let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
     let mn_sock = q(abc, pub_ns, "peptideSock");
     let mn_connected = q(abc, pub_ns, "connected");
@@ -2598,7 +2636,7 @@ pub fn inject_extra_resource(abc: &mut Abc, id: &str, file: &str, guid: &str, ki
 /// Listening turns that into a line naming the file and the error, and marking it handled keeps
 /// the game running so the next package still gets its turn. One bad package should cost its own
 /// content, not the session.
-pub fn inject_package_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
+pub fn inject_package_error_reporter(abc: &mut Abc, doc_class: &str) -> anyhow::Result<()> {
     let ci = abc.find_class_by_name(SSF2_RESOURCE_CLASS)
         .ok_or_else(|| anyhow::anyhow!("{SSF2_RESOURCE_CLASS} not found"))?;
     let events_ns = { let s = abc.intern_string("flash.events"); abc.intern_namespace(NS_PACKAGE, s) };
@@ -2614,8 +2652,8 @@ pub fn inject_package_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
     let mn_errobj = q(abc, pub_ns, "error");
     let mn_loader = q(abc, pub_ns, SSF2_RESOURCE_LOADER_FIELD);
     let mn_file = q(abc, pub_ns, SSF2_RESOURCE_FILE_FIELD);
-    let mn_main = q(abc, pub_ns, "Main");
-    let mn_root = q(abc, pub_ns, "ROOT");
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
     let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
     let mn_sock = q(abc, pub_ns, "peptideSock");
     let mn_connected = q(abc, pub_ns, "connected");
@@ -2691,8 +2729,12 @@ pub fn inject_package_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
     let mut ic = Code::default();
     let l_noloader = ic.new_label();
     ic.op(OP_GETLOCAL0); ic.op(OP_PUSHSCOPE);
-    ic.op(OP_GETLOCAL0); ic.op_u30(OP_GETPROPERTY, mn_loader); ic.branch(OP_IFFALSE, l_noloader);
-    ic.op(OP_GETLOCAL0); ic.op_u30(OP_GETPROPERTY, mn_loader);
+    // Through the public accessor, NOT the field behind it. The field is private, and a public
+    // lookup of a private name throws rather than returning nothing -- which, prepended to the
+    // method that starts every load, meant the first load threw and the queue never advanced. The
+    // symptom was a loading screen that spun forever and then reported failure at the end.
+    ic.op(OP_GETLOCAL0); ic.op_u30_u30(OP_CALLPROPERTY, mn_loader, 0); ic.branch(OP_IFFALSE, l_noloader);
+    ic.op(OP_GETLOCAL0); ic.op_u30_u30(OP_CALLPROPERTY, mn_loader, 0);
     ic.op_u30(OP_GETPROPERTY, mn_cli); ic.op_u30(OP_GETPROPERTY, mn_ueevents);
     ic.op_u30(OP_GETLEX, mn_uee); ic.op_u30(OP_GETPROPERTY, mn_uncaught);
     ic.op(OP_GETLOCAL0); ic.op_u30(OP_GETPROPERTY, mn_h);
@@ -2704,6 +2746,89 @@ pub fn inject_package_error_reporter(abc: &mut Abc) -> anyhow::Result<()> {
     let body = &mut abc.bodies[body_idx];
     prepend_code(body, &payload);
     body.max_stack = body.max_stack.max(5);
+    body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
+    Ok(())
+}
+
+/// Report every time a named method is entered, over the same channel the errors use.
+///
+/// When a package is refused, the message alone rarely says WHERE: the runtime shipped to players
+/// omits the detail, so an error reads as a bare code with no property, file or line. Knowing how
+/// far the engine got before it threw is the next best thing and is usually enough -- the last
+/// method to report is the one to read.
+///
+/// Deliberately blunt. It is a probe for triaging one bad package, not something to leave on.
+pub fn inject_method_probe(abc: &mut Abc, doc_class: &str, class_local: &str, method_name: &str, is_static: bool, subject: Option<&str>)
+    -> anyhow::Result<()>
+{
+    let ci = abc.find_class_by_name(class_local)
+        .ok_or_else(|| anyhow::anyhow!("class {class_local} not found"))?;
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    let s_tag = abc.intern_string(&format!("SCRIPTERR: reached {class_local}.{method_name} "));
+    let s_nl2 = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+
+    let traits = if is_static { &abc.classes[ci].traits } else { &abc.instances[ci].traits };
+    let method = traits.iter().find_map(|t| match t.data {
+        TraitKindData::Method { method, .. }
+            if abc.multiname_local(t.name).as_deref() == Some(method_name) => Some(method),
+        _ => None,
+    }).ok_or_else(|| anyhow::anyhow!("{class_local}.{method_name} not found"))?;
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for {class_local}.{method_name}"))?;
+
+    let mut c = Code::default();
+    let l_skip = c.new_label();
+    let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    root(&mut c); c.branch(OP_IFFALSE, l_skip);
+    root(&mut c);
+    let l_have = c.new_label();
+    let l_joined = c.new_label();
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+    c.branch(OP_IFTRUE, l_have);
+    c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank);
+    c.branch(OP_JUMP, l_joined);
+    c.place(l_have);
+    c.op(OP_CONVERT_S);
+    c.place(l_joined);
+    c.op_u30(OP_PUSHSTRING, s_tag); c.op(OP_ADD);
+    // Optionally say WHICH subject, read through a public accessor. "a load started" is not
+    // actionable when thirty are in flight; "this one started and never finished" is.
+    if let Some(g) = subject {
+        let mn_g = q(abc, pub_ns, g);
+        // an instance method describes itself; a static one describes what it was handed
+        if is_static { c.op_u30(OP_GETLOCAL, 1); } else { c.op(OP_GETLOCAL0); }
+        c.op_u30(OP_GETPROPERTY, mn_g); c.op(OP_CONVERT_S); c.op(OP_ADD);
+    }
+    c.op_u30(OP_PUSHSTRING, s_nl2); c.op(OP_ADD);
+    c.op_u30(OP_SETPROPERTY, mn_loadlog);
+
+    let l_sent = c.new_label();
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+    c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_sent);
+    c.place(l_skip);
+    c.op(OP_POPSCOPE);
+
+    let payload = c.finish();
+    let body = &mut abc.bodies[body_idx];
+    prepend_code(body, &payload);
+    body.max_stack = body.max_stack.max(6);
     body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
     Ok(())
 }

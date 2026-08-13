@@ -221,6 +221,9 @@ is a hard requirement of the player or the game, not a style preference:
 | symbol 0 bound to `Main` | the loaded content is an anonymous clip, not a package. the game finds nothing that answers to the package API and rejects it |
 | the api layer (`register` / `getProp` / `initAPI` / `getAPIVersion`) carried BY the package | a package ships its own copy in the top-level namespace, so the game's same-named classes never stand in. an empty stub means the package throws while saying what it is |
 | every class reference LATE bound (`findpropstrict` + `getproperty`, not `getlex`) | naming a class directly binds it at verify time, before its own script has run. the player rejects the whole method rather than reporting a missing name |
+| TWO frames, with the class bindings after the first | the player finishes a load once the frame carrying the document class is built. crammed into one frame the load never completes: no error, no timeout, just a loading screen that spins and reports failure when the queue gives up |
+| `getscopeobject 0` before the class value in each class-defining script | `initproperty` stores INTO something, so that something has to be under the value. leaving it out is a stack underflow and the package is refused whole |
+| the camera block's empty fields (`autoPanMultiplier`, `backgrounds`) | the game reaches into them without checking |
 | an entry in the game's own resource manifest | the file is simply never opened. no error is raised, because nothing tried |
 
 the manifest row is the one that cannot be satisfied by authoring alone. the id-to-file map is not
@@ -231,6 +234,13 @@ that same shape at the menu entry point. no manifest is rewritten and no shipped
 and a package with an entry is asked for by id like any other. WHERE that runs is load-bearing:
 the table's own initialiser runs while the table is still null, and the queue call is verified
 before the definitions it names have run, so both of those homes take the resource system down.
+
+the one gap authoring cannot close is the package-side API layer. a package carries its own copy
+of the classes it builds on, in the top-level namespace, and the stage base is where the behaviour
+the game drives actually lives. the official tooling compiles that copy in. naming the game's own
+equivalent instead does NOT work: a loaded package cannot see it, so the reference resolves to
+nothing and the package is refused. peptide's fixture gets as far as loading, validating and being
+cached, and fails when the game drives the stage object, because the base under it is a stub.
 
 a package the player refuses hard is not a script error and will not reach the `SCRIPTERR`
 channel: the process ends, with no report and no crash log. so a boot that reaches READY and then
