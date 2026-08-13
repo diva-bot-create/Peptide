@@ -179,13 +179,24 @@ dimensions below are the rest.
   since both are one screenful the source's particle COUNT carries over unchanged. verified live:
   the drifting field's centre moved 303 -> 1244 as the fighters moved 400 -> 1600.
 
-- **`e` cannot reach the script-API sandbox.** eval's `match` is a small hand-written facade
-  (`commands.hsx`), not the `MatchApi` a stage script gets, so `getCamera`/`getMatchSettingsConfig`
-  read as null there and anything a converted script sees costs a convert-export-boot cycle to
-  check. binding the real api object is not the fix: it binds fine (a correctly TYPED register
-  reads back a real `pxf.api.MatchApi`) but calling anything on it takes the engine down, and the
-  StageApi equivalent lands with a null receiver. the eval would have to RUN as a script object
-  with its own ambient bindings rather than reading a bound variable.
+- **`e` cannot reach the script-API sandbox, and the reason is per-class.** eval's `match` is a
+  small hand-written facade (`commands.hsx`), not the api a stage script gets, so anything only
+  that surface can answer costs a convert-export-boot cycle to check. binding the real object is
+  NOT the fix, and four routes are ruled out (each bound correctly through a typed register, then
+  failed on first use):
+
+  | bound | what happens |
+  | --- | --- |
+  | the match api object | engine goes down on the first method call |
+  | the stage api object | calls land with a null receiver |
+  | the api's own globals virtual | binds safely, but carries none of the accessors |
+  | the raw camera / match settings | engine goes down on the first FIELD read |
+
+  entity classes dispatch fine (`p0.getStateName()` works), so what the interpreter can drive is
+  decided per CLASS, not by sandboxed-vs-raw. a subclassed interpreter is not it either: one
+  interp class serves everything. an interpreted script gets a working ambient `match` from some
+  path that readies the interpreter per run, and peptide calls interpretScript directly, below it.
+  finding that path is the work; the binding is one line after that.
 
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and

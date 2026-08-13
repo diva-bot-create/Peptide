@@ -1508,17 +1508,26 @@ fn connect_edit(
     let stage_entity_t = require_type(code, "pxf.entity.Stage")?;
     let stage_field = find_field(code, match_t, "stageEntity")
         .ok_or_else(|| anyhow::anyhow!("Match.stageEntity field not found"))?;
-    // NOT bound: the script-API objects (pxf.api.StageApi, pxf.api.MatchApi), the sandbox an
-    // entity script sees as its ambient `stage` and `match`. They are the right conceptual
-    // surface -- the only surface a converted script can see, so the one to ask when debugging
-    // one -- and they bind fine: reading Match.matchApi into a correctly TYPED register (an
-    // arbitrary spare register reads back as whatever it was declared to hold) gives an object
-    // that reports itself as pxf.api.MatchApi. But CALLING anything on it through the
-    // interpreter Peptide drives does not work: StageApi lands with a null receiver, and
-    // MatchApi takes the engine down on the first call. Reaching this surface needs the eval to
-    // run as a real script object with its own ambient bindings, not a bound variable, so until
-    // then camera/match-settings questions cost a convert-export-boot cycle. Entity methods
-    // (p0.getStateName()) work, API
+    // NOT bound, and the reason is a HARD BOUNDARY worth knowing before trying again: what the
+    // interpreter can dispatch on is per-CLASS, not per-surface. Entity classes are fine
+    // (p0.getStateName() works). Everything else tried BINDS correctly and then fails on first
+    // use, several different ways:
+    //   - pxf.api.StageApi                    calls land with a null receiver
+    //   - pxf.api.MatchApi                    takes the ENGINE DOWN on the first method call
+    //   - Match.matchApiGlobals               binds safely as a virtual, but carries no
+    //                                         getCamera/getCharacters, and its getter has no
+    //                                         callers, so it is not what scripts are handed either
+    //   - Match.camera, Match.matchSettings   bind and identify correctly, then take the ENGINE
+    //                                         DOWN on the first FIELD read (camera.body.x)
+    // A subclassed interpreter is not the answer either: one hscript.Interp class serves
+    // everything. Each of these went through a correctly TYPED register (an arbitrary spare
+    // register reads back as whatever it was declared to hold), so the binding is not the fault.
+    // An interpreted script is handed a working ambient `match` by SOME path that readies the
+    // interpreter per run, and Peptide calls interpretScript directly, below it. Finding that path
+    // is the work; the binding is one line once it is known. Until then anything only these
+    // objects can answer -- where the camera is, which switches the match was started with --
+    // costs a convert-export-boot cycle, which is what makes it worth doing.
+    // Entity methods (p0.getStateName()) work, API
     // methods do not, so the sandbox has to be reached in bytecode the way `tree` is.
     let m_idx = add_int(code, 'm' as i32);
     let t_idx = add_int(code, 't' as i32);
