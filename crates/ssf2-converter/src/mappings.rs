@@ -308,6 +308,8 @@ pub enum AttachEffectPropMapping {
 ///   - `frame_params`        — per-parameter frame-count flags for 30→60fps
 ///   - `passthrough_fm_apis` — calls that ARE valid Fraymakers API; left
 ///                              untouched and treated as known calls
+///   - `haxe_builtins`       — Haxe/hscript stdlib methods the decompiler
+///                              surfaces as bare calls; known, never a gap
 ///   - `ssf2_only`           — calls with no Fraymakers equivalent; replaced
 ///                              by `// [SSF2-only: NAME] …` markers
 #[derive(Debug, Clone, Deserialize)]
@@ -328,6 +330,8 @@ pub struct ApiCommands {
     pub frame_params: Vec<FrameParam>,
     #[serde(default)]
     pub passthrough_fm_apis: Vec<NamedApi>,
+    #[serde(default)]
+    pub haxe_builtins: Vec<NamedApi>,
     #[serde(default)]
     pub ssf2_only: Vec<NamedApi>,
 }

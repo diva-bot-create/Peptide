@@ -73,6 +73,12 @@ const OP_IFGT:          u8 = 0x17;
 const OP_IFGE:          u8 = 0x18;
 const OP_IFSTRICTEQ:    u8 = 0x19;
 const OP_IFSTRICTNE:    u8 = 0x1A;
+// negated comparison branches (see decompiler.rs) — same 3-byte offset as their
+// positive twins, so the scan desyncs on any method that uses one.
+const OP_IFNLT:         u8 = 0x0C;
+const OP_IFNLE:         u8 = 0x0D;
+const OP_IFNGT:         u8 = 0x0E;
+const OP_IFNGE:         u8 = 0x0F;
 
 // ─── Parsed ABC structures ────────────────────────────────────────────────────
 
@@ -2002,7 +2008,8 @@ pub(crate) fn scan_method<V: AbcVisitor>(bytecode: &[u8], abc: &AbcFile, visitor
             OP_RETURNVALUE => { stack.pop(); }
             OP_RETURNVOID => {}
             OP_JUMP | OP_IFTRUE | OP_IFFALSE | OP_IFEQ | OP_IFNE | OP_IFLT |
-            OP_IFLE | OP_IFGT | OP_IFGE | OP_IFSTRICTEQ | OP_IFSTRICTNE => {
+            OP_IFLE | OP_IFGT | OP_IFGE | OP_IFNLT | OP_IFNLE | OP_IFNGT | OP_IFNGE |
+            OP_IFSTRICTEQ | OP_IFSTRICTNE => {
                 if i + 3 <= bytecode.len() { i += 3; }
                 if op != OP_JUMP { stack.pop(); }
             }

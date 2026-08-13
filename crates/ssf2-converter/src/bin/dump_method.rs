@@ -7,6 +7,7 @@
 //!   dump_method <swf> cinit <Class>            -- disasm class static init
 //!   dump_method <swf> sig <methodIndex>        -- print param/return types only
 //!   dump_method <swf> sigclass <Class>         -- print signature of every method on a class
+//!   dump_method <swf> find <name>              -- every method whose disasm mentions <name>
 
 use ssf2_converter::abc_codec::{self, Abc, Multiname, TraitKindData};
 
@@ -47,12 +48,20 @@ fn rd_u30(b: &[u8], i: &mut usize) -> u32 {
     r
 }
 fn rd_s24(b: &[u8], i: &mut usize) -> i32 {
+    // `find` disassembles every body in the file, so a truncated tail has to read as 0
+    // rather than panic partway through the scan.
+    if *i + 3 > b.len() { *i = b.len(); return 0; }
     let v = (b[*i] as i32) | ((b[*i+1] as i32) << 8) | ((b[*i+2] as i32) << 16);
     *i += 3;
     if v & 0x800000 != 0 { v - 0x1000000 } else { v }
 }
 
 fn disasm(abc: &Abc, code: &[u8]) {
+    print!("{}", disasm_text(abc, code));
+}
+
+fn disasm_text(abc: &Abc, code: &[u8]) -> String {
+    let mut out = String::new();
     let mut i = 0usize;
     while i < code.len() {
         let off = i;
@@ -109,6 +118,10 @@ fn disasm(abc: &Abc, code: &[u8]) {
             0x19 => { let t = rd_s24(code, &mut i); format!("ifstricteq -> {}", i as i32 + t) }
             0x1a => { let t = rd_s24(code, &mut i); format!("ifstrictne -> {}", i as i32 + t) }
             0x11 => { let t = rd_s24(code, &mut i); format!("iftrue2 -> {}", i as i32 + t) }
+            0x0c => { let t = rd_s24(code, &mut i); format!("ifnlt -> {}", i as i32 + t) }
+            0x0d => { let t = rd_s24(code, &mut i); format!("ifnle -> {}", i as i32 + t) }
+            0x0e => { let t = rd_s24(code, &mut i); format!("ifngt -> {}", i as i32 + t) }
+            0x0f => { let t = rd_s24(code, &mut i); format!("ifnge -> {}", i as i32 + t) }
             0x10 => { let t = rd_s24(code, &mut i); format!("jump -> {}", i as i32 + t) }
             0x1b => {
                 let def = rd_s24(code, &mut i);
@@ -133,8 +146,9 @@ fn disasm(abc: &Abc, code: &[u8]) {
             0xf1 => { rd_u30(code, &mut i); "debugfile".into() }
             _ => format!("op 0x{op:02x}"),
         };
-        println!("{off:>5}: {text}");
+        out.push_str(&format!("{off:>5}: {text}\n"));
     }
+    out
 }
 
 fn main() {
@@ -185,6 +199,29 @@ fn main() {
                 };
                 let nm = abc.multiname_local(t.name).unwrap_or_default();
                 print_sig(&abc, m.1, &format!("  {} {}", m.0, nm));
+            }
+        }
+        // A character's helpers live in nested closures, not class traits, so there's no
+        // index to look up — scan every body for one that mentions the name.
+        "find" => {
+            let needle = &args[3];
+            for b in &abc.bodies {
+                // a nested `function NAME(...)` is an activation-object trait on the
+                // ENCLOSING body, initialized by newfunction — the name never appears in
+                // the instruction stream, so the traits have to be checked separately.
+                let defs: Vec<String> = b.traits.iter()
+                    .filter(|t| abc.multiname_local(t.name).as_deref() == Some(needle.as_str()))
+                    .map(|t| match &t.data {
+                        TraitKindData::Method { method, .. } => format!("  DEFINES {needle} = method#{method}"),
+                        other => format!("  DEFINES {needle} ({other:?})"),
+                    })
+                    .collect();
+                let text = disasm_text(&abc, &b.code);
+                let hits: Vec<&str> = text.lines().filter(|l| l.contains(needle.as_str())).collect();
+                if defs.is_empty() && hits.is_empty() { continue; }
+                print_sig(&abc, b.method, &format!("method#{}", b.method));
+                for d in defs { println!("{d}"); }
+                for line in hits { println!("  {line}"); }
             }
         }
         other => { let _: Option<Multiname> = None; eprintln!("unknown {other}"); }

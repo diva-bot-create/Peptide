@@ -2300,6 +2300,21 @@ pub fn uncomment_local_fn_calls(code: &str) -> String {
     joined
 }
 
+/// Drop the `unknown` tally for every name the ASSEMBLED script defines as a local
+/// `function NAME(...)`. [`log_unknown_calls`] runs per-method, so an author-defined
+/// SSF2 helper (`isDarkPit`, `updateAuraPaws`, `hurtSelf`) counts as an unmapped gap
+/// even though its translated body is emitted right there and the call resolves fine.
+/// Same reconciliation as [`uncomment_local_fn_calls`], on the bookkeeping instead of
+/// the code — the unknown stream is what we prioritize converter work from, so it has
+/// to mean "no FM equivalent", not "the converter didn't recognize the name". Records
+/// the names; [`snapshot_conversion_log`] applies them, so a frame-script pass that
+/// accrues counts AFTER the defining file still gets discounted.
+pub fn discount_local_fn_calls(code: &str) {
+    let def_re = regex::Regex::new(r"(?m)^\s*function\s+(\w+)\s*\(").unwrap();
+    let mut log = conversion_log().lock().unwrap();
+    log.local_fns.extend(def_re.captures_iter(code).map(|c| c[1].to_string()));
+}
+
 /// Comment out any `}` whose matching `{` lives on a commented-out line. When a
 /// translator neutralizes a block-opening statement (`if (self.getMC()...) {` becomes
 /// `// [SSF2-only: getMC] if (...) {`), the opening brace is now inside a comment but
@@ -2434,6 +2449,10 @@ pub struct ConversionLog {
     pub unknown: std::collections::BTreeMap<String, usize>,
     pub ssf2_only: std::collections::BTreeMap<String, usize>,
     pub already_logged: std::collections::BTreeSet<String>,
+    /// Helper names this character's own script defines (see [`discount_local_fn_calls`]).
+    /// Filtered out of `unknown` at snapshot time, so it doesn't matter whether the
+    /// defining file or a later frame-script pass accrued the count.
+    pub local_fns: std::collections::BTreeSet<String>,
 }
 
 fn conversion_log() -> &'static std::sync::Mutex<ConversionLog> {
@@ -2448,17 +2467,29 @@ pub fn reset_conversion_log() {
 }
 
 /// Snapshot the current log (does not reset). Used at the end of a run to
-/// write `conversion_log.json` next to the exported character.
+/// write `conversion_log.json` next to the exported character. Calls to the
+/// character's own helpers are dropped from `unknown` here (see
+/// [`discount_local_fn_calls`]) so the stream means "no FM equivalent".
 pub fn snapshot_conversion_log() -> ConversionLog {
-    conversion_log().lock().unwrap().clone()
+    let mut snap = conversion_log().lock().unwrap().clone();
+    let locals = std::mem::take(&mut snap.local_fns);
+    snap.unknown.retain(|name, _| !locals.contains(name));
+    snap.local_fns = locals;
+    snap
 }
 
 /// Walk `code` for `.NAME(` call sites and log any name that isn't covered
-/// by any of the four commands.jsonc sections. Locally-defined helper names
-/// will appear here too — the log is a hint, not a strict gap report.
+/// by any of the five commands.jsonc sections. Locally-defined helper names
+/// still land here (this pass runs per-method, so it can't see a sibling
+/// definition); [`discount_local_fn_calls`] subtracts them once the whole
+/// script is assembled.
 fn log_unknown_calls(code: &str, cfg: &crate::mappings::ApiCommands) {
     // Build the union of all known names across every section.
     let mut known: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Call-shaped identifiers (`NAME(`) in a mapping's source and target text. A regex
+    // pattern escapes its call paren, so `NAME\(` counts as a call site too — without
+    // that, every name a regex mapping EMITS (`Common.setAutocancel($1)`) reads back as
+    // an unmapped gap.
     let extract = |s: &str, out: &mut std::collections::BTreeSet<String>| {
         let bytes = s.as_bytes();
         let mut i = 0usize;
@@ -2469,7 +2500,9 @@ fn log_unknown_calls(code: &str, cfg: &crate::mappings::ApiCommands) {
                 while i < bytes.len()
                     && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
                 { i += 1; }
-                if i < bytes.len() && bytes[i] == b'(' {
+                let call = bytes.get(i) == Some(&b'(')
+                    || (bytes.get(i) == Some(&b'\\') && bytes.get(i + 1) == Some(&b'('));
+                if call {
                     out.insert(String::from_utf8_lossy(&bytes[start..i]).into_owned());
                 }
             } else {
@@ -2481,7 +2514,12 @@ fn log_unknown_calls(code: &str, cfg: &crate::mappings::ApiCommands) {
         extract(&r.from, &mut known);
         extract(&r.to,   &mut known);
     }
+    for r in &cfg.regex_replacements {
+        extract(&r.pattern,     &mut known);
+        extract(&r.replacement, &mut known);
+    }
     for p in &cfg.passthrough_fm_apis { known.insert(p.name.clone()); }
+    for b in &cfg.haxe_builtins       { known.insert(b.name.clone()); }
     for o in &cfg.ssf2_only           { known.insert(o.name.clone()); }
     for f in &cfg.frame_params        { known.insert(f.name.clone()); }
 
