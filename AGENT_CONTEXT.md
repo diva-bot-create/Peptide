@@ -206,68 +206,13 @@ after unwrapping, `swf_parser::parse` uses the Ruffle `swf` crate (`decompress_s
 
 ### what a package must contain to LOAD (not just to parse)
 
-peptide's reader is deliberately forgiving, so a package can convert cleanly and still be a file
-the game will not open. these are the differences, learned by watching loads fail. everything here
-is a hard requirement of the player or the game, not a style preference:
+peptide's reader is deliberately forgiving, so a stage package can convert cleanly and still be a
+file the game will not open: the container form, the tag ORDER, the class graph, the clip tree and
+the api layer are all load-bearing, and none of them announce themselves when wrong.
 
-| requirement | what happens without it |
-| --- | --- |
-| the DAT container (zlib around `u32 swf_len`, `u32 index_count`, `N x u32` index, inner SWF) | the reader passes a bare `FWS` stream through, the game does not recognise the file at all |
-| `FileAttributes` with the ActionScript-3 flag, as the FIRST tag | the player runs the file as AVM1, ignores the ABC, and every symbol link binds to nothing |
-| a class defined for EVERY `SymbolClass` link | the player throws while binding symbols. this is the nastiest one: it happens during the boot's data pass, so the whole game dies rather than just this package |
-| one class per script, not all classes in one script | shared bases (the asset/stage bases) already exist in the game. a script initialiser that trips over an existing name stops there, taking every later class in that script with it -- including `Main` |
-| a `Main` class whose constructor registers `id` | the package has no identity, so nothing can ask for it no matter how correct the geometry is |
-| a stage class constructed WITH one argument, passed to `super` | a 0-argument version is rejected when the stage is built |
-| symbol 0 bound to `Main` | the loaded content is an anonymous clip, not a package. the game finds nothing that answers to the package API and rejects it |
-| the api layer (`register` / `getProp` / `initAPI` / `getAPIVersion`) carried BY the package | a package ships its own copy in the top-level namespace, so the game's same-named classes never stand in. an empty stub means the package throws while saying what it is |
-| every class reference LATE bound (`findpropstrict` + `getproperty`, not `getlex`) | naming a class directly binds it at verify time, before its own script has run. the player rejects the whole method rather than reporting a missing name |
-| TWO frames, with the class bindings after the first | the player finishes a load once the frame carrying the document class is built. crammed into one frame the load never completes: no error, no timeout, just a loading screen that spins and reports failure when the queue gives up |
-| `getscopeobject 0` before the class value in each class-defining script | `initproperty` stores INTO something, so that something has to be under the value. leaving it out is a stack underflow and the package is refused whole |
-| the camera block's empty fields (`autoPanMultiplier`, `backgrounds`) | the game reaches into them without checking |
-| the stage clip tree: `stageMC` containing `background`, `terrain`, `foreground`, with boundaries and spawn beacons nested INSIDE `terrain` | the game walks these by name and does not check as it goes, so a missing layer surfaces as an undefined-value error from somewhere inside the engine, naming neither the part nor the package |
-| an entry in the game's own resource manifest | the file is simply never opened. no error is raised, because nothing tried |
-
-the manifest row is the one that cannot be satisfied by authoring alone. the id-to-file map is not
-derived from the files: it is an obfuscated JSON manifest embedded in the game, and a package the
-manifest does not list is invisible however well formed it is. `inject_extra_resource` sidesteps it: the game already
-registers one package by hand, ahead of the manifest-driven ones, so peptide prepends another in
-that same shape at the menu entry point. no manifest is rewritten and no shipped file is touched,
-and a package with an entry is asked for by id like any other. WHERE that runs is load-bearing:
-the table's own initialiser runs while the table is still null, and the queue call is verified
-before the definitions it names have run, so both of those homes take the resource system down.
-
-`inject_stage_shape_check` exists to make that last row self-explaining: it reads the clip tree as
-the game validates a package and names each missing part, so an author gets "missing a required
-part: foreground" instead of a type error with no property, file or line. it is OPT-IN
-(`PEPTIDE_STAGE_CHECK`) while its wiring settles, because reading the resource at validation time
-is easy to get wrong and doing so stalls the load queue, which is worse than the failure it
-explains.
-
-a package also declares a CLASS MAP to the game (`MetaData.BASE_CLASSES`): every api class name
-the game knows, each mapped to the package's own class object. the game reads entries straight out
-of it without checking first, so a missing name comes back undefined and is then used. the names
-are the game's, not the package's, and shipped packages build the map with a plain
-`pushstring name; getlex Class` pair per entry. the game resolves a stage as
-`resource.getProp("stage")` first and that map second.
-
-the one gap authoring cannot close is the package-side API layer. a package carries its own copy
-of the classes it builds on, in the top-level namespace, and the stage base is where the behaviour
-the game drives actually lives. the official tooling compiles that copy in. naming the game's own
-equivalent instead does NOT work: a loaded package cannot see it, so the reference resolves to
-nothing and the package is refused. peptide's fixture gets as far as loading, validating and being
-cached, and fails when the game drives the stage object, because the base under it is a stub.
-
-a package the player refuses hard is not a script error and will not reach the `SCRIPTERR`
-channel: the process ends, with no report and no crash log. so a boot that reaches READY and then
-drops the connection the moment an id is requested means the package was rejected below the script
-layer, and the thing to check is the SWF itself rather than anything it does.
-
-none of these announce themselves. that is what `inject_load_error_reporter` is for: it hooks both
-of the loader's error paths so a package that fails names itself and its error over the
-`SCRIPTERR` channel, instead of leaving an author with a game that boots to a broken state and no
-line to read. reports are buffered on the document and drained the first tick the bridge socket is
-writable, because packages are opened during the boot -- before `connect()` has completed -- so a
-report written at the moment of failure would be dropped exactly when it matters most.
+that is its own subject and it has its own home:
+[`docs/SSF2_PACKAGE_FORMAT.md`](docs/SSF2_PACKAGE_FORMAT.md) covers every requirement, why each one
+fails silently, and how to diagnose a package that will not load.
 
 ### SWF structure for SSF2 characters
 

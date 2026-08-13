@@ -16,19 +16,23 @@
 //! * HYBRID — a soft (drop-through) platform above the floor, with the ledge beacons at the
 //!   floor's ends, so ledge-grab and platform-drop behaviour have a known reference.
 //!
-//! Coordinates are SSF2 units (the converter scales them on the way out). The floor's top surface
-//! is y = 0 so that "on the ground" is the origin and heights read directly as distance fallen.
+//! Coordinates are SSF2 units (the converter scales them on the way out), and Y grows DOWNWARD.
+//! That is the one thing to keep hold of while reading the numbers here: the floor carries the
+//! LARGEST y of anything a fighter interacts with, spawn beacons sit at smaller y because they are
+//! above it, and a fall is y increasing. Authoring it the other way round produces a stage that
+//! looks right in a diagram and puts its ground above everyone's head, out of reach and doing
+//! nothing, which is exactly what the first working version of this did.
 
 use swf::{
     Fixed8, Rectangle, ShapeRecord, ShapeStyles, StyleChangeData, Tag, Twips,
 };
 
 /// Floor top surface. Everything vertical is measured from here.
-pub const FLOOR_Y: f64 = 0.0;
+pub const FLOOR_Y: f64 = 400.0;
 /// Floor half-width: the walkable span is `-FLOOR_HALF_W ..= FLOOR_HALF_W`.
 pub const FLOOR_HALF_W: f64 = 600.0;
 /// Soft platform's top surface, above the floor.
-pub const PLATFORM_Y: f64 = -260.0;
+pub const PLATFORM_Y: f64 = 140.0;
 /// How high above the floor a character can be dropped from and still be inside the blast box.
 pub const DROP_CEILING: f64 = -2800.0;
 
@@ -161,7 +165,10 @@ pub fn build_fixture_swf() -> Vec<u8> {
     let mut placements: Vec<Tag> = Vec::new();
     let mut depth = 20u16;
     for (i, x) in [-300.0f64, -100.0, 100.0, 300.0].into_iter().enumerate() {
-        for (kind, y) in [("start", -100.0f64), ("spawn", -600.0)] {
+        // Capitalised, because shipped stages capitalise them and the game matches the name it is
+        // given. Lowercase beacons are not beacons the game finds, so it falls back to a default
+        // position and the stage's own spawn points never get used.
+        for (kind, y) in [("Start", 300.0f64), ("Spawn", -200.0)] {
             tags.push(rect_shape(next_shape, -4.0, -4.0, 4.0, 4.0, mark));
             tags.push(sprite_of(next_sprite, next_shape));
             // SSF2 numbers players from ONE: `player_index` subtracts 1, so a `p0_` beacon is

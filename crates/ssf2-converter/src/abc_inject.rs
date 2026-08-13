@@ -2949,6 +2949,41 @@ fn operand_shape(op: u8) -> (usize, usize) {
 /// asking the error where it came from, wrap the method and let the METHOD say: anything thrown
 /// inside it is reported against its own source location and then rethrown untouched, so the game
 /// behaves exactly as it would have and the log gains the one fact it was missing.
+/// Stands in for the error message inside a report, so the place it happened and the reason it
+/// happened can sit either side of it without assembling the line in pieces at runtime.
+const MARKER: &str = "\u{1}";
+
+/// What a failure at a given place in the engine actually MEANS for the package that caused it.
+///
+/// Each of these was paid for once. The engine reports a type error or a null read from deep
+/// inside its own code, with nothing naming the package or the mistake; the mapping from "it threw
+/// here" to "your stage is built wrong in this specific way" is the expensive part, and there is no
+/// reason for the next person to buy it again. Anything not listed still reports its file and line,
+/// which is the raw material for adding a line here.
+const PACKAGE_FAULT_HINTS: &[(&str, u32, &str)] = &[
+    ("StageData.as", 409,
+     "a boundary is a CLIP, not a shape. wrap deathBoundary/camBoundary in their own sprites"),
+    ("StageData.as", 410,
+     "the smash ball boundary is a CLIP, not a shape"),
+    ("StageData.as", 411,
+     "the blast boundary is a CLIP, not a shape"),
+    ("ResourceManager.as", 659,
+     "initAPI must RETURN the class carrying BASE_CLASSES; returning nothing reads the map off null"),
+    ("ResourceManager.as", 662,
+     "initAPI must RETURN the class carrying BASE_CLASSES; returning nothing reads the map off null"),
+    ("GameController.as", 258,
+     "getProp(\"stage\") must return a CLASS. check the package registered its stage class"),
+    ("GameController.as", 150,
+     "the stage clip is missing: the game looks for a clip linked as stage_<id>"),
+];
+
+/// The explanation for a failure at this file and line, if one is known.
+fn fault_hint(file: &str, line: u32) -> Option<&'static str> {
+    PACKAGE_FAULT_HINTS.iter()
+        .find(|(f, l, _)| *l == line && file == *f)
+        .map(|(_, _, why)| *why)
+}
+
 pub fn inject_error_locator(abc: &mut Abc, doc_class: &str, class_local: &str, method_name: &str,
     is_static: bool) -> anyhow::Result<()>
 {
@@ -2990,11 +3025,15 @@ pub fn inject_error_locator(abc: &mut Abc, doc_class: &str, class_local: &str, m
 
     let s_nl = abc.intern_string("\n");
     let s_blank = abc.intern_string("");
+    let s_marker = abc.intern_string(MARKER);
+    let mn_replace = q(abc, pub_ns, "replace");
     let err_local = abc.bodies[body_idx].local_count.max(1);
     // The file already names the class, so naming it again earns nothing. `file:line method` says
     // where and what, once each.
     let tags: Vec<(u32, u32, u32)> = regions.iter().map(|(from, to, line)| {
-        let t = abc.intern_string(&format!("SCRIPTERR: {file}:{line} {method_name}: "));
+        let why = fault_hint(&file, *line).map(|w| format!("\n      {w}")).unwrap_or_default();
+        // the message goes between the two, so the hint is emitted as a suffix the handler appends
+        let t = abc.intern_string(&format!("SCRIPTERR: {file}:{line} {method_name}: {MARKER}{why}"));
         (*from, *to, t)
     }).collect();
 
@@ -3027,8 +3066,13 @@ pub fn inject_error_locator(abc: &mut Abc, doc_class: &str, class_local: &str, m
         h.place(l_have);
         h.op(OP_CONVERT_S);
         h.place(l_joined);
-        h.op_u30(OP_PUSHSTRING, *s_tag); h.op(OP_ADD);
-        h.op_u30(OP_GETLOCAL, err_local); h.op(OP_CONVERT_S); h.op(OP_ADD);
+        // The tag carries a marker where the message belongs, so "where" and "why" can sit on
+        // either side of "what" without building the string in three separate pieces here.
+        h.op_u30(OP_PUSHSTRING, *s_tag);
+        h.op_u30(OP_PUSHSTRING, s_marker);
+        h.op_u30(OP_GETLOCAL, err_local); h.op(OP_CONVERT_S);
+        h.op_u30_u30(OP_CALLPROPERTY, mn_replace, 2);
+        h.op(OP_ADD);
         h.op_u30(OP_PUSHSTRING, s_nl); h.op(OP_ADD);
         h.op_u30(OP_SETPROPERTY, mn_loadlog);
         // send at once: whatever threw here may well stop the frame that would otherwise drain it

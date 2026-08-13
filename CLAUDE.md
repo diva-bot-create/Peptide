@@ -15,6 +15,9 @@ FrayTools to publish. see [`README.md`](README.md) for the pitch.
 - [`DEVELOPMENT.md`](DEVELOPMENT.md) -- converter dev guide: build, the pipeline, every module,
   the mapping config, output layout.
 - [`TESTING.md`](TESTING.md) -- the two validation harnesses + the iteration loop.
+- [`docs/SSF2_PACKAGE_FORMAT.md`](docs/SSF2_PACKAGE_FORMAT.md) -- how an SSF2 stage package is
+  BUILT (container, tag order, class graph, clip tree, api layer) and how to diagnose one that
+  won't load. read it before authoring or debugging a package the game refuses.
 - [`docs/PORTING_STAGES.md`](docs/PORTING_STAGES.md) -- the deep-RE playbook for porting a stage
   accurately (static inventory, AS3 disasm, live probing, coordinate model, verification gates).
   follow it phase by phase for EVERY stage.
