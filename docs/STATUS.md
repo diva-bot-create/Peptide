@@ -285,6 +285,24 @@ dimensions below are the rest.
   TODO naming the effect instead of a call that draws the wrong thing
   (`api_mappings::effect_is_spawnable`). sandbag went from 13 dangling vfx references to none.
 
+- **four animation/effect faults, all fixed.**
+
+  | fault | cause | fix |
+  | --- | --- | --- |
+  | effect placements ignored facing | the source flips the offset by hand (`self.flipX(78)`) AND fraymakers mirrors it via `flipWith`, so the two cancelled | drop the source's flip exactly when `flipWith` is set. measured live: `flipWith` + raw `x: 78` lands at +78 facing right, -78 facing left |
+  | `run_turn` faced backwards | only its FIRST frame was mirrored | a turn is drawn facing the direction turned FROM and the engine flips facing when the turn starts, so the whole animation mirrors |
+  | `crouch_out` played like a second crouch | the exit slot cloned the entry FORWARD | splits carry a `reversed` flag; the exit runs the entry backwards |
+  | `fall_loop` looped wrong, and the fall looked like the jump never ended | the loop was sliced at a template constant, and the peeled entry frames were appended to the END -- so every cycle flashed the entry pose | the loop comes from the clip's OWN loop-back call |
+
+  the loop detection is structural, not a name list: a looping SSF2 stance ends by playing a label
+  again from its final frame, so `source_loop_frame` reads that call's target and looks up where
+  that label sits. the name varies across the corpus (`again` on sandbag and mario, `redo` on fox
+  and samus) and none of it is hardcoded. sandbag's fall: entry frames 0-5, loop 5-14.
+
+  the ported loop-back call is then STRIPPED from a looping animation: fraymakers loops natively
+  via `endType: LOOP`, and the label the call named was sliced off with the entry, so it threw once
+  per cycle and looped nothing.
+
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
   chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the

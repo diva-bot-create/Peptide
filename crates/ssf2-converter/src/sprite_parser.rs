@@ -541,7 +541,11 @@ pub fn parse_sprite_boxes_from_swf(
             let frames = extract_frame_boxes(sprite, &sym_names, box_base_size, xform);
             let content_switches = extract_content_switch_frames(sprite);
 
-            log::debug!("Sprite '{}' → ssf2='{}' fm='{}': {} frames with boxes, {} labels",
+            if std::env::var("PEPTIDE_TRACE_LABELS").is_ok() {
+                eprintln!("[trace-labels] {sym} ssf2='{ssf2_name}' fm='{fm_name}' frames={} labels={frame_labels:?}",
+                          sprite.num_frames);
+            }
+        log::debug!("Sprite '{}' → ssf2='{}' fm='{}': {} frames with boxes, {} labels",
                 sym, ssf2_name, fm_name, frames.len(), frame_labels.len());
 
             // Check if this animation should be split into sub-animations
@@ -772,6 +776,13 @@ fn split_taunt(frame_labels: &[(String, u16)], total_frames: u16) -> Vec<(String
 /// Missing FM anim name → best donor FM anim name. One shared table for both the
 /// collision-box fallbacks (`apply_fallbacks`) and the image fallbacks
 /// (`image_extractor::apply_image_fallbacks`) so the two can't drift apart.
+/// Fallbacks whose donor must be played BACKWARDS. SSF2 draws the entry animation only and runs
+/// it in reverse to exit, so cloning the donor forward gives an exit that plays like a second
+/// entry -- a character standing up by crouching again.
+pub(crate) const ANIM_FALLBACKS_REVERSED: &[(&str, &str)] = &[
+    ("crouch_out",   "crouch_in"),
+];
+
 pub(crate) const ANIM_FALLBACKS: &[(&str, &str)] = &[
     // Damage / launched states
     ("stunned",           "hurt"),
@@ -805,6 +816,19 @@ pub(crate) const ANIM_FALLBACKS: &[(&str, &str)] = &[
     ("item_screw",        "special_up"),
 ];
 
+/// Reverse a cloned donor's per-frame boxes in place, so an exit animation built from an entry
+/// runs backwards. Frame labels are dropped: they mark positions in the ENTRY and mean nothing
+/// once the order is inverted.
+fn reverse_box_frames(data: &mut AnimationBoxData) {
+    let n = data.total_frames;
+    if n <= 1 { return; }
+    let old = std::mem::take(&mut data.frames);
+    for (f, boxes) in old {
+        if f < n { data.frames.insert(n - 1 - f, boxes); }
+    }
+    data.frame_labels.clear();
+}
+
 fn apply_fallbacks(result: &mut BTreeMap<String, AnimationBoxData>) {
     let mut to_insert: Vec<AnimationBoxData> = Vec::new();
 
@@ -817,6 +841,17 @@ fn apply_fallbacks(result: &mut BTreeMap<String, AnimationBoxData>) {
             to_insert.push(cloned);
         } else {
             log::debug!("Fallback: '{}' ← '{}' (donor also missing)", missing, donor);
+        }
+    }
+
+    for (missing, donor) in ANIM_FALLBACKS_REVERSED {
+        if result.contains_key(*missing) { continue; }
+        if let Some(donor_data) = result.get(*donor) {
+            let mut cloned = donor_data.clone();
+            cloned.fm_name = missing.to_string();
+            reverse_box_frames(&mut cloned);
+            log::debug!("Fallback (reversed): '{}' ← '{}' ({} frames)", missing, donor, cloned.total_frames);
+            to_insert.push(cloned);
         }
     }
 

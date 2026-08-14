@@ -63,7 +63,7 @@ pub fn generate(output_dir: &Path, char_name: &str, char_pascal: &str, data: &Ch
 
     fs::write(scripts_dir.join("HitboxStats.hx"),   generate_hitbox_stats(data, &char_id))?;
     fs::write(scripts_dir.join("CharacterStats.hx"), generate_character_stats(data, &char_id))?;
-    let splits = crate::anim_splitter::split_animations(&data.animations, sprite_boxes, data.stats.jump_startup.round().max(0.0) as u16);
+    let splits = crate::anim_splitter::split_animations(&data.animations, sprite_boxes, data.stats.jump_startup.round().max(0.0) as u16, &data.scripts);
     fs::write(scripts_dir.join("AnimationStats.hx"), generate_animation_stats(data, &splits))?;
     fs::write(scripts_dir.join("Script.hx"),         generate_script(data, &char_id, populated_jabs))?;
 

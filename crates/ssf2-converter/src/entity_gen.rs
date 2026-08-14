@@ -298,6 +298,20 @@ fn strip_trailing_return(body: &str) -> String {
 /// the real logic dead after it. Dropping the bare return keeps that logic — a
 /// conditional early-exit (`if (c) { return; }`) is inside a block (depth > 0) and
 /// is left untouched. Comment-only / blank tails don't count as "more statements".
+/// Remove the source's loop-back call from the last frame of an animation that Fraymakers loops
+/// on its own. SSF2 loops a stance by playing a label again from the final frame; the converted
+/// animation expresses the same thing as `endType: LOOP`, so the ported call is redundant -- and
+/// worse than redundant, because the label it names belongs to the un-sliced clip.
+fn strip_loop_back_calls(body: &str) -> String {
+    body.lines()
+        .filter(|line| {
+            let t = line.trim();
+            !(t.starts_with("self.playLabel(") && t.ends_with(");"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn strip_unreachable_returns(body: &str) -> String {
     if !body.contains("return;") {
         return body.to_string();
@@ -442,7 +456,7 @@ pub fn generate_entity(
     // ── Apply animation splits ────────────────────────────────────────────────
     // The splitter expands multi-label SSF2 animations into separate FM animations.
     // Each SplitAnim carries (fm_name, source_anim, start_frame, end_frame, loop info).
-    let split_anims = crate::anim_splitter::split_animations(&data.animations, sprite_boxes, data.stats.jump_startup.round().max(0.0) as u16);
+    let split_anims = crate::anim_splitter::split_animations(&data.animations, sprite_boxes, data.stats.jump_startup.round().max(0.0) as u16, &data.scripts);
 
     for split in &split_anims {
         let anim_name = &split.fm_name;
@@ -636,6 +650,18 @@ pub fn generate_entity(
                                     // a statement sequence; code after `return` is a
                                     // parse error). See strip_unreachable_returns.
                                     let body = strip_unreachable_returns(&body);
+                                    // An animation that LOOPS carries the source's own loop-back
+                                    // (`stancePlayFrame("again")` -> `playLabel("again")`) on its
+                                    // last frame. Fraymakers loops it natively via endType LOOP,
+                                    // and the label the call names was sliced off with the entry,
+                                    // so leaving it in is a call to a label that no longer exists:
+                                    // it threw once per cycle and never looped anything.
+                                    let body = if split.loop_tail && local_frame + 1 == frame_count {
+                                        strip_loop_back_calls(&body)
+                                    } else {
+                                        body
+                                    };
+                                    if body.trim().is_empty() { continue; }
                                     frame_code.insert(local_frame, body);
                                 }
                             }
@@ -1164,12 +1190,14 @@ pub fn generate_entity(
                     // and gameplay timelines are equal length this is the identity.
                     let img_len = anim_imgs.frames.keys().max()
                         .map(|m| *m as u32 + 1).unwrap_or(1).max(1);
-                    let held: Vec<Option<crate::image_extractor::FrameImageEntry>> = (0..total)
+                    let mut held: Vec<Option<crate::image_extractor::FrameImageEntry>> = (0..total)
                         .map(|f| {
                             let looped = (src_frame(f) as u32 % img_len) as u16;
                             anim_imgs.frames.get(&looped).and_then(|v| v.get(slot)).cloned()
                         })
                         .collect();
+                    // An exit slot filled from its entry animation plays the entry BACKWARDS.
+                    if split.reversed { held.reverse(); }
 
                     let mut f: u32 = 0;
                     while f < total {
@@ -1185,10 +1213,8 @@ pub fn generate_entity(
                         let world_rot = entry.map(|e| round2(e.world_rotation)).unwrap_or(0.0);
 
                         // Run-length encode consecutive frames with identical symbol + world transform.
-                        // run_turn's FIRST frame is mirrored (see below), so it never merges into
-                        // a longer run with the unmirrored frames after it.
                         let mut run = 1u32;
-                        while f + run < total && !(anim_name == "run_turn" && f == 0) {
+                        while f + run < total {
                             let next = held[(f + run) as usize].as_ref();
                             let matches = next.map(|e| e.symbol_name.as_str()) == sym_name
                                 && next.map(|e| round2(e.world_tx))       == sym_name.is_some().then_some(world_tx)
@@ -1251,10 +1277,11 @@ pub fn generate_entity(
                                 .and_then(|sid| img_result.shape_fill_scale.get(&sid))
                                 .copied()
                                 .unwrap_or((1.0, 1.0));
-                            // stand_turn mirrors every frame; run_turn mirrors only its FIRST
-                            // frame (the character still faces the old direction for one frame
-                            // before the engine's facing flip catches up).
-                            let turn_flip = anim_name == "stand_turn" || (anim_name == "run_turn" && f == 0);
+                            // A turn animation is drawn facing the direction being turned FROM,
+                            // and fraymakers flips the character's facing when the turn STARTS, so
+                            // the art needs mirroring for the whole animation -- not just its first
+                            // frame, which left the rest of a run turn facing backwards.
+                            let turn_flip = anim_name == "stand_turn" || anim_name == "run_turn";
                             let fm_sx = round2(world_sx * fsx) * if turn_flip { -1.0 } else { 1.0 };
                             let fm_sy = round2(world_sy * fsy);
 

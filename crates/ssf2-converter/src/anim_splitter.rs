@@ -31,6 +31,10 @@ pub struct SplitAnim {
     /// walk_loop sliced from [walk_in_len, total) appends [0, walk_in_len) so the full cycle
     /// plays starting just after the lean-in. 0 = no appended frames (the common case).
     pub append_head_frames: u16,
+    /// Play the sliced frames BACKWARDS. SSF2 draws an entry animation only and runs it in
+    /// reverse to exit, so an exit slot filled from the entry has to be reversed or the character
+    /// stands up by crouching again.
+    pub reversed: bool,
 }
 
 // Fraymakers template intro/outro slice lengths, in SOURCE (pre-doubling, 30fps) frames =
@@ -42,12 +46,50 @@ const FALL_IN_FRAMES: u16 = 3;
 /// length, NOT the full idle loop. Source (30fps) frames → ~2x engine frames.
 const STAND_TURN_FRAMES: u16 = 3;
 
+
+/// The frame an animation loops back to, read from the clip's OWN loop call.
+///
+/// A looping SSF2 stance ends by playing a label again from its final frame
+/// (`stancePlayFrame("again")`), and that label's position is where the loop starts. Reading it
+/// this way keeps the detection structural: the loop is wherever the clip says it is, whatever the
+/// label happens to be called -- `again` on sandbag and mario, `redo` on fox and samus, something
+/// else on the next character.
+///
+/// Returns None when the clip's last frame does not loop back, or names a label the clip does not
+/// have.
+pub fn source_loop_frame(
+    ssf2_name: &str,
+    total: u16,
+    labels: &[(String, u16)],
+    scripts: &[crate::extractor::ScriptInfo],
+) -> Option<u16> {
+    if total == 0 { return None; }
+    let last = format!("{ssf2_name}__frame{}", total - 1);
+    let code = scripts.iter().find(|s| !s.is_ext_method && s.name == last).map(|s| s.code.as_str())?;
+    let target = loop_call_target(code)?;
+    labels.iter().find(|(n, _)| *n == target).map(|(_, f)| *f)
+}
+
+/// The label a play-label call names, for the SSF2 spelling and its converted form alike.
+fn loop_call_target(code: &str) -> Option<String> {
+    for open in ["stancePlayFrame(\"", "playLabel(\"", "gotoAndPlay(\""] {
+        if let Some(i) = code.find(open) {
+            let rest = &code[i + open.len()..];
+            if let Some(j) = rest.find('"') {
+                return Some(rest[..j].to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Produce the list of output animations for a character.
 /// Returns one `SplitAnim` per Fraymakers animation to emit.
 pub fn split_animations(
     source_anims: &BTreeMap<String, crate::extractor::AnimationInfo>,
     sprite_boxes: &BTreeMap<String, AnimationBoxData>,
     jump_startup: u16,
+    scripts: &[crate::extractor::ScriptInfo],
 ) -> Vec<SplitAnim> {
     let mut out: Vec<SplitAnim> = Vec::new();
 
@@ -373,13 +415,30 @@ pub fn split_animations(
             // rest loops as fall_loop with the peeled head frames appended. A uspecFall label
             // splits the helpless tail off as fall_special.
             "fall" => {
-                let fi = FALL_IN_FRAMES.min(total.saturating_sub(1));
                 let uspec_f = label_map.get("uspecFall").copied();
                 let loop_end = uspec_f.unwrap_or(total);
+                // WHERE the fall loops is the source's own decision, not a template constant: the
+                // clip's last frame plays a label back (`stancePlayFrame("again")`) and that label
+                // is the loop start. Across the corpus it is `again` or `redo`, at frame 0 for a
+                // clip that loops whole (mario, link, fox) and part-way in for one with an entry
+                // (sandbag 5, samus 5). Slicing at FALL_IN_FRAMES instead made fall_loop a range
+                // the source never loops, so the cycle restarted in the wrong place.
+                let loop_f = source_loop_frame(anim_name, total, &labels, scripts)
+                    .filter(|f| *f < loop_end);
+                let fi = match loop_f {
+                    // loops from the top: no entry of its own, so keep the template lead-in
+                    Some(0) | None => FALL_IN_FRAMES.min(total.saturating_sub(1)),
+                    Some(f) => f,
+                };
                 if fi >= 1 { push_split(&mut out, "fall_in", anim_name, 0, fi, &labels, false, None); }
                 if loop_end > fi {
                     push_split(&mut out, "fall_loop", anim_name, fi, loop_end, &labels, true, Some(0));
-                    if let Some(s) = out.last_mut() { s.append_head_frames = fi; }
+                    // Only a template-guessed entry needs its head appended to close the cycle. A
+                    // source-declared loop already IS the cycle, so appending would replay the
+                    // entry every time round.
+                    if loop_f.is_none() || loop_f == Some(0) {
+                        if let Some(s) = out.last_mut() { s.append_head_frames = fi; }
+                    }
                 } else {
                     push_split(&mut out, "fall_loop", anim_name, 0, total, &labels, true, Some(0));
                 }
@@ -643,6 +702,9 @@ pub fn split_animations(
         ("assist_call",     "stand"),
         ("assist_call_air", "jump_in"),
     ];
+    // Slots whose donor must run BACKWARDS (see SplitAnim::reversed).
+    const REVERSED_ALIASES: &[&str] = &["crouch_out"];
+
     for (target, src) in SLOT_ALIASES {
         if out.iter().any(|s| s.fm_name == *target) { continue; }
         if let Some(mut a) = out.iter().find(|s| s.fm_name == *src).cloned() {
@@ -658,7 +720,9 @@ pub fn split_animations(
                 a.append_head_frames = 0;
                 a.labels.retain(|(_, f)| *f < STAND_TURN_FRAMES);
             }
-            log::debug!("anim alias: '{}' <- reuse of '{}'", target, src);
+            a.reversed = REVERSED_ALIASES.contains(target);
+            log::debug!("anim alias: '{}' <- reuse of '{}'{}", target, src,
+                if a.reversed { " (reversed)" } else { "" });
             out.push(a);
         }
     }
@@ -683,6 +747,7 @@ pub fn split_animations(
 
 fn push_full(out: &mut Vec<SplitAnim>, name: &str, total: u16, labels: &[(String, u16)]) {
     out.push(SplitAnim {
+        reversed: false,
         fm_name:     name.to_string(),
         source_anim: name.to_string(),
         start_frame: 0,
@@ -711,6 +776,7 @@ fn push_split(
         .collect();
 
     out.push(SplitAnim {
+        reversed: false,
         fm_name:     fm_name.to_string(),
         source_anim: source_anim.to_string(),
         start_frame: start,

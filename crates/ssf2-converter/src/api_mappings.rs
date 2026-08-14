@@ -915,6 +915,7 @@ pub fn rewrite_attach_effect_calls(code: &str) -> String {
         for (key, value) in parse_prop_bag(props_block) {
             translate_attach_effect_prop(&key, &value, &mut fm_fields, &mut todo_lines);
         }
+        drop_redundant_flip(&mut fm_fields);
         let mut bag = build_vfx_head(name);
         for (k, v) in &fm_fields {
             bag.push_str(&format!(", {}: {}", k, v));
@@ -1056,6 +1057,47 @@ fn parse_prop_bag(body: &str) -> Vec<(String, String)> {
 /// `fm_fields`. On an explicit `todo` or an unknown key, push a
 /// `// TODO:` note onto `todo_lines`. Both arrays are caller-owned so
 /// the rewrite can emit them in source order.
+
+/// Drop the source's own horizontal flip from an effect offset when the engine is already doing it.
+///
+/// SSF2 does not mirror an attached effect with its owner, so its scripts flip the offset by hand
+/// (`x: self.flipX(78)`). Fraymakers DOES mirror it, via the `flipWith` that `parentLock` expands
+/// to -- measured in-engine: with `flipWith: true` and a raw `x: 78`, the effect lands at +78
+/// facing right and -78 facing left. Porting both flips means they cancel, and every effect with a
+/// sideways offset appears on the wrong side of a character facing left.
+///
+/// So the flip is removed from the VALUE exactly when `flipWith` is set, and kept when it is not.
+fn drop_redundant_flip(fm_fields: &mut [(String, String)]) {
+    let engine_flips = fm_fields.iter().any(|(k, v)| k == "flipWith" && v.trim() != "false");
+    if !engine_flips { return; }
+    for (k, v) in fm_fields.iter_mut() {
+        if k != "x" { continue; }
+        if let Some(inner) = strip_call(v.trim(), "self.flipX(") {
+            *v = inner;
+        }
+    }
+}
+
+/// `self.flipX(<expr>)` -> `<expr>`, respecting nesting. None when the text is not that call.
+fn strip_call(text: &str, open: &str) -> Option<String> {
+    let rest = text.strip_prefix(open)?;
+    let mut depth = 1usize;
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // only a bare call, not `self.flipX(1) + 2`
+                    return rest[i + 1..].trim().is_empty().then(|| rest[..i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn translate_attach_effect_prop(
     key: &str,
     value: &str,
