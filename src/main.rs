@@ -951,6 +951,66 @@ fn insert_ops_front(f: &mut hlbc::types::Function, ops: Vec<Opcode>) {
 }
 
 /// Append registers of the given type indices; returns the index of the first.
+
+/// A field's index together with the TYPE it holds, so a register can be allocated for it.
+///
+/// HL registers are typed. Reading a field into an arbitrary spare register does not fail -- it
+/// yields whatever that register was declared to hold, so the value identifies as the wrong class
+/// and dies on first touch, which reads like a dispatch or engine problem rather than a register
+/// mistake. That cost four separate debugging passes in one sitting.
+///
+/// Field resolution and register allocation cannot happen in one call here: taking the function to
+/// add a register borrows the bytecode mutably. So this returns the field's type index, and the
+/// allocation site uses it instead of picking a register and hoping.
+fn field_and_type(code: &Bytecode, type_name: &str, field: &str) -> anyhow::Result<(usize, usize)> {
+    let ti = require_type(code, type_name)?;
+    let idx = find_field(code, ti, field)
+        .ok_or_else(|| anyhow::anyhow!("field not found: {type_name}.{field}"))?;
+    let ft = code.types[ti].get_type_obj()
+        .and_then(|o| o.fields.get(idx))
+        .map(|fl| fl.t.0)
+        .ok_or_else(|| anyhow::anyhow!("field type missing: {type_name}.{field}"))?;
+    Ok((idx, ft))
+}
+
+/// One hop of a guarded field walk: which field to read, and the typed register to read it into.
+struct Hop {
+    field: usize,
+    reg: Reg,
+}
+
+/// Emit `out = <root>.f1.f2…` as a Dynamic, or null if ANY hop is null, and patch every guard to
+/// land on the same join point.
+///
+/// This walk appears more than twenty times in the injector, and each copy hand-computes its own
+/// jump offsets. One wrong offset is a wrong branch target in live engine code, which is the worst
+/// failure mode in this file, so the arithmetic lives here once.
+fn emit_guarded_chain(
+    ops: &mut Vec<Opcode>,
+    root: Reg,
+    out_dyn: Reg,
+    hops: &[Hop],
+) {
+    ops.push(Opcode::Null { dst: out_dyn });
+    let mut guards: Vec<usize> = Vec::with_capacity(hops.len() + 1);
+    guards.push(ops.len());
+    ops.push(Opcode::JNull { reg: root, offset: 0 });
+    let mut obj = root;
+    for (i, hop) in hops.iter().enumerate() {
+        ops.push(Opcode::Field { dst: hop.reg, obj, field: hlbc::types::RefField(hop.field) });
+        // the LAST hop's null-check doubles as the guard on the value itself
+        guards.push(ops.len());
+        ops.push(Opcode::JNull { reg: hop.reg, offset: 0 });
+        obj = hop.reg;
+        let _ = i;
+    }
+    ops.push(Opcode::ToDyn { dst: out_dyn, src: obj });
+    let join = ops.len();
+    for g in guards {
+        if let Opcode::JNull { offset, .. } = &mut ops[g] { *offset = join as i32 - g as i32 - 1; }
+    }
+}
+
 fn add_regs(f: &mut hlbc::types::Function, types: &[usize]) -> u32 {
     let base = f.regs.len() as u32;
     for &t in types {
@@ -1514,13 +1574,8 @@ fn connect_edit(
     // Using that interpreter is the difference between asking the engine what content can see and
     // reconstructing it from the side. Our own names are additive on top, so `e` keeps p0..p3,
     // characters and stageEntity as well.
-    let api_script_t = require_type(code, "pxf.api.ApiScript")?;
-    let stage_apiscript_field = require_field(code, "pxf.entity.Stage", "_baseApiScriptObj")?;
-    let apiscript_runner_field = require_field(code, "pxf.api.ApiScript", "runner")?;
-    let runner_iface_t = code.types[api_script_t].get_type_obj()
-        .and_then(|o| o.fields.get(apiscript_runner_field))
-        .map(|fl| fl.t.0)
-        .ok_or_else(|| anyhow::anyhow!("ApiScript.runner field type missing"))?;
+    let (stage_apiscript_field, api_script_t) = field_and_type(code, "pxf.entity.Stage", "_baseApiScriptObj")?;
+    let (apiscript_runner_field, runner_iface_t) = field_and_type(code, "pxf.api.ApiScript", "runner")?;
     let hscript_runner_t = require_type(code, "pxf.api.runners.hscript.HscriptRunner")?;
     // `_baseApiScriptObj` lives on the base Entity, so the same walk reaches a CHARACTER's script.
     // That matters because only hscript content carries a borrowable interpreter: a built-in stage
@@ -4446,19 +4501,11 @@ fn connect_edit(
     // imply a parity with converted scripts that doesn't hold (see the note at stage_field).
     // This is the raw entity, for tooling that needs what's actually in the match rather
     // than what content is allowed to touch — placement diffing against SSF2's display list.
-    ops.push(Opcode::Null { dst: rr(28) });                                            // default null
     ops.push(Opcode::GetGlobal { dst: rr(43), global: RefGlobal(mc_g) });
-    ops.push(Opcode::Field { dst: rr(44), obj: rr(43), field: RefField(cm_field) });   // currentMatch
-    let idx_st_jnomatch = ops.len();
-    ops.push(Opcode::JNull { reg: rr(44), offset: 0 });                                // no match -> null
-    ops.push(Opcode::Field { dst: stage_reg, obj: rr(44), field: RefField(stage_field) });
-    let idx_st_jnostage = ops.len();
-    ops.push(Opcode::JNull { reg: stage_reg, offset: 0 });                             // no stage -> null
-    ops.push(Opcode::ToDyn { dst: rr(28), src: stage_reg });
-    let idx_st_set = ops.len();
-    for j in [idx_st_jnomatch, idx_st_jnostage] {
-        if let Opcode::JNull { offset, .. } = &mut ops[j] { *offset = idx_st_set as i32 - j as i32 - 1; }
-    }
+    emit_guarded_chain(&mut ops, rr(43), rr(28), &[
+        Hop { field: cm_field, reg: rr(44) },        // currentMatch
+        Hop { field: stage_field, reg: stage_reg },  // .stageEntity
+    ]);
     ops.push(Opcode::GetGlobal { dst: rr(14), global: RefGlobal(eval_stage_ent_g) });
     ops.push(Opcode::Call3 { dst: r_ret, fun: RefFun(hs_setvar), arg0: e_interp, arg1: rr(14), arg2: rr(28) });
     // ---- crash-proof eval: parse + run inside a Trap. On ANY error (parse OR runtime)
