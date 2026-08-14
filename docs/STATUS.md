@@ -176,8 +176,14 @@ dimensions below are the rest.
   is that engine's screen; fraymakers' screen is a different shape (640x360 at zoom 1 vs the 498x492
   the scaled numbers gave), so copying them across misses the sides and overshoots the top. sizing
   off `getViewportWidth()/getZoomScaleX()` re-derived per frame is what makes it the same field, and
-  since both are one screenful the source's particle COUNT carries over unchanged. verified live:
-  the drifting field's centre moved 303 -> 1244 as the fighters moved 400 -> 1600.
+  since both are one screenful the source's particle COUNT carries over unchanged.
+
+  the viewport is reported in WORLD units and already accounts for zoom, so dividing by the zoom
+  scale is wrong: it pins the field to a constant 480 half-width while the visible half-view is
+  ~690, leaving the sides bare. sizing straight off the viewport tracks it. verified live through
+  the borrowed content interpreter, which can read the stage script's own state: with the fighters
+  1200 apart, `halfW` 1035.6 against a viewport of 1380.8, particles spanning -704..935, and the
+  worst per-particle tether error across all 30 exactly 0.
 
 - **`e` reaches the script-api sandbox AND keeps engine-level access** (fixed). eval now runs in a
   LIVE content interpreter, borrowed rather than rebuilt: `currentMatch -> stageEntity -> its

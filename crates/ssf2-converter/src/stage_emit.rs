@@ -2654,7 +2654,7 @@ fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
     // across gives a field that misses the sides and overshoots the top. Sizing off the viewport is
     // what makes it the same field, and because both are "one screenful" the source's particle
     // COUNT carries over unchanged and looks as thick as it did. Re-derived per frame so the field
-    // grows and shrinks with the camera's zoom instead of tearing at the edges when it pulls out.
+    // grows and shrinks with the camera instead of tearing at the edges when it pulls out.
     //
     // With no camera to ask, the SSF2 numbers are the fallback: a field over one patch of the stage
     // is wrong, but it is the source's own wrongness rather than a field of zero size.
@@ -2667,12 +2667,12 @@ fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
          \t\tif (cam != null) {{\n\
          \t\t\tcamX = cam.getX();\n\
          \t\t\tcamY = cam.getY();\n\
-         \t\t\tvar zx = cam.getZoomScaleX();\n\
-         \t\t\tvar zy = cam.getZoomScaleY();\n\
          \t\t\t// scattered over 1.5 screens so particles arrive from off-view rather than\n\
-         \t\t\t// appearing at the frame edge\n\
-         \t\t\tif (zx > 0) hw = cam.getViewportWidth() / zx * 0.75;\n\
-         \t\t\tif (zy > 0) hh = cam.getViewportHeight() / zy * 0.75;\n\
+         \t\t\t// appearing at the frame edge. the viewport is reported in WORLD units and already\n\
+         \t\t\t// accounts for zoom, so dividing by the zoom scale pins the field to a constant and\n\
+         \t\t\t// leaves the sides bare on any shot wider than one screen.\n\
+         \t\t\thw = cam.getViewportWidth() * 0.75;\n\
+         \t\t\thh = cam.getViewportHeight() * 0.75;\n\
          \t\t}}\n\
          \t\tfor (p in m_weather) {{\n\
          \t\t\tp.y -= p.k;\n\
