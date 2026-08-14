@@ -1522,6 +1522,10 @@ fn connect_edit(
         .map(|fl| fl.t.0)
         .ok_or_else(|| anyhow::anyhow!("ApiScript.runner field type missing"))?;
     let hscript_runner_t = require_type(code, "pxf.api.runners.hscript.HscriptRunner")?;
+    // `_baseApiScriptObj` lives on the base Entity, so the same walk reaches a CHARACTER's script.
+    // That matters because only hscript content carries a borrowable interpreter: a built-in stage
+    // is compiled and has none, but a converted character on that stage does.
+    let entity_base_t = require_type(code, "pxf.entity.Entity")?;
     let runner_interp_field = require_field(code, "pxf.api.runners.hscript.HscriptRunner", "interpreter")?;
     // The script-api sandbox IS reachable from `e`, by borrowing rather than rebuilding (see the
     // interp acquisition further down). An interpreted script's ambient variables are written into
@@ -1969,6 +1973,7 @@ fn connect_edit(
     let stage_reg = Reg(add_regs(f, &[stage_entity_t]));
     // one register per api class statics, each of exactly that statics type
     let cached_interp_reg = Reg(add_regs(f, &[506]));   // hscript.Interp
+    let borrow_entity_reg = Reg(add_regs(f, &[entity_base_t]));
     let apiscript_reg = Reg(add_regs(f, &[api_script_t]));
     let runner_iface_reg = Reg(add_regs(f, &[runner_iface_t]));
     let hscript_runner_reg = Reg(add_regs(f, &[hscript_runner_t]));
@@ -4229,7 +4234,23 @@ fn connect_edit(
     ops.push(Opcode::Field { dst: runner_iface_reg, obj: apiscript_reg, field: RefField(apiscript_runner_field) });
     let idx_bi_norunner = ops.len();
     ops.push(Opcode::JNull { reg: runner_iface_reg, offset: 0 });
+    // The cast is GUARDED: only content authored as hscript runs on an HscriptRunner. A built-in
+    // stage is compiled haxescript and runs on a different runner entirely, so an unguarded cast
+    // throws and takes the engine down -- `e` would crash on every shipped stage. On a failed cast
+    // the trap leaves the interpreter null and the fallback below builds our own.
+    ops.push(Opcode::Null { dst: hscript_runner_reg });
+    let idx_bi_trap = ops.len();
+    ops.push(Opcode::Trap { exc: rr(28), offset: 0 });
     ops.push(Opcode::SafeCast { dst: hscript_runner_reg, src: runner_iface_reg });
+    ops.push(Opcode::EndTrap { exc: rr(28) });
+    let idx_bi_castdone = ops.len();
+    ops.push(Opcode::JAlways { offset: 0 });
+    let idx_bi_castfail = ops.len();
+    ops.push(Opcode::EndTrap { exc: rr(28) });
+    ops.push(Opcode::Null { dst: hscript_runner_reg });
+    let idx_bi_castjoin = ops.len();
+    if let Opcode::Trap { offset, .. } = &mut ops[idx_bi_trap] { *offset = idx_bi_castfail as i32 - idx_bi_trap as i32; }
+    if let Opcode::JAlways { offset, .. } = &mut ops[idx_bi_castdone] { *offset = idx_bi_castjoin as i32 - idx_bi_castdone as i32 - 1; }
     let idx_bi_nocast = ops.len();
     ops.push(Opcode::JNull { reg: hscript_runner_reg, offset: 0 });
     ops.push(Opcode::Field { dst: e_interp, obj: hscript_runner_reg, field: RefField(runner_interp_field) });
@@ -4238,6 +4259,67 @@ fn connect_edit(
         if let Opcode::JNull { offset, .. } = &mut ops[j] { *offset = idx_bi_done as i32 - j as i32 - 1; }
     }
     // borrowed successfully? mark the cache as content-backed and skip building
+    // Second source: a live CHARACTER's script. Converted characters are hscript, so this covers
+    // every built-in stage, which is most of them.
+    let idx_c_haveinterp = ops.len();
+    ops.push(Opcode::JNotNull { reg: e_interp, offset: 0 });    // stage gave us one -> done
+    ops.push(Opcode::GetGlobal { dst: rr(43), global: RefGlobal(mc_g) });
+    ops.push(Opcode::Field { dst: rr(44), obj: rr(43), field: RefField(cm_field) });
+    let idx_c_nomatch = ops.len();
+    ops.push(Opcode::JNull { reg: rr(44), offset: 0 });
+    ops.push(Opcode::Field { dst: rr(33), obj: rr(44), field: RefField(characters_field) });
+    let idx_c_noarr = ops.len();
+    ops.push(Opcode::JNull { reg: rr(33), offset: 0 });
+    ops.push(Opcode::Field { dst: rr(16), obj: rr(33), field: RefField(0) });   // length
+    ops.push(Opcode::Int { dst: rr(39), ptr: RefInt(zero_idx) });
+    let idx_c_empty = ops.len();
+    ops.push(Opcode::JSGte { a: rr(39), b: rr(16), offset: 0 });                // 0 >= length -> none
+    ops.push(Opcode::Field { dst: rr(32), obj: rr(33), field: RefField(1) });   // native array
+    ops.push(Opcode::GetArray { dst: rr(28), array: rr(32), index: rr(39) });   // characters[0]
+    ops.push(Opcode::Null { dst: borrow_entity_reg });
+    let idx_c_trap = ops.len();
+    ops.push(Opcode::Trap { exc: rr(29), offset: 0 });
+    ops.push(Opcode::SafeCast { dst: borrow_entity_reg, src: rr(28) });
+    ops.push(Opcode::EndTrap { exc: rr(29) });
+    let idx_c_castok = ops.len();
+    ops.push(Opcode::JAlways { offset: 0 });
+    let idx_c_castfail = ops.len();
+    ops.push(Opcode::EndTrap { exc: rr(29) });
+    ops.push(Opcode::Null { dst: borrow_entity_reg });
+    let idx_c_castjoin = ops.len();
+    if let Opcode::Trap { offset, .. } = &mut ops[idx_c_trap] { *offset = idx_c_castfail as i32 - idx_c_trap as i32; }
+    if let Opcode::JAlways { offset, .. } = &mut ops[idx_c_castok] { *offset = idx_c_castjoin as i32 - idx_c_castok as i32 - 1; }
+    let idx_c_nocast = ops.len();
+    ops.push(Opcode::JNull { reg: borrow_entity_reg, offset: 0 });
+    ops.push(Opcode::Field { dst: apiscript_reg, obj: borrow_entity_reg, field: RefField(stage_apiscript_field) });
+    let idx_c_noscript = ops.len();
+    ops.push(Opcode::JNull { reg: apiscript_reg, offset: 0 });
+    ops.push(Opcode::Field { dst: runner_iface_reg, obj: apiscript_reg, field: RefField(apiscript_runner_field) });
+    let idx_c_norunner = ops.len();
+    ops.push(Opcode::JNull { reg: runner_iface_reg, offset: 0 });
+    ops.push(Opcode::Null { dst: hscript_runner_reg });
+    let idx_c_trap2 = ops.len();
+    ops.push(Opcode::Trap { exc: rr(29), offset: 0 });
+    ops.push(Opcode::SafeCast { dst: hscript_runner_reg, src: runner_iface_reg });
+    ops.push(Opcode::EndTrap { exc: rr(29) });
+    let idx_c_cast2ok = ops.len();
+    ops.push(Opcode::JAlways { offset: 0 });
+    let idx_c_cast2fail = ops.len();
+    ops.push(Opcode::EndTrap { exc: rr(29) });
+    ops.push(Opcode::Null { dst: hscript_runner_reg });
+    let idx_c_cast2join = ops.len();
+    if let Opcode::Trap { offset, .. } = &mut ops[idx_c_trap2] { *offset = idx_c_cast2fail as i32 - idx_c_trap2 as i32; }
+    if let Opcode::JAlways { offset, .. } = &mut ops[idx_c_cast2ok] { *offset = idx_c_cast2join as i32 - idx_c_cast2ok as i32 - 1; }
+    let idx_c_nocast2 = ops.len();
+    ops.push(Opcode::JNull { reg: hscript_runner_reg, offset: 0 });
+    ops.push(Opcode::Field { dst: e_interp, obj: hscript_runner_reg, field: RefField(runner_interp_field) });
+    let idx_c_done = ops.len();
+    for j in [idx_c_nomatch, idx_c_noarr, idx_c_nocast, idx_c_noscript, idx_c_norunner, idx_c_nocast2] {
+        if let Opcode::JNull { offset, .. } = &mut ops[j] { *offset = idx_c_done as i32 - j as i32 - 1; }
+    }
+    if let Opcode::JNotNull { offset, .. } = &mut ops[idx_c_haveinterp] { *offset = idx_c_done as i32 - idx_c_haveinterp as i32 - 1; }
+    if let Opcode::JSGte { offset, .. } = &mut ops[idx_c_empty] { *offset = idx_c_done as i32 - idx_c_empty as i32 - 1; }
+
     let idx_bi_have = ops.len();
     ops.push(Opcode::JNull { reg: e_interp, offset: 0 });      // nothing borrowed -> fall through
     ops.push(Opcode::Bool { dst: rr(64), value: ValBool(true) });

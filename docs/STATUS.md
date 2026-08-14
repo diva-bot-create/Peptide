@@ -206,6 +206,12 @@ dimensions below are the rest.
   `Match.matchApi` is typed as. hand-binding that field yields an object that identifies correctly
   and takes the engine down on first touch. borrowing never names the type.
 
+  the borrow tries the STAGE's script first and a CHARACTER's second. only hscript content carries
+  a borrowable interpreter -- a built-in stage is compiled haxescript and has none -- so the
+  character source is what makes the sandbox available on shipped stages, which is most of them.
+  both casts are trapped: an unguarded one throws on a compiled runner and takes the engine down,
+  which is exactly what `e` did on thespire before the guard went in.
+
   ONE vocabulary change came with it: `match` is now the content api, so
   `match.getCharacters()` hands back CharacterApi objects rather than raw entities, and
   `getStateName()`/`body`/`damage` are not on those. entity-level access is `p0`..`p3` or the bare
