@@ -194,7 +194,10 @@ dimensions below are the rest.
 
   entity classes dispatch fine (`p0.getStateName()` works), so what the interpreter can drive is
   decided per CLASS, not by sandboxed-vs-raw. a subclassed interpreter is not it either: one
-  interp class serves everything. an interpreted script gets a working ambient `match` from some
+  interp class serves everything. and it is not reachable through the interpreter GLOBALS: those
+  are types, enums and utility statics only, and NO static in the binary answers
+  getMatch/getCurrentMatch/getCamera, so the live match cannot be picked up from static scope.
+  which fits the boundary above, since what the globals do bind is the entity TYPES. an interpreted script gets a working ambient `match` from some
   path that readies the interpreter per run, and peptide calls interpretScript directly, below it.
   finding that path is the work; the binding is one line after that.
 

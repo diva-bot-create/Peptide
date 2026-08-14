@@ -1520,7 +1520,11 @@ fn connect_edit(
     //   - Match.camera, Match.matchSettings   bind and identify correctly, then take the ENGINE
     //                                         DOWN on the first FIELD read (camera.body.x)
     // A subclassed interpreter is not the answer either: one hscript.Interp class serves
-    // everything. Each of these went through a correctly TYPED register (an arbitrary spare
+    // everything. Nor are the interpreter GLOBALS: they are types, enums and utility statics only
+    // (Std/PXF/Engine/Internal/Menu/Shake/AudioClip plus the entity types and event families), and
+    // no static anywhere in the binary answers getMatch/getCurrentMatch/getCamera -- so the live
+    // match is not obtainable from anything statically in scope. Which fits: what the globals DO
+    // bind is the entity TYPES, and entity instances are exactly what dispatches today. Each of these went through a correctly TYPED register (an arbitrary spare
     // register reads back as whatever it was declared to hold), so the binding is not the fault.
     // An interpreted script is handed a working ambient `match` by SOME path that readies the
     // interpreter per run, and Peptide calls interpretScript directly, below it. Finding that path
