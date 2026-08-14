@@ -266,6 +266,25 @@ dimensions below are the rest.
   finish: an aerial now reads `aerial_neutral x40` then fall then land, where before it was
   whatever the respawn left behind.
 
+- **an unconvertible effect drew the character's revival frame** (fixed). a converted move that
+  asked for an effect the character does not carry spawned it anyway, and what the engine drew was
+  not nothing: `getContent` does NOT validate, it just builds `private::<resource>.<id>` from
+  whatever it is handed, so a missing id is a DANGLING reference and a VfxStats built on one falls
+  back to the resource's first animation. for a character that is `revival` -- so the move drew the
+  bag on its blue revival platform for a frame, behind itself.
+
+  which effects, and where: `effect_land` is asked for by tilt_up, walk_loop, strong_down_attack
+  and tech_roll -- up tilt, walk and down smash, exactly the moves it was reported in. these are
+  SSF2 SHARED effects, registered by whichever character's file defines them (sandbag's
+  `effect_land` lives in bandanadee's), so a character that only references one has nothing to
+  convert from its own file.
+
+  two fixes. `effect_land` and `ground_bounce` map to `GlobalVfx.LAND_DUST`, since fraymakers has
+  its own equivalent. and anything still unmapped is no longer spawned at all: with neither a
+  GlobalVfx mapping nor a local effect entity there is nothing to draw, so the emitter leaves a
+  TODO naming the effect instead of a call that draws the wrong thing
+  (`api_mappings::effect_is_spawnable`). sandbag went from 13 dangling vfx references to none.
+
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
   chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the

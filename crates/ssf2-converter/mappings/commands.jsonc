@@ -628,7 +628,13 @@
     "global_sparkle":       "SPARKLE_LIGHT",
     "global_smash_spark":   "SPARKLE_HEAVY",
     // Item pickup indicator.
-    "itempickup_effect":    "ITEM_INDICATOR"
+    "itempickup_effect":    "ITEM_INDICATOR",
+    // SSF2 SHARED effects — registered by whichever character's file defines them (sandbag's
+    // `effect_land` lives in bandanadee's), so a character that only REFERENCES one has nothing
+    // to convert. Fraymakers has its own equivalents, so they map here rather than dangling.
+    // Anything left unmapped is not spawned at all: see api_mappings::effect_is_spawnable.
+    "effect_land":          "LAND_DUST",
+    "ground_bounce":        "LAND_DUST"
   },
 
   // global_sound_map: SSF2 *shared* sound ids (not extracted into a
