@@ -249,6 +249,23 @@ dimensions below are the rest.
   a stage whose count cannot be read emits NO weather rather than a loop over nothing, which would
   render as a stage that carries weather and shows none.
 
+- **the "revival platform frame" was the harness, not the converter** (fixed). a frame of the
+  revival pose showed up at the head of tilt_up, down_smash and walk. the emitted animations are
+  clean -- tilt_up carries a body layer and a motion smear and nothing else, and the unused image
+  layers really are blank -- because nothing was wrong with them.
+
+  the sweep parked aerials BELOW the floor, which is right on the fixture (open space, blast
+  boundary far below) and wrong everywhere else: on an ordinary stage, below the floor IS the blast
+  zone. the engine KOs and respawns the character, and the two frames of REVIVAL that follow land
+  at the start of the next move. measured on thespire, whose floor is y=73: parking at y=600 gives
+  `revival x2` then stand, parking at y=73 gives stand alone, and a bare `reset` never produces it.
+
+  two fixes. the floor is MEASURED per engine at the start of a sweep (drop the character, see
+  where it stops) instead of being the fixture's constant applied to every stage. and aerials park
+  high ABOVE the floor with enough clearance for ~100 frames of fall, so a move still gets to
+  finish: an aerial now reads `aerial_neutral x40` then fall then land, where before it was
+  whatever the respawn left behind.
+
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
   chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the

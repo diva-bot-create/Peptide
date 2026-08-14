@@ -81,17 +81,21 @@ def names_agree(ssf2_anim, fm_anim):
         return None                      # nothing claimed, so nothing to contradict
     got = fm_anim.lower()
     return got == want or got.startswith(want)
-FLOOR_TOP_SRC = 400.0       # fixture FLOOR_Y
-# Aerials are dropped BELOW the floor, not above it. Above, the only thing a falling character can
-# do is land on the floor, which cuts the move short and makes the measurement about the drop
-# height. Below the floor there is nothing between the character and the blast boundary ~2600
-# source units down, so the move gets the whole of itself before anything interrupts.
-AIR_BELOW_FLOOR_SRC = 300.0
+FLOOR_TOP_SRC = 400.0       # fixture FLOOR_Y; only a fallback now -- see measure_floor()
+# Aerials are dropped from HIGH ABOVE the floor. The point is air time: a move needs to finish
+# before anything interrupts it, and this much clearance buys ~100 frames of fall, more than the
+# longest aerial takes.
+#
+# They used to be parked BELOW the floor, which works on the fixture (open space and a blast
+# boundary far below) and nowhere else: on an ordinary stage, below the floor IS the blast zone.
+# The engine KOs and respawns the character, and the two frames of REVIVAL that follow land at the
+# head of the next move -- which is what "a frame of the revival pose in tilt_up" turned out to be.
+AIR_ABOVE_FLOOR_SRC = 850.0
 
 ENGINES = {
-    # name:      (tell prefix,             floor top,                 clearance)
-    "fm":   (["session"], FLOOR_TOP_SRC * SCALE, AIR_BELOW_FLOOR_SRC * SCALE),
-    "ssf2": (["ssf2"],    FLOOR_TOP_SRC,         AIR_BELOW_FLOOR_SRC),
+    # name:      (tell prefix,             floor top (fallback),      clearance)
+    "fm":   (["session"], FLOOR_TOP_SRC * SCALE, AIR_ABOVE_FLOOR_SRC * SCALE),
+    "ssf2": (["ssf2"],    FLOOR_TOP_SRC,         AIR_ABOVE_FLOOR_SRC),
 }
 
 # ── the moves ────────────────────────────────────────────────────────────────
@@ -186,12 +190,51 @@ def timeline_for(engine, timeline):
     return timeline
 
 
+# Where the ground actually is, per engine, measured once at the start of a sweep. Filled by
+# measure_floor(); the ENGINES defaults are only used if the measurement cannot be taken.
+MEASURED_FLOOR = {}
+
+
+def measure_floor(engine):
+    """Ask the engine where its floor is, by dropping the character and seeing where it stops.
+
+    The floor was hardcoded to the FIXTURE's, which is right on the fixture and wrong everywhere
+    else -- and being wrong is not harmless: parking below a stage's floor puts the character in
+    the blast zone, so the engine KOs and respawns it, and the two frames of REVIVAL that follow
+    land at the head of the next move. That is what "a frame of the revival pose in tilt_up" was.
+    """
+    tell(engine, "reset")
+    time.sleep(1.0)
+    before = drain(engine)
+    tell(engine, "record")
+    time.sleep(0.8)
+    tell(engine, "trace raw")
+    for _ in range(60):
+        time.sleep(0.1)
+        if re.search(r"TRACE:", read_log(engine)[before:]):
+            break
+    time.sleep(0.3)
+    # `trace raw` prints one line per frame: <anim>|<state>|<x>|<y>
+    ys = [float(m.group(1)) for m in re.finditer(r"\|[-\d.]+\|(-?[\d.]+)\s*$",
+                                                 read_log(engine)[before:], re.M)]
+    if not ys:
+        return None
+    floor = ys[-1]
+    MEASURED_FLOOR[engine] = floor
+    print(f"  [{engine}] floor measured at y={floor:.0f}")
+    return floor
+
+
 def run_move(engine, name, kind, timeline):
     """Park the character, play the move, and return the captured trace."""
     timeline = timeline_for(engine, timeline)
-    _, floor_top, below = ENGINES[engine]
-    # +y is DOWN, so an aerial parks BELOW the floor and falls away from it into open space.
-    y = floor_top if kind == "ground" else floor_top + below
+    _, floor_top, clearance = ENGINES[engine]
+    floor_top = MEASURED_FLOOR.get(engine, floor_top)
+    # +y is DOWN. An aerial parks ABOVE the floor so it has air to finish in and then LANDS.
+    # Parking below the floor only works on a stage with open space under it (the fixture); on any
+    # other stage it is the blast zone, and the KO that follows shows up as revival frames at the
+    # start of the next move.
+    y = floor_top if kind == "ground" else floor_top - clearance
     # p1 is parked well away on the same floor so it can neither be hit nor wander into frame.
     away = 400.0 * (SCALE if engine == "fm" else 1.0)
     # Wait for the PREVIOUS move to stop talking before marking where this one starts. SSF2
@@ -368,6 +411,8 @@ def summarize(name, kind, cap):
 
 def sweep(engine, only=None):
     out = []
+    # Where the floor is is a property of the stage in front of us, not a constant.
+    measure_floor(engine)
     for name, kind, timeline in MOVES:
         if only and name not in only:
             continue
