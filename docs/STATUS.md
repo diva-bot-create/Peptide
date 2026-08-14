@@ -179,26 +179,32 @@ dimensions below are the rest.
   since both are one screenful the source's particle COUNT carries over unchanged. verified live:
   the drifting field's centre moved 303 -> 1244 as the fighters moved 400 -> 1600.
 
-- **`e` cannot reach the script-api sandbox, and we now know what content actually gets.** an
-  interpreted script's ambient variables are written into its interpreter's variable map by its
-  RUNNER'S CONSTRUCTOR: `self` + `exports` from the base hscript runner, `camera` + `match` +
-  `stage` from the entity one. no special wrappers involved: `match` is `Match.matchApi` and
-  `camera` is `Match.camera.cameraApi`, and that map write is exactly what `Interp.setVar` does.
+- **`e` reaches the script-api sandbox AND keeps engine-level access** (fixed). eval now runs in a
+  LIVE content interpreter, borrowed rather than rebuilt: `currentMatch -> stageEntity -> its
+  ApiScript -> runner -> interpreter`. an interpreted script's ambient variables are written into
+  that interpreter's variable map by its runner's constructor (`self`/`exports` from the base
+  hscript runner, `camera`/`match`/`stage` from the entity one), so `e` inherits the whole surface
+  content sees instead of reconstructing it. peptide's own names are additive on top, so both hold
+  at once. verified live:
 
-  so binding them in `e` is the same operation under a different name, and it is ADDITIVE: the raw
-  bindings (`p0`..`p3`, `characters`, `stageEntity`) are separate keys in the same map, so `e` would
-  end up with both the surface content is limited to and the engine-level access content never
-  gets. that half of the design is settled.
+  | expression | answers |
+  | --- | --- |
+  | `match.getCamera().getX()` | 1047.4 |
+  | `match.getCamera().getViewportWidth()` | 640.0 |
+  | `match.getMatchSettingsConfig().hazards` | true |
+  | `p0.getStateName()` | STAND |
+  | `stageEntity != null` | true |
 
-  what blocks it is none of the obvious suspects. not the interp: a runner builds its own the same
-  way peptide does (new, ctor, applyInterpreterGlobals). not the binding: setVar IS variables.set.
-  not the object: we can bind the very same one content is handed. not a missing global: the
-  globals are types, enums and utility statics, and no static answers getMatch/getCamera. it is the
-  object CLASS -- touching an api object from this interpreter is fatal even for a plain field read
-  (`camera.__camera__` takes the engine down, `camera.getX()` gets far enough to null-check its own
-  back-reference), while entity objects are completely fine. and what the globals DO register is
-  the entity TYPES. the open question is why the identical object is safe on the runner's execution
-  path and not on this one.
+  rebuilding it instead does NOT work, and the reason is why four earlier attempts failed:
+  content's `match` is a `FraymakersMatchApi`, a SUBCLASS, not the `pxf.api.MatchApi` that
+  `Match.matchApi` is typed as. hand-binding that field yields an object that identifies correctly
+  and takes the engine down on first touch. borrowing never names the type.
+
+  two things this forced. `commands.hsx` must not redefine content's names: it used to assign
+  `match` unconditionally, which in a borrowed interpreter replaced the live stage's api mid-match
+  and broke it (its own getCamera went null on the very next frame). the facade is now installed
+  only when nothing else has set `match`. and a fallback interp is never treated as final, so an
+  `e` sent before the match starts cannot pin it -- the borrow is retried until it succeeds.
 
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
