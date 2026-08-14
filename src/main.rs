@@ -1508,29 +1508,28 @@ fn connect_edit(
     let stage_entity_t = require_type(code, "pxf.entity.Stage")?;
     let stage_field = find_field(code, match_t, "stageEntity")
         .ok_or_else(|| anyhow::anyhow!("Match.stageEntity field not found"))?;
-    // NOT bound, and the reason is a HARD BOUNDARY worth knowing before trying again: what the
-    // interpreter can dispatch on is per-CLASS, not per-surface. Entity classes are fine
-    // (p0.getStateName() works). Everything else tried BINDS correctly and then fails on first
-    // use, several different ways:
-    //   - pxf.api.StageApi                    calls land with a null receiver
-    //   - pxf.api.MatchApi                    takes the ENGINE DOWN on the first method call
-    //   - Match.matchApiGlobals               binds safely as a virtual, but carries no
-    //                                         getCamera/getCharacters, and its getter has no
-    //                                         callers, so it is not what scripts are handed either
-    //   - Match.camera, Match.matchSettings   bind and identify correctly, then take the ENGINE
-    //                                         DOWN on the first FIELD read (camera.body.x)
-    // A subclassed interpreter is not the answer either: one hscript.Interp class serves
-    // everything. Nor are the interpreter GLOBALS: they are types, enums and utility statics only
-    // (Std/PXF/Engine/Internal/Menu/Shake/AudioClip plus the entity types and event families), and
-    // no static anywhere in the binary answers getMatch/getCurrentMatch/getCamera -- so the live
-    // match is not obtainable from anything statically in scope. Which fits: what the globals DO
-    // bind is the entity TYPES, and entity instances are exactly what dispatches today. Each of these went through a correctly TYPED register (an arbitrary spare
-    // register reads back as whatever it was declared to hold), so the binding is not the fault.
-    // An interpreted script is handed a working ambient `match` by SOME path that readies the
-    // interpreter per run, and Peptide calls interpretScript directly, below it. Finding that path
-    // is the work; the binding is one line once it is known. Until then anything only these
-    // objects can answer -- where the camera is, which switches the match was started with --
-    // costs a convert-export-boot cycle, which is what makes it worth doing.
+    // NOT bound -- but we now know exactly WHAT content gets and HOW, which is the useful half.
+    //
+    // An interpreted script's ambient variables are written straight into its interpreter's
+    // variable map by its runner's CONSTRUCTOR: `self` + `exports` from the base hscript runner,
+    // `camera` + `match` + `stage` from the entity one. The values are not special wrappers:
+    //     match  = Match.matchApi          camera = Match.camera.cameraApi
+    // and that map write is literally what Interp.setVar does, so binding them here is the same
+    // operation under a different name. Being additive, it would ALSO keep everything below --
+    // p0..p3, characters, stageEntity are separate keys in the same map, so `e` would hold both
+    // the surface content is limited to and the engine-level access content never gets.
+    //
+    // What stops it is narrower than "the sandbox is unreachable", and none of the obvious
+    // suspects: not the interp (a runner builds its own the same way Peptide does -- New, ctor,
+    // applyInterpreterGlobals), not the binding (setVar IS variables.set), not the object (we can
+    // bind the very same one content is handed), and not a missing globals entry (the globals are
+    // types, enums and utility statics; no static anywhere answers getMatch/getCamera). It is the
+    // OBJECT CLASS: touching an api object from this interpreter is fatal even for a plain field
+    // read (`camera.__camera__` takes the engine down; `camera.getX()` gets far enough to null-check
+    // its own back-reference), while entity objects are completely fine. Note what the globals DO
+    // register: the entity TYPES. So the open question is why the identical object is safe on the
+    // runner's execution path and not on this one -- answer that and the binding is one line.
+    // Until then anything only that surface can answer costs a convert-export-boot cycle.
     // Entity methods (p0.getStateName()) work, API
     // methods do not, so the sandbox has to be reached in bytecode the way `tree` is.
     let m_idx = add_int(code, 'm' as i32);

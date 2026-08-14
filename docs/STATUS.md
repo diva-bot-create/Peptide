@@ -179,27 +179,26 @@ dimensions below are the rest.
   since both are one screenful the source's particle COUNT carries over unchanged. verified live:
   the drifting field's centre moved 303 -> 1244 as the fighters moved 400 -> 1600.
 
-- **`e` cannot reach the script-API sandbox, and the reason is per-class.** eval's `match` is a
-  small hand-written facade (`commands.hsx`), not the api a stage script gets, so anything only
-  that surface can answer costs a convert-export-boot cycle to check. binding the real object is
-  NOT the fix, and four routes are ruled out (each bound correctly through a typed register, then
-  failed on first use):
+- **`e` cannot reach the script-api sandbox, and we now know what content actually gets.** an
+  interpreted script's ambient variables are written into its interpreter's variable map by its
+  RUNNER'S CONSTRUCTOR: `self` + `exports` from the base hscript runner, `camera` + `match` +
+  `stage` from the entity one. no special wrappers involved: `match` is `Match.matchApi` and
+  `camera` is `Match.camera.cameraApi`, and that map write is exactly what `Interp.setVar` does.
 
-  | bound | what happens |
-  | --- | --- |
-  | the match api object | engine goes down on the first method call |
-  | the stage api object | calls land with a null receiver |
-  | the api's own globals virtual | binds safely, but carries none of the accessors |
-  | the raw camera / match settings | engine goes down on the first FIELD read |
+  so binding them in `e` is the same operation under a different name, and it is ADDITIVE: the raw
+  bindings (`p0`..`p3`, `characters`, `stageEntity`) are separate keys in the same map, so `e` would
+  end up with both the surface content is limited to and the engine-level access content never
+  gets. that half of the design is settled.
 
-  entity classes dispatch fine (`p0.getStateName()` works), so what the interpreter can drive is
-  decided per CLASS, not by sandboxed-vs-raw. a subclassed interpreter is not it either: one
-  interp class serves everything. and it is not reachable through the interpreter GLOBALS: those
-  are types, enums and utility statics only, and NO static in the binary answers
-  getMatch/getCurrentMatch/getCamera, so the live match cannot be picked up from static scope.
-  which fits the boundary above, since what the globals do bind is the entity TYPES. an interpreted script gets a working ambient `match` from some
-  path that readies the interpreter per run, and peptide calls interpretScript directly, below it.
-  finding that path is the work; the binding is one line after that.
+  what blocks it is none of the obvious suspects. not the interp: a runner builds its own the same
+  way peptide does (new, ctor, applyInterpreterGlobals). not the binding: setVar IS variables.set.
+  not the object: we can bind the very same one content is handed. not a missing global: the
+  globals are types, enums and utility statics, and no static answers getMatch/getCamera. it is the
+  object CLASS -- touching an api object from this interpreter is fatal even for a plain field read
+  (`camera.__camera__` takes the engine down, `camera.getX()` gets far enough to null-check its own
+  back-reference), while entity objects are completely fine. and what the globals DO register is
+  the entity TYPES. the open question is why the identical object is safe on the runner's execution
+  path and not on this one.
 
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
