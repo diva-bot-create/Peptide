@@ -55,7 +55,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // stage layer. Each layer is a PNG + `.meta`; the `.png` is gitignored (regenerated).
     let sprites = lib.join("sprites").join("Stage");
     std::fs::create_dir_all(&sprites).context("mkdir sprites/Stage")?;
-    let write_layer = |suffix: &str, art: &StageArt| -> Result<ArtRef> {
+    let mut write_layer = |suffix: &str, art: &StageArt| -> Result<ArtRef> {
         let guid = det_uuid(&format!("stage::{id}::{suffix}"));
         std::fs::write(sprites.join(format!("{id}_{suffix}.png")), &art.png)?;
         write_json(&sprites.join(format!("{id}_{suffix}.png.meta")), &json!({
@@ -90,24 +90,12 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
         }
     }
     let elem_ids = element_ids(&model.art.background);
-    let bg_refs: Vec<BgLayerRef> = model.art.background.iter().enumerate()
-        .map(|(i, layer)| -> Result<BgLayerRef> {
-            let eid = &elem_ids[i];
-            let frames: Vec<ArtRef> = if layer.frames.len() == 1 {
-                vec![write_layer(eid, &layer.frames[0])?]
-            } else {
-                layer.frames.iter().enumerate()
-                    .map(|(j, a)| write_layer(&format!("{eid}_{j}"), a))
-                    .collect::<Result<_>>()?
-            };
-            Ok(BgLayerRef {
-                name: bg_layer_name(&layer.name, i), eid: eid.clone(), frames,
-                plane: BgPlane::Background,
-                segments: layer.segments.iter()
-                    .map(|s| (s.label.clone(), s.frames.len(), s.next.clone())).collect(),
-            })
-        })
-        .collect::<Result<_>>()?;
+    let mut bg_refs: Vec<BgLayerRef> = Vec::new();
+    for (i, layer) in model.art.background.iter().enumerate() {
+        bg_refs.extend(build_element_layers(&elem_ids[i], bg_layer_name(&layer.name, i),
+                                            &layer.frames, &layer.segments,
+                                            BgPlane::Background, &mut write_layer)?);
+    }
     // UNIVERSAL: promote every ANIMATED backdrop element (the weather embers, jumping podoboos,
     // lava bubbles/splashes, flickering torches, a spectating Bowser, …) to its own looping VFX
     // the stage spawns, instead of baking it as a layer inside the single `stage` animation where
@@ -147,19 +135,9 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
             // name with a backdrop one — same id means same filenames, and one silently overwrites
             // the other's art.
             let eid = &format!("fge_{}", fg_elem_ids[i]);
-            let frames: Vec<ArtRef> = if layer.frames.len() == 1 {
-                vec![write_layer(eid, &layer.frames[0])?]
-            } else {
-                layer.frames.iter().enumerate()
-                    .map(|(j, a)| write_layer(&format!("{eid}_{j}"), a))
-                    .collect::<Result<_>>()?
-            };
-            promoted_bg.push(BgLayerRef {
-                name: bg_layer_name(&layer.name, i), eid: eid.clone(), frames,
-                plane: BgPlane::Foreground,
-                segments: layer.segments.iter()
-                    .map(|s| (s.label.clone(), s.frames.len(), s.next.clone())).collect(),
-            });
+            promoted_bg.extend(build_element_layers(eid, bg_layer_name(&layer.name, i),
+                                                    &layer.frames, &layer.segments,
+                                                    BgPlane::Foreground, &mut write_layer)?);
         }
     }
     // declared platforms become MOVING STRUCTURES (like the official stage-template's moving
@@ -2924,6 +2902,179 @@ fn bg_segment_script_hx(eid: &str, layer: &BgLayerRef) -> String {
 /// no scripts/stats/manifest entry — resolved by id via getContent, like the character port's
 /// effects) and return the stage-Script spawn lines: createVfx (loop forever, absolute position)
 /// then reparent its sprite into the stage background container for depth.
+
+
+
+/// One source element as the layer(s) that represent it: normally one, but a mostly-still element
+/// becomes a plate plus the part that moves (see `split_static_plate`).
+fn build_element_layers(
+    eid: &str,
+    name: String,
+    frames: &[crate::stage_parser::StageArt],
+    segments: &[crate::stage_parser::BgSegment],
+    plane: BgPlane,
+    write_layer: &mut impl FnMut(&str, &crate::stage_parser::StageArt) -> Result<ArtRef>,
+) -> Result<Vec<BgLayerRef>> {
+    let segs: Vec<(String, usize, Option<crate::abc_parser::LabelJump>)> =
+        segments.iter().map(|s| (s.label.clone(), s.frames.len(), s.next.clone())).collect();
+    if segs.is_empty() {
+        if let Some((plate, moving)) = split_static_plate(frames) {
+            let plate_id = format!("{eid}_plate");
+            let plate_ref = write_layer(&plate_id, &plate)?;
+            let moving_refs = write_element_frames(eid, &moving, false, write_layer)?;
+            return Ok(vec![
+                BgLayerRef { name: format!("{name} (plate)"), eid: plate_id, frames: vec![plate_ref],
+                             plane, segments: Vec::new() },
+                BgLayerRef { name, eid: eid.to_string(), frames: moving_refs, plane, segments: Vec::new() },
+            ]);
+        }
+    }
+    let refs = write_element_frames(eid, frames, !segs.is_empty(), write_layer)?;
+    Ok(vec![BgLayerRef { name, eid: eid.to_string(), frames: refs, plane, segments: segs }])
+}
+
+/// Split a mostly-static animated element into a still PLATE plus a small moving piece.
+///
+/// A backdrop element is rasterised whole on every frame, so an element that is a large static
+/// picture with one small thing moving in it costs the full canvas per frame. Clocktown's town
+/// backdrop is 623 distinct 739x437 frames -- 160MB, and FrayTools could not publish it at all --
+/// while only a ~259x258 patch of it ever changes.
+///
+/// So: frame 0 is emitted once as a full-canvas plate, and the animation is emitted cropped to the
+/// region that actually moves, offset to sit back over the plate. Nothing is lost -- the crop is
+/// the union of every frame's difference from the plate.
+///
+/// Returns None when the element is small, short, or genuinely changes across most of its canvas.
+fn split_static_plate(frames: &[crate::stage_parser::StageArt])
+    -> Option<(crate::stage_parser::StageArt, Vec<crate::stage_parser::StageArt>)>
+{
+    const MIN_FRAMES: usize = 8;
+    const MAX_MOVING_FRACTION: f64 = 0.6;
+    if frames.len() < MIN_FRAMES { return None; }
+    let plate = &frames[0];
+    let base = image::load_from_memory(&plate.png).ok()?.to_rgba8();
+    let (cw, ch) = (base.width(), base.height());
+    if cw * ch == 0 { return None; }
+
+    // Sample first: decoding every frame to find out the answer is no is the expensive way to
+    // learn it, and most elements that reach here are the whole-canvas kind (clocktown's town
+    // backdrop differs from its own first frame across all of it by the end).
+    let step = (frames.len() / 8).max(1);
+    let (mut sx0, mut sy0, mut sx1, mut sy1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for f in frames.iter().step_by(step) {
+        let im = image::load_from_memory(&f.png).ok()?.to_rgba8();
+        if im.width() != cw || im.height() != ch { return None; }
+        for y in 0..ch {
+            for x in 0..cw {
+                if im.get_pixel(x, y) != base.get_pixel(x, y) {
+                    sx0 = sx0.min(x); sy0 = sy0.min(y); sx1 = sx1.max(x); sy1 = sy1.max(y);
+                }
+            }
+        }
+    }
+    if sx0 == u32::MAX { return None; }
+    let sampled = ((sx1 - sx0 + 1) as f64 * (sy1 - sy0 + 1) as f64) / (cw as f64 * ch as f64);
+    if sampled > MAX_MOVING_FRACTION { return None; }
+
+    // union of every frame's difference from the plate
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for f in &frames[1..] {
+        let im = image::load_from_memory(&f.png).ok()?.to_rgba8();
+        if im.width() != cw || im.height() != ch { return None; }   // frames crop differently already
+        for y in 0..ch {
+            for x in 0..cw {
+                if im.get_pixel(x, y) != base.get_pixel(x, y) {
+                    x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x); y1 = y1.max(y);
+                }
+            }
+        }
+    }
+    if x0 == u32::MAX { return None; }                              // nothing moves at all
+    let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+    if (bw as f64 * bh as f64) / (cw as f64 * ch as f64) > MAX_MOVING_FRACTION { return None; }
+
+    let encode = |img: &image::RgbaImage| -> Option<Vec<u8>> {
+        use image::ImageEncoder;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8).ok()?;
+        Some(png)
+    };
+    let mut moving = Vec::with_capacity(frames.len());
+    for f in frames {
+        let im = image::load_from_memory(&f.png).ok()?.to_rgba8();
+        let crop = image::imageops::crop_imm(&im, x0, y0, bw, bh).to_image();
+        moving.push(crate::stage_parser::StageArt {
+            png: encode(&crop)?,
+            x: f.x + x0 as f64, y: f.y + y0 as f64,
+            w: bw, h: bh, hold: f.hold,
+        });
+    }
+    log::info!("backdrop element: {}x{} canvas with a {bw}x{bh} moving region — emitting a still plate plus the crop",
+               cw, ch);
+    Some((plate.clone(), moving))
+}
+
+/// Write one backdrop element's frames, collapsing what the source repeats.
+///
+/// SSF2 authors a small looping element and the stage timeline it sits on runs far longer, so the
+/// art walk sees the element's cycle over and over. Clocktown arrives with 1363 frames of bottom
+/// fire drawn from 8 distinct images, and 621 frames of fire light drawn from 2 -- rasterised
+/// frame by frame that stage emitted 263MB of sprites, enough that publishing it timed out.
+///
+/// Two reductions, both lossless:
+///   - a sequence that is one cycle repeated is emitted as ONE cycle (the element loops anyway).
+///     the tail does not have to be a whole cycle -- the source stops wherever its timeline ends.
+///   - an image that appears on more than one frame is WRITTEN once and referenced again, which
+///     covers a sequence that reuses a handful of images without repeating in a fixed period.
+fn write_element_frames(
+    eid: &str,
+    frames: &[crate::stage_parser::StageArt],
+    segmented: bool,
+    mut write_layer: impl FnMut(&str, &crate::stage_parser::StageArt) -> Result<ArtRef>,
+) -> Result<Vec<ArtRef>> {
+    // Segmented elements keep every frame: their segment lengths index into this list.
+    let src = if segmented { frames } else { &frames[..element_cycle_len(frames)] };
+    if src.len() < frames.len() {
+        log::info!("backdrop element '{eid}': {} frames are repeats of a {}-frame cycle; emitting one",
+                   frames.len(), src.len());
+    }
+    if src.len() == 1 {
+        return Ok(vec![write_layer(eid, &src[0])?]);
+    }
+    let mut out: Vec<ArtRef> = Vec::with_capacity(src.len());
+    let mut seen: Vec<(usize, ArtRef)> = Vec::new();   // index of first use -> its ref
+    let mut written = 0usize;
+    for (j, a) in src.iter().enumerate() {
+        if let Some((_, prev)) = seen.iter().find(|(i, _)| same_art(&src[*i], a)) {
+            // same picture as an earlier frame: reuse the asset, keep this frame's own hold
+            out.push(ArtRef { hold: a.hold.max(1) as usize, ..prev.clone() });
+            continue;
+        }
+        let r = write_layer(&format!("{eid}_{j}"), a)?;
+        seen.push((j, r.clone()));
+        out.push(r);
+        written += 1;
+    }
+    if written < src.len() {
+        log::info!("backdrop element '{eid}': {} frames drawn from {written} images", src.len());
+    }
+    Ok(out)
+}
+
+fn same_art(a: &crate::stage_parser::StageArt, b: &crate::stage_parser::StageArt) -> bool {
+    a.png == b.png && a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h
+}
+
+/// The smallest prefix that reproduces the whole sequence by repeating, or its full length.
+fn element_cycle_len(frames: &[crate::stage_parser::StageArt]) -> usize {
+    let n = frames.len();
+    if n < 2 { return n; }
+    (1..=n / 2)
+        .find(|&p| (p..n).all(|i| same_art(&frames[i], &frames[i % p]) && frames[i].hold == frames[i % p].hold))
+        .unwrap_or(n)
+}
+
 fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
     -> Result<(String, Vec<Value>)> {
     let mut spawns = String::new();

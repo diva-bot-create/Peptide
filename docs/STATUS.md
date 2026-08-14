@@ -303,6 +303,26 @@ dimensions below are the rest.
   via `endType: LOOP`, and the label the call named was sliced off with the entry, so it threw once
   per cycle and looped nothing.
 
+- **backdrop elements no longer emit the same picture hundreds of times** (fixed). SSF2 authors a
+  small looping element and the stage timeline it sits on runs far longer, so the art walk sees the
+  cycle over and over and every repeat was rasterised. clocktown arrived as 3379 sprites / 263MB --
+  1363 frames of bottom fire drawn from 8 distinct images, 621 frames of fire light drawn from 2 --
+  and FrayTools could not publish it at all, at any timeout.
+
+  two lossless reductions, both in the element writer: a sequence that is one cycle repeated emits
+  ONE cycle (the element loops anyway, and the tail does not have to be a whole cycle), and an
+  image used on more than one frame is written once and referenced again. clocktown: 3379 -> 726
+  sprites, 263MB -> 164MB. bowserscastle is unchanged bar 8 files.
+
+  a third reduction is in place but rarely applies: an element that is a large still picture with
+  one small moving part is emitted as a plate plus a crop of the part that moves. it samples before
+  committing, and declines when the element changes across most of its canvas -- which is what
+  clocktown's remaining 623-frame town backdrop does, so that stage is still too heavy to publish.
+
+- **crateria converts and runs clean.** 2.4MB, 27 sprites, no script errors: 50 weather particles
+  tethered to the camera (worst per-particle error 0) and spanning the view, the hazards switch
+  wired, and both caution-sign hazards spawned.
+
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
   chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the
