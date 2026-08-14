@@ -223,6 +223,32 @@ dimensions below are the rest.
   only when nothing else has set `match`. and a fallback interp is never treated as final, so an
   `e` sent before the match starts cannot pin it -- the borrow is retried until it succeeds.
 
+- **weather is detected by the engine call it makes, not by a class name** (fixed). a stage hands
+  its weather's container to the engine's weather layer, so "the object whose `getContainer()` is
+  added to `getWeatherMC()`" identifies it exactly, on every stage that has any, without knowing a
+  single class name. keying on a name containing "weather" found 2 of the 8 stages in the corpus
+  that call it, and only if the construction sat in `initialize` (clocktown builds its rain behind
+  a state machine, smashville in `syncStage`).
+
+  the COUNT and area come from the class too, not from the call: the constructor says which
+  parameter lands in which field, and the signature carries the defaults for whatever the stage
+  did not pass. bowserscastle passes only the particle class and takes the rest from those
+  defaults, which is why reading the call site alone found nothing. its real numbers are 50
+  particles over 640x360 -- and that area being exactly one SSF2 screen is independent
+  confirmation that a weather field is meant to be one screenful.
+
+  | stage | particle | count |
+  | --- | --- | --- |
+  | bowserscastle | ember | 50 |
+  | clocktown | ClockTownRainDrop | 100 |
+  | crateria | CrateriaGreenRainDrop | 50 |
+  | fairyglade | fairyglade_particle | 8 |
+  | smashville | (rain) | 100 |
+  | finalvalley | (rain) | not readable, skipped with a warning |
+
+  a stage whose count cannot be read emits NO weather rather than a loop over nothing, which would
+  render as a stage that carries weather and shows none.
+
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
   chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the

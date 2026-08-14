@@ -111,6 +111,13 @@ pub struct Method {
     pub name: Arc<str>,
     pub param_count: u32,
     pub return_type_idx: u32,
+    /// Declared defaults for the OPTIONAL trailing parameters, resolved against the numeric pools
+    /// (`None` for a non-numeric default). A call site is free to pass fewer arguments than the
+    /// signature takes, and what the object is actually built with then lives here rather than at
+    /// the call: bowserscastle constructs its weather with one argument and takes the count and
+    /// area from these.
+    #[serde(default)]
+    pub optionals: Vec<Option<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,18 +475,25 @@ pub fn parse(data: &[u8]) -> Result<AbcFile> {
         for _ in 0..param_count { r.read_u30()?; } // param types
         let name_idx = r.read_u30()?;
         let flags = r.read_u8()?;
+        let mut optionals: Vec<Option<f64>> = Vec::new();
         if flags & 0x08 != 0 { // HAS_OPTIONAL
             let opt_count = r.read_u30()? as usize;
             for _ in 0..opt_count {
-                r.read_u30()?; // value index
-                r.read_u8()?;  // value kind
+                let vidx = r.read_u30()? as usize;
+                let kind = r.read_u8()?;
+                optionals.push(match kind {
+                    0x03 => ints.get(vidx).map(|v| *v as f64),      // Int
+                    0x04 => uints.get(vidx).map(|v| *v as f64),     // UInt
+                    0x06 => doubles.get(vidx).copied(),             // Double
+                    _ => None,
+                });
             }
         }
         if flags & 0x80 != 0 { // HAS_PARAM_NAMES
             for _ in 0..param_count { r.read_u30()?; }
         }
         let name = strings.get(name_idx as usize).cloned().unwrap_or_default();
-        methods.push(Method { name_idx, name, param_count, return_type_idx });
+        methods.push(Method { name_idx, name, param_count, return_type_idx, optionals });
     }
 
     // ── Metadata ──────────────────────────────────────────────────────────────
@@ -2157,15 +2171,41 @@ pub struct StageWeather {
 /// hand that object the area and the count. Keyed on that shape rather than on any stage or class
 /// name, so a second stage doing the same thing is found the same way.
 pub fn extract_stage_weather(abc: &AbcFile, stage_class: &str) -> Option<StageWeather> {
-    let class = abc.classes.iter().find(|c| c.name == stage_class)?;
-    let init = class.instance_methods.iter().find(|t| &*t.name == "initialize")?;
-    let body = abc.method_bodies.iter().find(|b| b.method_idx == init.method_idx)?;
+    let class = abc.classes.iter().find(|c| c.name == stage_class)
+        .or_else(|| abc.classes.iter().find(|c| c.name.eq_ignore_ascii_case(stage_class)))?;
+    // Every method, not just `initialize`: a stage builds its weather where it likes (smashville
+    // does it in `syncStage`, clocktown behind a state machine).
+    for t in class.instance_methods.iter() {
+        let Some(body) = abc.method_bodies.iter().find(|b| b.method_idx == t.method_idx) else { continue };
+        if let Some(w) = weather_in_body(abc, &body.bytecode) { return Some(w); }
+    }
+    None
+}
 
-    let bc = &body.bytecode;
-    let (mut i, mut last_lex, mut art) = (0usize, None::<String>, None::<String>);
-    let mut nums: Vec<f64> = Vec::new();
+/// The weather construction inside one method body, keyed on the ENGINE CALL that defines it.
+///
+/// A stage hands its weather's container to the engine's weather layer:
+///
+/// ```text
+///   constructprop <WeatherClass>(<particle class>, …)   // built from one small clip
+///   initproperty  <field>                               // kept on the stage
+///   … getWeatherMC()                                    // the engine's weather layer
+///   getproperty <field>; callproperty getContainer; callpropvoid addChild
+/// ```
+///
+/// `getWeatherMC` is the signature. It is in every package's api layer but only weather code CALLS
+/// it, so "the object whose container goes into the weather layer" identifies the weather exactly,
+/// on every stage that has any, without knowing a single class name. Keying on a name containing
+/// "weather" instead finds two of the eight stages in the corpus that call it.
+fn weather_in_body(abc: &AbcFile, bc: &[u8]) -> Option<StageWeather> {
+    // pass 1: field -> (particle art, numbers seen just after its construction)
+    let mut built: Vec<(String, String, Option<String>, Vec<f64>)> = Vec::new();
+    let (mut i, mut last_lex) = (0usize, None::<String>);
+    let mut recent: Vec<f64> = Vec::new();
+    let mut pending: Option<(String, Option<String>, Vec<f64>)> = None;
     while i < bc.len() {
         let op = bc[i];
+        let at = i;
         i += 1;
         match op {
             OP_GETLEX => {
@@ -2174,33 +2214,134 @@ pub fn extract_stage_weather(abc: &AbcFile, stage_class: &str) -> Option<StageWe
             }
             OP_CONSTRUCTPROP => {
                 let mn = read_u30_at(bc, &mut i)?;
-                let _argc = read_u30_at(bc, &mut i)?;
-                let name = abc.multinames.get(mn as usize).map(|m| m.name.to_string()).unwrap_or_default();
-                // The class being constructed is the weather; the thing most recently pushed is
-                // the particle it is made of.
-                if name.to_ascii_lowercase().contains("weather") {
-                    art = last_lex.clone();
-                    nums.clear();          // the numbers that matter come AFTER the construction
-                }
+                let argc = read_u30_at(bc, &mut i)? as usize;
+                let cname = abc.multinames.get(mn as usize).map(|m| m.name.to_string()).unwrap_or_default();
+                // The arguments were pushed BEFORE the call, so they are the tail of what we have
+                // seen. The particle class is the most recent name; the numbers among the args are
+                // whatever the stage chose to override.
+                let take = recent.len().min(argc);
+                let args: Vec<f64> = recent[recent.len() - take..].to_vec();
+                recent.clear();
+                pending = Some((cname, last_lex.clone(), args));
             }
             OP_PUSHDOUBLE => {
                 let idx = read_u30_at(bc, &mut i)?;
-                if art.is_some() { if let Some(v) = abc.doubles.get(idx as usize) { nums.push(*v); } }
+                if let Some(v) = abc.doubles.get(idx as usize) { recent.push(*v); }
             }
             OP_PUSHINT => {
                 let idx = read_u30_at(bc, &mut i)?;
-                if art.is_some() { if let Some(v) = abc.ints.get(idx as usize) { nums.push(*v as f64); } }
+                if let Some(v) = abc.ints.get(idx as usize) { recent.push(*v as f64); }
             }
-            OP_PUSHBYTE => { if art.is_some() { nums.push(bc.get(i).map(|b| *b as i8 as f64)?); } i += 1; }
-            _ => skip_opcode_operands(op, bc, &mut i),
+            OP_PUSHSHORT => {
+                let v = read_u30_at(bc, &mut i)? as i32;
+                recent.push(v as f64);
+            }
+            OP_PUSHBYTE => {
+                recent.push(bc.get(i).map(|b| *b as i8 as f64)?);
+                i += 1;
+            }
+            OP_SETPROPERTY | OP_INITPROPERTY => {
+                let mn = read_u30_at(bc, &mut i)?;
+                let field = abc.multinames.get(mn as usize).map(|m| m.name.to_string()).unwrap_or_default();
+                if let Some((cname, art, args)) = pending.take() { built.push((field, cname, art, args)); }
+            }
+            _ => { let mut j = at + 1; skip_opcode_operands(op, bc, &mut j); i = j; }
         }
-        if art.is_some() && nums.len() >= 3 { break; }
+    }
+    if built.is_empty() { return None; }
+
+    // pass 2: after the weather-layer call, the field whose container is added is the weather
+    let (mut i, mut saw_layer, mut last_field) = (0usize, false, None::<String>);
+    let mut weather_field: Option<String> = None;
+    while i < bc.len() {
+        let op = bc[i];
+        let at = i;
+        i += 1;
+        match op {
+            OP_GETPROPERTY => {
+                let mn = read_u30_at(bc, &mut i)?;
+                last_field = abc.multinames.get(mn as usize).map(|m| m.name.to_string());
+            }
+            OP_CALLPROPERTY | OP_CALLPROPVOID => {
+                let mn = read_u30_at(bc, &mut i)?;
+                let _argc = read_u30_at(bc, &mut i)?;
+                let name = abc.multinames.get(mn as usize).map(|m| m.name.to_string()).unwrap_or_default();
+                match name.as_str() {
+                    "getWeatherMC" => saw_layer = true,
+                    "getContainer" if saw_layer => {
+                        if let Some(f) = last_field.clone() {
+                            if built.iter().any(|(bf, _, _, _)| *bf == f) { weather_field = Some(f); }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => { let mut j = at + 1; skip_opcode_operands(op, bc, &mut j); i = j; }
+        }
+    }
+    // A stage that builds one weather object and hands it over without going through a field still
+    // reads as weather: the layer call is the evidence, the single construction is the object.
+    let (_, cname, art, args) = match weather_field {
+        Some(f) => built.into_iter().find(|(bf, _, _, _)| *bf == f)?,
+        None if saw_layer && built.len() == 1 => built.into_iter().next()?,
+        None => return None,
+    };
+    let art = art?;
+    let (width, height, count) = weather_numbers(abc, &cname, &args);
+    Some(StageWeather { art, width, height, count })
+}
+
+/// The count and area a weather object is actually built with.
+///
+/// The stage may pass them or leave them out, so the values come from the CLASS: its constructor
+/// says which parameter lands in which field (`getlocal_N` then a store), and its signature carries
+/// the defaults for the ones the stage did not pass. bowserscastle passes only the particle class
+/// and takes everything else from those defaults, so reading the call site alone finds nothing.
+fn weather_numbers(abc: &AbcFile, class_name: &str, args: &[f64]) -> (f64, f64, u32) {
+    let Some(class) = abc.classes.iter().find(|c| c.name == class_name) else { return (0.0, 0.0, 0) };
+    let Some(ctor) = abc.methods.get(class.constructor_idx as usize) else { return (0.0, 0.0, 0) };
+    let Some(body) = abc.method_bodies.iter().find(|b| b.method_idx == class.constructor_idx) else { return (0.0, 0.0, 0) };
+
+    // param index (1-based, as getlocal numbers them) -> the field it is stored in
+    let mut param_field: Vec<(usize, String)> = Vec::new();
+    let bc = &body.bytecode;
+    let (mut i, mut last_local) = (0usize, None::<usize>);
+    while i < bc.len() {
+        let op = bc[i];
+        let at = i;
+        i += 1;
+        match op {
+            OP_GETLOCAL1 => last_local = Some(1),
+            OP_GETLOCAL2 => last_local = Some(2),
+            OP_GETLOCAL3 => last_local = Some(3),
+            OP_GETLOCAL => { last_local = read_u30_at(bc, &mut i).map(|n| n as usize); }
+            OP_SETPROPERTY | OP_INITPROPERTY => {
+                let mn = read_u30_at(bc, &mut i).unwrap_or(0);
+                let f = abc.multinames.get(mn as usize).map(|m| m.name.to_string()).unwrap_or_default();
+                if let Some(n) = last_local.take() { param_field.push((n, f)); }
+            }
+            _ => { let mut j = at + 1; skip_opcode_operands(op, bc, &mut j); i = j; }
+        }
     }
 
-    let art = art?;
-    if nums.len() < 3 { return None; }
-    // width, height, count -- the order the engine is handed them.
-    Some(StageWeather { art, width: nums[0], height: nums[1], count: nums[2].max(0.0) as u32 })
+    // the value for a parameter: what the stage passed, else what the signature declares
+    let pc = ctor.param_count as usize;
+    let first_optional = pc.saturating_sub(ctor.optionals.len());
+    let value_of = |p1: usize| -> Option<f64> {
+        let idx = p1.checked_sub(1)?;              // getlocal is 1-based over params
+        if idx < args.len() { return Some(args[idx]); }
+        if idx >= first_optional { return ctor.optionals.get(idx - first_optional).copied().flatten(); }
+        None
+    };
+    let find = |needle: &str| -> Option<f64> {
+        param_field.iter()
+            .find(|(_, f)| f.to_ascii_lowercase().contains(needle))
+            .and_then(|(p, _)| value_of(*p))
+    };
+    let count = find("cnt").or_else(|| find("count")).or_else(|| find("num")).unwrap_or(0.0);
+    let width = find("width").unwrap_or(0.0);
+    let height = find("height").unwrap_or(0.0);
+    (width, height, count.max(0.0) as u32)
 }
 
 /// What a stage puts behind the HAZARDS SWITCH, read out of the stage's own code.

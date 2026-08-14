@@ -2612,8 +2612,21 @@ fn weather_entity(eid: &str, guid: &str, w: u32, h: u32, scale: f64) -> Value {
 }
 
 /// Write the particle art + entity. Returns (spawn code, per-frame code) for the stage script.
+/// Ceiling on live weather particles. The source count is scaled up to keep the authored DENSITY
+/// over Fraymakers' larger view, and this stops a wide pull-out (or a misread source) turning that
+/// into a swarm.
+const WEATHER_MAX_PARTICLES: u32 = 200;
+
 fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
     let Some(w) = &model.weather else { return Ok((String::new(), String::new())) };
+    // A count of zero means the class's own code did not yield one (the value is neither passed at
+    // the construction nor declared as a default). Emitting anyway gives a loop over nothing: the
+    // stage carries a weather entity and renders no weather, which looks like it works. Say so
+    // instead, so it reads as a known gap rather than a silent one.
+    if w.count == 0 {
+        log::warn!("stage weather: found the particle ({}x{}) but not how many, so no weather is emitted", w.art.w, w.art.h);
+        return Ok((String::new(), String::new()));
+    }
     let eid = format!("{}_weather", model.id);
     let sprites = lib.join("sprites").join("Stage");
     std::fs::create_dir_all(&sprites).ok();
@@ -2630,21 +2643,47 @@ fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
     // particles arriving from off-screen instead of appearing at the frame edge.
     let hw = (w.width * 0.75).round() as i64;
     let hh = (w.height * 0.75).round() as i64;
-    let count = w.count.min(200);   // a stage asking for thousands is a stage we misread
+    let count = w.count.min(WEATHER_MAX_PARTICLES);   // a stage asking for thousands is a stage we misread
     let vs = velocity_scale();
     // Rise and drift are per-frame speeds, so they convert like every other one.
     let k_lo = 1.0 * vs;
     let k_span = (2.0 * vs * 100.0).round() as i64;
     let wind_lo = -1.5 * vs;
     let wind_span = (4.2 * vs * 100.0).round() as i64;
+    // Both the scatter and the COUNT come off the live camera, not off the source numbers.
+    // SSF2's field is one SSF2 screenful; Fraymakers shows a good deal more world than that, so
+    // reusing the source's area scatters the particles into a band in the middle, and reusing the
+    // source's count spreads that many across a bigger screen and reads as thinner weather than
+    // the original. Scaling the count by the area ratio keeps the DENSITY the source authored,
+    // which is what actually looks the same. Capped so a big pull-out cannot spawn a swarm.
+    // The source area is what the count's DENSITY is relative to. A stage whose class names its
+    // area fields something this pass does not recognise reports none, and scaling would then be
+    // dividing by a number we do not have -- so the source count is used as-is instead.
+    let src_area = (hw.max(0) * hh.max(0)) as f64;
+    let count_calc = if src_area > 0.0 {
+        format!("\t\t\tvar wn = Std.int({count} * (shw * shh) / {src_area:.1});\n")
+    } else {
+        format!("\t\t\tvar wn = {count};\n")
+    };
     let spawn = format!(
-        "\t\t\tm_weather = [];\n\
-         \t\t\tfor (i in 0...{count}) {{\n\
+        "\t\t\tvar wcam = match.getCamera();\n\
+         \t\t\tvar shw = {hw}.0;\n\
+         \t\t\tvar shh = {hh}.0;\n\
+         \t\t\tif (wcam != null) {{\n\
+         \t\t\t\tshw = wcam.getViewportWidth() * 0.75;\n\
+         \t\t\t\tshh = wcam.getViewportHeight() * 0.75;\n\
+         \t\t\t}}\n\
+{count_calc}\
+         \t\t\tif (wn < {count}) wn = {count};\n\
+         \t\t\tif (wn > {cap}) wn = {cap};\n\
+         \t\t\tm_weather = [];\n\
+         \t\t\tfor (i in 0...wn) {{\n\
          \t\t\t\tvar v = match.createVfx(new VfxStats({{ spriteContent: self.getResource().getContent(\"{eid}\"), animation: \"active\", loop: true, timeout: -1, relativeWith: false }}));\n\
          \t\t\t\tv.setAlpha(0.2 + Random.getInt(0, 60) / 100.0);\n\
          \t\t\t\tself.getBackgroundEffectsContainer().addChild(v.getViewRootContainer());\n\
-         \t\t\t\tm_weather.push({{ v: v, x: Random.getInt(-{hw}, {hw}) * 1.0, y: Random.getInt(-{hh}, {hh}) * 1.0, k: {k_lo:.3} + Random.getInt(0, {k_span}) / 100.0, wind: {wind_lo:.3} + Random.getInt(0, {wind_span}) / 100.0 }});\n\
-         \t\t\t}}\n");
+         \t\t\t\tm_weather.push({{ v: v, x: (Random.getInt(0, 200) / 100.0 - 1.0) * shw, y: (Random.getInt(0, 200) / 100.0 - 1.0) * shh, k: {k_lo:.3} + Random.getInt(0, {k_span}) / 100.0, wind: {wind_lo:.3} + Random.getInt(0, {wind_span}) / 100.0 }});\n\
+         \t\t\t}}\n",
+        cap = WEATHER_MAX_PARTICLES);
     // Weather is attached to the VIEW, not to the stage: it fills the screen wherever the camera
     // goes, and a particle leaving one edge returns at the other. So a particle's stored position
     // is an offset from the camera (which reports the CENTRE of the view), resolved every frame.
@@ -3132,7 +3171,7 @@ fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str
         // no hazards: keep update() a clean empty body (byte-stable with hazardless stages).
         (String::new(), String::new())
     } else {
-        ("var m_hazardsSpawned = false;\nvar m_hazardsOn = true;\n".to_string(),
+        ("var m_hazardsSpawned = false;\nvar m_hazardsOn = true;\nvar m_weatherSpawned = false;\n".to_string(),
          format!("\tif (!m_hazardsSpawned) {{\n\
                   \t\tvar chars = match.getCharacters();\n\
                   \t\tif (chars.length > 0) {{\n\
@@ -3144,7 +3183,17 @@ fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str
                   \t\t\tvar cfg = match.getMatchSettingsConfig();\n\
                   \t\t\tm_hazardsOn = cfg == null || cfg.hazards;\n\
                   \t\t\tvar owner = null;\n\
-{hazard_spawns}{w_spawn}\
+{hazard_spawns}\
+                  \t\t}}\n\
+                  \t}}\n\
+                  \t// the weather waits for a CAMERA, not just for the match: it is scattered over\n\
+                  \t// the view and sized by it, and when the fighters first exist the camera is not\n\
+                  \t// up yet -- spawning then falls back to the source area, sized for SSF2's screen\n\
+                  \tif (!m_weatherSpawned) {{\n\
+                  \t\tvar wc0 = match.getCamera();\n\
+                  \t\tif (wc0 != null) {{\n\
+                  \t\t\tm_weatherSpawned = true;\n\
+{w_spawn}\
                   \t\t}}\n\
                   \t}}\n{w_frame}"))
     };
