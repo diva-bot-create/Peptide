@@ -10,8 +10,8 @@
 // live match/character context (a character script gets `self`; we are not one), so the
 // only job of commands.hsx is to expose that context. Everything else, a user writes as
 // plain hscript through `e`:
-//     match.getCharacters()[0].getStateName()
-//     match.getCharacters()[0].toState(CState.SPECIAL_NEUTRAL)
+//     p0.getStateName()                     entity-level: state, body, damage, everything
+//     p0.toState(CState.SPECIAL_NEUTRAL)
 //
 // Bound PER-EVAL by the eval hook (so these read live state at call time):
 //   match, camera, stage, self = the SANDBOX, exactly what a content script is handed. `e` runs
@@ -21,7 +21,9 @@
 //                additive, so engine-level access content never gets is available in the same
 //                breath.
 //   p0, p1     = the match's characters (FraymakersCharacter); plumbing for getCharacters().
-//                Prefer match.getCharacters()[i] over p0 — explicit, no hidden target.
+//                Use p0..p3 (or the bare getCharacters()) for ENTITY-level access. `match` is
+//                the content api now, so match.getCharacters() hands back CharacterApi objects
+//                with the script surface, not entities: no getStateName/body/damage on those.
 //   CState, HitboxStats, Assist, MatchModifier, … = the engine script API (applyInterpreterGlobals).
 //   __td       = Tildebugger statics, for the Engine.log facade.
 
@@ -35,7 +37,7 @@ log = function(msg) { __td.log("" + msg, null, null); return "logged: " + msg; }
 // The live character list, as a NATIVE hscript array. (The raw pxf.core.Match.characters
 // ArrayObj has no usable RTTI — .length/Std.string on it return garbage — so we build a
 // fresh array from the per-eval-bound characters.) Returning an Array lets callers chain:
-// match.getCharacters()[0].getStateName(), match.getCharacters().length. p1..p3 are null
+// p0.getStateName(), getCharacters().length. p1..p3 are null
 // until the match actually has that many players (1-4 supported).
 getCharacters = function() {
   var a = [];

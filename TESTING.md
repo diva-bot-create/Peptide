@@ -89,8 +89,8 @@ cargo build --release
 ./build/release/peptide session --full &        # boots + holds a live engine
 #   wait for "engine READY" in:  ./build/release/peptide log
 ./build/release/peptide tell "spawn <id>"                       # start a real match
-./build/release/peptide tell "match.getCharacters()[0].getStateName()"   # read state
-./build/release/peptide tell "match.getCharacters()[0].toState(CState.JAB)"  # drive a move
+./build/release/peptide tell "p0.getStateName()"                       # read state
+./build/release/peptide tell "p0.toState(CState.JAB)"                  # drive a move
 ./build/release/peptide log -n 20                # read everything the engine streamed back
 ./build/release/peptide tell "exit"             # clean shutdown when done
 
@@ -240,7 +240,7 @@ short-name resolution (`spawn` / `load`): a bare `sandbag` (no `::`) is tried ag
 `tools/runseq.sh <gap_s> "cmd1" "cmd2" …` to feed a gapped sequence into one session: it boots
 once (boot→READY budget via `FRAY_READY_BUDGET`), fires the first command at READY, and paces
 the rest by `gap_s` (fractional OK). example:
-`./tools/runseq.sh 6 "spawn sandbag" "match.getCharacters()[0].getStateName()" "match.getCharacters()[0].toState(CState.JAB)"`.
+`./tools/runseq.sh 6 "spawn sandbag" "p0.getStateName()" "p0.toState(CState.JAB)"`.
 
 ### timing parity (is the 30->60fps doubling right?)
 

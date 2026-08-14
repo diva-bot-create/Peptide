@@ -206,6 +206,11 @@ dimensions below are the rest.
   `Match.matchApi` is typed as. hand-binding that field yields an object that identifies correctly
   and takes the engine down on first touch. borrowing never names the type.
 
+  ONE vocabulary change came with it: `match` is now the content api, so
+  `match.getCharacters()` hands back CharacterApi objects rather than raw entities, and
+  `getStateName()`/`body`/`damage` are not on those. entity-level access is `p0`..`p3` or the bare
+  `getCharacters()` (both verified live), and TESTING.md plus the two test scripts use those.
+
   two things this forced. `commands.hsx` must not redefine content's names: it used to assign
   `match` unconditionally, which in a borrowed interpreter replaced the live stage's api mid-match
   and broke it (its own getCamera went null on the very next frame). the facade is now installed

@@ -84,7 +84,7 @@ scan_one() {
     # frame counter and returns when the animation completes / loops / changes / stalls,
     # so the next state is never driven over a half-played one. The gap below is only a
     # floor between sends; the pacing that matters is the await.
-    cmds+=("$PARK" "match.getCharacters()[0].toState(CState.$s)" "await p0 $AWAIT_BUDGET")
+    cmds+=("$PARK" "p0.toState(CState.$s)" "await p0 $AWAIT_BUDGET")
   done
 
   echo "[$c] driving ${#cmds[@]} commands across $(echo $STATES | wc -w | tr -d ' ') states" >&2
