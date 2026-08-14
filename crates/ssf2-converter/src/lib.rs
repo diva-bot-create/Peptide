@@ -54,4 +54,5 @@ pub mod stage_abc;
 pub mod stage_parser;
 pub use stage_parser::{parse_stage, parse_stage_opts, ParallaxLayer, ParallaxMode, Platform, Rect, SpawnPoint, StageArt, StageArtSet, StageModel};
 pub mod stage_emit;
+pub mod content_audit;
 pub use stage_emit::{emit_stage, render_placeholder_for_test};

@@ -80,6 +80,8 @@ pub fn generate(output_dir: &Path, char_name: &str, char_pascal: &str, data: &Ch
         fs::write(char_dir.join(format!("{}.fraytools", char_name)), fraytools_project::generate_fraytools_project(char_name))?;
         let proj_names: Vec<String> = projectiles.iter().map(|p| p.name.clone()).collect();
         fs::write(char_dir.join("library/manifest.json"), generate_manifest(&char_id, char_name, &proj_names))?;
+        // Ask what the engine would ask: does every content id these scripts name actually exist?
+        crate::content_audit::audit_and_log(&char_dir.join("library"), &char_id);
         fs::write(char_dir.join("library/manifest.json.meta"), generate_manifest_meta(&det_uuid(&format!("{}::manifest::meta", char_id))))?;
     }
 

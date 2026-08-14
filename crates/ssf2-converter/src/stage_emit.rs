@@ -213,6 +213,8 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     write_script(&scripts.join(format!("{id}StageStats.hx")), &stage_stats_hx(id, &art.parallax, model.scale))?;
     write_meta(&scripts.join(format!("{id}StageStats.hx.meta")), id, &format!("{id}StageStats"), "hscript", None, None)?;
 
+    crate::content_audit::audit_and_log(&lib, id);
+
     let fraytools = dir.join(format!("{id}.fraytools"));
     write_json(&fraytools, &build_fraytools())?;
 

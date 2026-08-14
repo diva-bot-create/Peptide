@@ -776,13 +776,13 @@ fn split_taunt(frame_labels: &[(String, u16)], total_frames: u16) -> Vec<(String
 /// Missing FM anim name → best donor FM anim name. One shared table for both the
 /// collision-box fallbacks (`apply_fallbacks`) and the image fallbacks
 /// (`image_extractor::apply_image_fallbacks`) so the two can't drift apart.
-/// Fallbacks whose donor must be played BACKWARDS. SSF2 draws the entry animation only and runs
-/// it in reverse to exit, so cloning the donor forward gives an exit that plays like a second
-/// entry -- a character standing up by crouching again.
-pub(crate) const ANIM_FALLBACKS_REVERSED: &[(&str, &str)] = &[
-    ("crouch_out",   "crouch_in"),
-];
-
+///
+/// This is the DATA phase: an FM animation whose source data is missing entirely borrows another
+/// animation's boxes and images. The SLOT phase is a different table -- `anim_splitter`'s
+/// `SLOT_ALIASES`, which fills an FM slot that has no split of its own by reusing another split,
+/// and is where a reuse that needs slicing, clipping or REVERSING belongs (`crouch_out` runs
+/// `crouch_in` backwards there). The two are disjoint by target; if a reuse is not taking effect,
+/// it is usually because it was added to this one when it belonged in that one.
 pub(crate) const ANIM_FALLBACKS: &[(&str, &str)] = &[
     // Damage / launched states
     ("stunned",           "hurt"),
@@ -816,19 +816,6 @@ pub(crate) const ANIM_FALLBACKS: &[(&str, &str)] = &[
     ("item_screw",        "special_up"),
 ];
 
-/// Reverse a cloned donor's per-frame boxes in place, so an exit animation built from an entry
-/// runs backwards. Frame labels are dropped: they mark positions in the ENTRY and mean nothing
-/// once the order is inverted.
-fn reverse_box_frames(data: &mut AnimationBoxData) {
-    let n = data.total_frames;
-    if n <= 1 { return; }
-    let old = std::mem::take(&mut data.frames);
-    for (f, boxes) in old {
-        if f < n { data.frames.insert(n - 1 - f, boxes); }
-    }
-    data.frame_labels.clear();
-}
-
 fn apply_fallbacks(result: &mut BTreeMap<String, AnimationBoxData>) {
     let mut to_insert: Vec<AnimationBoxData> = Vec::new();
 
@@ -841,17 +828,6 @@ fn apply_fallbacks(result: &mut BTreeMap<String, AnimationBoxData>) {
             to_insert.push(cloned);
         } else {
             log::debug!("Fallback: '{}' ← '{}' (donor also missing)", missing, donor);
-        }
-    }
-
-    for (missing, donor) in ANIM_FALLBACKS_REVERSED {
-        if result.contains_key(*missing) { continue; }
-        if let Some(donor_data) = result.get(*donor) {
-            let mut cloned = donor_data.clone();
-            cloned.fm_name = missing.to_string();
-            reverse_box_frames(&mut cloned);
-            log::debug!("Fallback (reversed): '{}' ← '{}' ({} frames)", missing, donor, cloned.total_frames);
-            to_insert.push(cloned);
         }
     }
 

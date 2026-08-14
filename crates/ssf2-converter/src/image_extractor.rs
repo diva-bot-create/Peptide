@@ -1275,26 +1275,6 @@ fn apply_image_fallbacks(result: &mut BTreeMap<String, AnimFrameImages>) {
             to_insert.push((missing.to_string(), donor_data.clone()));
         }
     }
-    for (missing, donor) in crate::sprite_parser::ANIM_FALLBACKS_REVERSED {
-        let needs_fallback = match result.get(*missing) {
-            None => true,
-            Some(existing) => existing.frames.is_empty()
-                || existing.frames.values().all(|entries| entries.iter().all(|e| e.symbol_name.starts_with("id_"))),
-        };
-        if !needs_fallback { continue; }
-        if let Some(donor_data) = result.get(*donor) {
-            let mut cloned = donor_data.clone();
-            let n = cloned.total_frames;
-            if n > 1 {
-                let old = std::mem::take(&mut cloned.frames);
-                for (f, entries) in old {
-                    if f < n { cloned.frames.insert(n - 1 - f, entries); }
-                }
-            }
-            to_insert.push((missing.to_string(), cloned));
-        }
-    }
-
     for (name, data) in to_insert {
         result.insert(name, data);
     }
