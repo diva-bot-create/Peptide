@@ -1319,6 +1319,14 @@ pub fn generate_entity(
                             let pivot_x = 0.0_f64;
                             let pivot_y = 0.0_f64;
                             let mut emit_rot = ((world_rot % 360.0) + 360.0) % 360.0;
+                            // A mirror reflects the pose's ROTATION too: reflecting about the
+                            // vertical axis maps an angle to its negative. Negating scaleX and x
+                            // without it leaves a rotated frame turned the wrong way -- invisible
+                            // on stand_turn, whose idle pose is flat, and plain on a run turn,
+                            // whose frames are authored at 180 and 150 degrees.
+                            if turn_flip {
+                                emit_rot = ((-emit_rot % 360.0) + 360.0) % 360.0;
+                            }
                             if anim_name == "tumble" {
                                 if let Some(img) = bitmap_img {
                                     let (hw, hh) = (img.width as f64 / 2.0, img.height as f64 / 2.0);

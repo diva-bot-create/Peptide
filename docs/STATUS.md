@@ -290,7 +290,7 @@ dimensions below are the rest.
   | fault | cause | fix |
   | --- | --- | --- |
   | effect placements ignored facing | the source flips the offset by hand (`self.flipX(78)`) AND fraymakers mirrors it via `flipWith`, so the two cancelled | drop the source's flip exactly when `flipWith` is set. measured live: `flipWith` + raw `x: 78` lands at +78 facing right, -78 facing left |
-  | `run_turn` faced backwards | only its FIRST frame was mirrored | a turn is drawn facing the direction turned FROM and the engine flips facing when the turn starts, so the whole animation mirrors |
+  | `run_turn` faced backwards | only its FIRST frame was mirrored | a turn is drawn facing the direction turned FROM and the engine flips facing when the turn starts, so the whole animation mirrors -- scaleX, x AND rotation, since reflecting about the vertical axis maps an angle to its negative |
   | `crouch_out` played like a second crouch | the exit slot cloned the entry FORWARD | splits carry a `reversed` flag; the exit runs the entry backwards |
   | `fall_loop` looped wrong, and the fall looked like the jump never ended | the loop was sliced at a template constant, and the peeled entry frames were appended to the END -- so every cycle flashed the entry pose | the loop comes from the clip's OWN loop-back call |
 
