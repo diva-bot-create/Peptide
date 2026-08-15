@@ -54,6 +54,9 @@ const OP_PUSHSHORT: u8 = 0x25;
 /// to guard MovieClip-only / container-only properties in the NODE verb — reading
 /// `currentFrame` off a Bitmap throws (display classes are sealed), which would abort the
 /// whole command through the dispatcher's try and answer "ERR:" for an otherwise fine node.
+const NS_PRIVATE: u8 = 0x05;
+const OP_IFNE: u8 = 0x14;
+const OP_THROW: u8 = 0x03;
 const OP_ISTYPELATE: u8 = 0xB3;
 const OP_IFGE: u8 = 0x18;
 
@@ -72,6 +75,29 @@ pub const SSF2_NS_ENGINE: &str = "com.mcleodgaming.ssf2.engine"; // Character, S
 pub const SSF2_NS_UTIL: &str = "com.mcleodgaming.ssf2.util";     // Controller, ControlsObject, ResourceManager
 pub const SSF2_NS_ENUMS: &str = "com.mcleodgaming.ssf2.enums";   // Mode
 
+/// The loader that opens one data package, and the two handlers it routes a failed open through.
+/// Both are hooked so a package that fails names itself instead of vanishing.
+pub const PEPTIDE_LOAD_LOG: &str = "peptideLoadLog";
+/// The error most recently reported, so the same one passing outward is not reported again.
+pub const PEPTIDE_LAST_ERR: &str = "peptideLastErr";
+pub const SSF2_RESOURCE_CLASS: &str = "Resource";
+pub const SSF2_RESOURCE_FILE_FIELD: &str = "CurrentFileName";
+pub const SSF2_RESOURCE_ERROR_METHODS: [&str; 2] = ["initialLoadError", "loadError"];
+pub const SSF2_RESOURCE_LOADER_FIELD: &str = "getLoader";
+pub const SSF2_RESOURCE_LOAD_METHOD: &str = "load";
+
+/// Where an extra package is registered from, and the table that doubles as its one-shot guard.
+pub const SSF2_MENU_ENTRY_METHOD: &str = "showInitialMenu";
+pub const SSF2_RESOURCE_POOL: &str = "poolHash";
+
+/// The engine's resource-type values, as declared on its own resource class.
+pub const SSF2_RESOURCE_TYPE_STAGE: u8 = 2;
+
+/// The clip tree every stage package must have. The game walks these by name and does not check
+/// as it goes, so a missing one surfaces as an undefined-value error with nothing naming it.
+pub const SSF2_STAGE_CLIP: &str = "stageMC";
+pub const SSF2_STAGE_PARTS: [&str; 3] = ["background", "terrain", "foreground"];
+
 /// A tiny opcode emitter with the AVM2 u30 var-encoding + label/branch fixups.
 #[derive(Default)]
 struct Code {
@@ -83,6 +109,9 @@ struct Code {
 }
 impl Code {
     fn op(&mut self, o: u8) { self.b.push(o); }
+    /// Bytes emitted so far, for callers that need an offset into their own payload (an
+    /// exception handler has to be pointed at, which means knowing where it lands).
+    fn len(&self) -> usize { self.b.len() }
     fn u30(&mut self, mut v: u32) {
         loop {
             let mut byte = (v & 0x7f) as u8;
@@ -1731,6 +1760,19 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
         abc.add_instance_method_trait(ci, mn_pwalk, pw);
     }
 
+    // The buffer every error reporter writes into is declared HERE, alongside the socket, because
+    // this runs on every boot. Declaring it on the menu path instead left it missing on a fast
+    // boot, so each reporter threw on a property that did not exist -- and reported its own
+    // failure in place of the one it was watching, which is the worst way for a diagnostic to break.
+    {
+        let s = abc.intern_string(PEPTIDE_LOAD_LOG);
+        let mn = abc.intern_qname(pub_ns, s);
+        abc.add_instance_slot(ci, mn);
+        let s2 = abc.intern_string(PEPTIDE_LAST_ERR);
+        let mn2 = abc.intern_qname(pub_ns, s2);
+        abc.add_instance_slot(ci, mn2);
+    }
+
     // ctor: this.peptideSock = new Socket(); addEventListener("socketData", this.peptideOnData);
     //       connect(host, port)  — dial into the host's loopback server. connect() coerces
     //       the port String to int; the handler fires only when the host sends data.
@@ -1897,12 +1939,13 @@ pub fn inject_ready_signal(abc: &mut Abc, doc_class_local: &str) -> anyhow::Resu
     let (pkg, local) = doc_class_local.rsplit_once('.').unwrap_or(("", doc_class_local));
     let doc_ns = { let s = abc.intern_string(pkg); abc.intern_namespace(NS_PACKAGE, s) };
     let mn_main = { let s = abc.intern_string(local); abc.intern_qname(doc_ns, s) };
-    let mn_root = q(abc, pub_ns, "ROOT");            // Main.ROOT = the document instance
+    let mn_root = doc_root_qname(abc, doc_class_local); // the document's singleton of itself
     let mn_sock = q(abc, pub_ns, "peptideSock");     // the bridge socket (instance slot)
     let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
     let mn_flush = q(abc, pub_ns, "flush");
     let mn_readysent = q(abc, pub_ns, "peptideReadySent"); // one-shot guard flag
     let mn_connected = q(abc, pub_ns, "connected");        // Socket.connected (Boolean)
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);     // load reports buffered pre-connect
     let s_ready = abc.intern_string("READY\n");
 
     // one-shot flag slot on the document instance (defaults to undefined → falsy)
@@ -1955,6 +1998,32 @@ pub fn inject_ready_signal(abc: &mut Abc, doc_class_local: &str) -> anyhow::Resu
     c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); c.op_u30(OP_GETPROPERTY, mn_sock);
     c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
     c.place(l_skip);
+
+    // Then, on every tick and independent of READY, drain anything the load-error reporter
+    // buffered. Packages are opened during the boot, which is BEFORE the socket finishes
+    // connecting -- connect() returns immediately and the link only becomes writable a few
+    // event-loop turns later. A report written at the moment of failure would therefore be
+    // thrown away exactly when it matters most, so the reporter parks it on the document and
+    // this drains it the first tick the socket can actually carry it.
+    //   if (Main.ROOT != null && Main.ROOT.peptideSock != null
+    //       && Main.ROOT.peptideSock.connected && Main.ROOT.peptideLoadLog != null) {
+    //       Main.ROOT.peptideSock.writeUTFBytes(Main.ROOT.peptideLoadLog); flush();
+    //       Main.ROOT.peptideLoadLog = null;
+    //   }
+    let l_drained = c.new_label();
+    let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+    root(&mut c); c.branch(OP_IFFALSE, l_drained);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_drained);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+    c.branch(OP_IFFALSE, l_drained);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.branch(OP_IFFALSE, l_drained);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_drained);
+
     c.op(OP_POPSCOPE);
     let payload = c.finish();
 
@@ -1977,7 +2046,9 @@ pub fn inject_ready_signal(abc: &mut Abc, doc_class_local: &str) -> anyhow::Resu
 /// `char_id`/`stage_id` are the resource ids (the same ids the SPAWN verb queues). Queuing an
 /// unknown id is a safe no-op in `queueResources`. This replaces the body wholesale (the
 /// original is ~6 ops: `disclaimerMenu.show()`), so the disclaimer call simply isn't emitted.
-pub fn inject_quickboot(abc: &mut Abc, char_id: &str, stage_id: &str) -> anyhow::Result<()> {
+pub fn inject_quickboot(abc: &mut Abc, char_id: &str, stage_id: &str, prime_stage: Option<&str>)
+    -> anyhow::Result<()>
+{
     let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
     let util_ns = { let s = abc.intern_string(SSF2_NS_UTIL); abc.intern_namespace(NS_PACKAGE, s) };
     let ctrl_ns = { let s = abc.intern_string(SSF2_NS_CONTROLLERS); abc.intern_namespace(NS_PACKAGE, s) };
@@ -2009,6 +2080,15 @@ pub fn inject_quickboot(abc: &mut Abc, char_id: &str, stage_id: &str) -> anyhow:
     let mut c = Code::default();
     c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
     c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_PUSHSTRING, s_char); c.op_u30(OP_NEWARRAY, 1); c.op_u30_u30(OP_CALLPROPVOID, mn_queueres, 1);
+    // Optionally queue another package FIRST. Packages share one namespace for the layer they
+    // build on, and the first definition of a name wins for everything loaded after it. A package
+    // that carries only the shape of that layer therefore depends on a complete one having been
+    // loaded already: with one, its own stubs are discarded and it inherits the real behaviour;
+    // without one, its stubs are what everything gets.
+    if let Some(prime) = prime_stage {
+        let s_prime = abc.intern_string(prime);
+        c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_PUSHSTRING, s_prime); c.op_u30(OP_NEWARRAY, 1); c.op_u30_u30(OP_CALLPROPVOID, mn_queueres, 1);
+    }
     c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_PUSHSTRING, s_stage); c.op_u30(OP_NEWARRAY, 1); c.op_u30_u30(OP_CALLPROPVOID, mn_queueres, 1);
     c.op_u30(OP_GETLEX, mn_menuctrl); c.op_u30(OP_GETPROPERTY, mn_loadingmenu); c.op_u30_u30(OP_CALLPROPVOID, mn_show, 0);
     c.op(OP_RETURNVOID);
@@ -2155,6 +2235,7 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, char_index: u
     let mn_sock = q(abc, pub_ns, "peptideSock");
     let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
     let mn_flush = q(abc, pub_ns, "flush");
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
     let mn_rec = q(abc, pub_ns, "peptideFrameRec");
     let n_rec = abc.intern_string("peptideFrameRec");
     let pub_nsset = abc.intern_ns_set(vec![pub_ns]);
@@ -2170,6 +2251,20 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, char_index: u
     c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
     // if (this.peptideSock == null) return;  — not connected yet, nobody to push to
     c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
+
+    // Before anything else: flush whatever the error reporters buffered. They cannot write when
+    // they fire, because the failures worth reading happen during the boot while the link is
+    // still coming up, and on a fast boot the menu path that would otherwise drain them never
+    // runs. This has to sit ahead of the recorder's own guards -- those wait for a live match,
+    // and a boot that died never gets one, which is exactly when the report is needed.
+    let l_nolog = c.new_label();
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.branch(OP_IFFALSE, l_nolog);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_nolog);
     // sd = GameController.stageData; if (sd == null) return;
     c.op_u30(OP_GETLEX, mn_gc); c.op_u30(OP_GETPROPERTY, mn_stagedata); c.op_u30(OP_SETLOCAL, l_sd);
     c.op_u30(OP_GETLOCAL, l_sd); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
@@ -2193,6 +2288,7 @@ pub fn inject_frame_recorder(abc: &mut Abc, doc_class_local: &str, char_index: u
     c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
     c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
     c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+
     c.place(l_skip);
     c.op(OP_RETURNVOID);
 
@@ -2248,10 +2344,13 @@ pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Re
     let mn_loaderinfo = q(abc, pub_ns, "loaderInfo");
     let mn_ueevents = q(abc, pub_ns, "uncaughtErrorEvents");
     let mn_addel = q(abc, pub_ns, "addEventListener");
-    let mn_text = q(abc, pub_ns, "text");
-    let mn_sock = q(abc, pub_ns, "peptideSock");
-    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
-    let mn_flush = q(abc, pub_ns, "flush");
+    // `text` is only populated when what was thrown is an error EVENT; a thrown Error object
+    // leaves it empty, which is the common case and reports as a bare tag with nothing after it.
+    // The thrown object itself stringifies to the message and code, so report that and keep `text`
+    // as the suffix for the cases where it is the one carrying detail.
+    let mn_errobj = q(abc, pub_ns, "error");
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let s_blank3 = abc.intern_string("");
     let mn_h = q(abc, pub_ns, "peptideOnError");
     let n_h = abc.intern_string("peptideOnError");
     let s_tag = abc.intern_string("SCRIPTERR: ");
@@ -2261,13 +2360,27 @@ pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Re
     let mut c = Code::default();
     let l_skip = c.new_label();
     c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
-    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op(OP_PUSHNULL); c.branch(OP_IFSTRICTEQ, l_skip);
-    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock);
-    c.op_u30(OP_PUSHSTRING, s_tag);
-    c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_text); c.op(OP_CONVERT_S); c.op(OP_ADD);
+    // Buffered, not written. An error raised before the link is up would otherwise be lost, and
+    // those are the ones worth having: a boot that dies takes its own explanation with it. The
+    // per-frame recorder sends whatever has accumulated as soon as the socket can carry it.
+    c.op(OP_GETLOCAL0);
+    let l_have = c.new_label();
+    let l_joined = c.new_label();
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+    c.branch(OP_IFTRUE, l_have);
+    c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank3);
+    c.branch(OP_JUMP, l_joined);
+    c.place(l_have);
+    c.op(OP_CONVERT_S);
+    c.place(l_joined);
+    c.op_u30(OP_PUSHSTRING, s_tag); c.op(OP_ADD);
+    c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_errobj); c.op(OP_CONVERT_S); c.op(OP_ADD);
+    // Said ONCE. The thrown object already stringifies to the message; `text` is empty for
+    // anything that is not an error event, and the runtime shipped to players answers
+    // getStackTrace with the message again -- so printing all three produced the same code three
+    // times over and buried the one thing that varies.
     c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
-    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
-    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    c.op_u30(OP_SETPROPERTY, mn_loadlog);
     c.place(l_skip);
     c.op(OP_RETURNVOID);
 
@@ -2295,6 +2408,854 @@ pub fn inject_error_reporter(abc: &mut Abc, doc_class_local: &str) -> anyhow::Re
     let body = &mut abc.bodies[body_idx];
     prepend_code(body, &payload);
     body.max_stack = body.max_stack.max(4);
+    body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
+    Ok(())
+}
+
+/// Resolve the singleton the document keeps of itself.
+///
+/// It lives in a PRIVATE namespace, not the public one, and the private namespace's name is the
+/// class's own fully qualified name in `package:Class` form. A public lookup does not merely
+/// return nothing, it throws -- and inside a reporter that is disastrous, because the handler
+/// fails while handling and what reaches the log is its own error instead of the one it was
+/// watching. Every silent diagnostic in this file traced back to exactly that.
+fn doc_root_qname(abc: &mut Abc, doc_class: &str) -> u32 {
+    let (pkg, local) = doc_class.rsplit_once('.').unwrap_or(("", doc_class));
+    let private = abc.intern_string(&format!("{pkg}:{local}"));
+    let ns = abc.intern_namespace(NS_PRIVATE, private);
+    let n = abc.intern_string("ROOT");
+    abc.intern_qname(ns, n)
+}
+
+/// Resolve the document class as a package-qualified name.
+///
+/// It is NOT in the public namespace, and a lookup that assumes it is throws. That is a
+/// particularly nasty mistake inside a reporter: the handler fails while handling, so what
+/// reaches the log is the reporter's own error and the real one is never seen.
+fn doc_class_qname(abc: &mut Abc, doc_class: &str) -> u32 {
+    let (pkg, local) = doc_class.rsplit_once('.').unwrap_or(("", doc_class));
+    let p = abc.intern_string(pkg);
+    let ns = abc.intern_namespace(NS_PACKAGE, p);
+    let n = abc.intern_string(local);
+    abc.intern_qname(ns, n)
+}
+
+/// Report every package that fails to load, over the same `SCRIPTERR` channel engine errors use.
+///
+/// A malformed package does not announce itself. The game asks for a data file, the player refuses
+/// it, the failure is handled quietly, and what the author sees is a game that boots to a broken
+/// state with nothing naming the file responsible -- or, when the failure lands mid-enumeration, a
+/// game that does not come up at all. That is the single worst thing about authoring custom
+/// content: the feedback is "it didn't work", with no line to read.
+///
+/// So both of the loader's error paths get a prologue that pushes the file name and the underlying
+/// error text before the game's own handling runs. Nothing is suppressed -- the original body still
+/// executes exactly as before, and the report is skipped whenever the bridge socket is not up, so
+/// an unpatched or pre-connection load behaves as it always did.
+pub fn inject_load_error_reporter(abc: &mut Abc, doc_class: &str) -> anyhow::Result<()> {
+    let ci = abc.find_class_by_name(SSF2_RESOURCE_CLASS)
+        .ok_or_else(|| anyhow::anyhow!("{SSF2_RESOURCE_CLASS} not found"))?;
+
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    let mn_file = q(abc, pub_ns, SSF2_RESOURCE_FILE_FIELD);
+    let s_tag = abc.intern_string("SCRIPTERR: package load failed: ");
+    let s_sep = abc.intern_string(": ");
+    let s_nl = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+
+    for method_name in SSF2_RESOURCE_ERROR_METHODS {
+        let method = abc.instances[ci].traits.iter().find_map(|t| match t.data {
+            TraitKindData::Method { method, .. }
+                if abc.multiname_local(t.name).as_deref() == Some(method_name) => Some(method),
+            _ => None,
+        });
+        // Both handlers are expected, but a missing one is not worth failing a patch over: this
+        // is a diagnostic, and losing one report is better than refusing to boot.
+        let Some(method) = method else { continue };
+        let Some(body_idx) = abc.bodies.iter().position(|b| b.method == method) else { continue };
+
+        // if (Main.ROOT == null) skip;   — nothing to buffer onto yet
+        // Main.ROOT.peptideLoadLog = (Main.ROOT.peptideLoadLog || "")
+        //     + "SCRIPTERR: package load failed: " + this.<file> + ": " + arg1 + "\n";
+        //
+        // Appending rather than writing is what makes this work at all: these handlers run
+        // during the boot, before the socket is writable. The READY tick drains the buffer the
+        // moment the link is up. Every dereference is guarded so the diagnostic can never be the
+        // reason a load fails -- the original handler still runs untouched right after.
+        let mut c = Code::default();
+        let l_skip = c.new_label();
+        let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+        root(&mut c); c.branch(OP_IFFALSE, l_skip);
+
+        root(&mut c);                                   // target for the setproperty below
+        let l_have = c.new_label();
+        let l_joined = c.new_label();
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+        c.branch(OP_IFTRUE, l_have);                    // already a string: keep it
+        c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank); // first report: start from ""
+        c.branch(OP_JUMP, l_joined);
+        c.place(l_have);
+        c.op(OP_CONVERT_S);
+        c.place(l_joined);
+
+        c.op_u30(OP_PUSHSTRING, s_tag); c.op(OP_ADD);
+        c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_file); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_sep); c.op(OP_ADD);
+        c.op_u30(OP_GETLOCAL, 1); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
+        c.op_u30(OP_SETPROPERTY, mn_loadlog);
+
+        // Then send it NOW if the link is already up, rather than leaving it for the next frame.
+        // A package failing its FIRST load ends the boot: the game stops, and a report waiting on
+        // a frame that never arrives is a report nobody reads. Buffering still covers the earlier
+        // failures, when there is no link yet; this covers the ones that are about to be fatal.
+        let l_sent = c.new_label();
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_sent);
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+        c.branch(OP_IFFALSE, l_sent);
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+        c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+        root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+        root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+        c.place(l_sent);
+        c.place(l_skip);
+
+        let payload = c.finish();
+        let body = &mut abc.bodies[body_idx];
+        prepend_code(body, &payload);
+        body.max_stack = body.max_stack.max(6);
+        body.local_count = body.local_count.max(2);
+    }
+    Ok(())
+}
+
+/// Register one extra package with the engine at boot, so it can be asked for by id.
+///
+/// The id-to-file map is not built from the data directory. It comes from an obfuscated manifest
+/// carried inside the engine, which means a package the manifest does not list is never opened --
+/// no error, because nothing tried. That is a wall for anyone adding content: the file can be
+/// perfectly well formed and still be invisible.
+///
+/// The engine already registers one package by hand, ahead of the manifest-driven ones, so a
+/// hand-registered entry is a shape it fully supports rather than something forced on it. This
+/// prepends another in exactly that shape. Nothing existing is touched: no manifest is rewritten
+/// and no shipped data file is modified, so the only difference from stock is one additional entry
+/// in the pool.
+///
+/// `kind` names the resource-type constant (`"STAGE"`, `"CHARACTER"`, ...). `file` is the name as
+/// it appears in the data directory.
+pub fn inject_extra_resource(abc: &mut Abc, id: &str, file: &str, guid: &str, kind: u8)
+    -> anyhow::Result<()>
+{
+    let util_ns = { let s = abc.intern_string(SSF2_NS_UTIL); abc.intern_namespace(NS_PACKAGE, s) };
+    let ctrl_ns = { let s = abc.intern_string(SSF2_NS_CONTROLLERS); abc.intern_namespace(NS_PACKAGE, s) };
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_rm = q(abc, util_ns, "ResourceManager");
+    let mn_res = q(abc, util_ns, SSF2_RESOURCE_CLASS);
+    let mn_add = q(abc, pub_ns, "addResource");
+    let mn_pool = q(abc, pub_ns, SSF2_RESOURCE_POOL);
+    let key_nsset = abc.intern_ns_set(vec![pub_ns]);
+    let mn_key = abc.intern_multinamel(key_nsset);   // pool[<runtime key>]
+    let s_id = abc.intern_string(id);
+    let s_file = abc.intern_string(file);
+    let s_guid = abc.intern_string(guid);
+
+    // Hooked on the menu entry point, which is where the boot decides what to load. That timing is
+    // the whole point: the table already exists by then, and this runs immediately before anything
+    // is queued, so the entry is in place the first time the id is asked for.
+    //
+    // Two earlier homes both failed, in opposite ways, and the difference is worth keeping: the
+    // table's own initialiser runs while the table is still null, and the queue call is verified
+    // before the definitions it names have run, which the player rejects outright. This method is
+    // verified with the same lookups the fast-boot rewrite already uses, so it is known good.
+    let ci = abc.find_class_by_name("MenuController")
+        .ok_or_else(|| anyhow::anyhow!("MenuController not found"))?;
+    let method = abc.classes[ci].traits.iter().find_map(|t| match t.data {
+        TraitKindData::Method { method, .. }
+            if abc.multiname_local(t.name).as_deref() == Some(SSF2_MENU_ENTRY_METHOD) => Some(method),
+        _ => None,
+    }).ok_or_else(|| anyhow::anyhow!("MenuController.{SSF2_MENU_ENTRY_METHOD} not found"))?;
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for {SSF2_MENU_ENTRY_METHOD}"))?;
+    let _ = ctrl_ns;
+
+    // if (pool[<id>] != null) skip;   -- the table doubles as the one-shot guard, so this needs no
+    //                                    state of its own however often the entry point runs
+    // ResourceManager.addResource(new Resource(id, file, file, guid, <kind>));
+    //
+    // The two filename arguments are the plain and obfuscated names. Passing the same value for
+    // both means the entry resolves to the same file whichever naming a build reads.
+    let mut c = Code::default();
+    let l_skip = c.new_label();
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    // if (pool == null) skip -- indexing a table that has not been built yet throws, and a throw
+    // here escapes into the boot and stops it, which looks exactly like the package being at fault
+    c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_GETPROPERTY, mn_pool);
+    c.branch(OP_IFFALSE, l_skip);
+    c.op_u30(OP_GETLEX, mn_rm); c.op_u30(OP_GETPROPERTY, mn_pool);
+    c.op_u30(OP_PUSHSTRING, s_id); c.op_u30(OP_GETPROPERTY, mn_key);
+    c.branch(OP_IFTRUE, l_skip);
+
+    c.op_u30(OP_GETLEX, mn_rm);
+    c.op_u30(OP_FINDPROPSTRICT, mn_res);
+    c.op_u30(OP_PUSHSTRING, s_id);
+    c.op_u30(OP_PUSHSTRING, s_file);
+    c.op_u30(OP_PUSHSTRING, s_file);
+    c.op_u30(OP_PUSHSTRING, s_guid);
+    c.op(OP_PUSHBYTE); c.op(kind);
+    c.op_u30_u30(OP_CONSTRUCTPROP, mn_res, 5);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_add, 1);
+    c.place(l_skip);
+    c.op(OP_POPSCOPE);
+
+    let payload = c.finish();
+    let body = &mut abc.bodies[body_idx];
+    prepend_code(body, &payload);
+    body.max_stack = body.max_stack.max(9);
+    body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
+    Ok(())
+}
+
+/// Catch errors thrown INSIDE a package while it loads, and survive them.
+///
+/// This is the surface that matters most and the one nothing was watching. An error raised by a
+/// package's own code as it initialises is not dispatched to the application: it goes to the
+/// loader that opened it. With no listener there the runtime treats it as unhandled and ENDS THE
+/// PROCESS, which is why a malformed package reads as the game reaching its ready state and then
+/// simply disappearing, with no script error and no crash report to look at.
+///
+/// Listening turns that into a line naming the file and the error, and marking it handled keeps
+/// the game running so the next package still gets its turn. One bad package should cost its own
+/// content, not the session.
+pub fn inject_package_error_reporter(abc: &mut Abc, doc_class: &str) -> anyhow::Result<()> {
+    let ci = abc.find_class_by_name(SSF2_RESOURCE_CLASS)
+        .ok_or_else(|| anyhow::anyhow!("{SSF2_RESOURCE_CLASS} not found"))?;
+    let events_ns = { let s = abc.intern_string("flash.events"); abc.intern_namespace(NS_PACKAGE, s) };
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+
+    let mn_uee = q(abc, events_ns, "UncaughtErrorEvent");
+    let mn_uncaught = q(abc, pub_ns, "UNCAUGHT_ERROR");
+    let mn_cli = q(abc, pub_ns, "contentLoaderInfo");
+    let mn_ueevents = q(abc, pub_ns, "uncaughtErrorEvents");
+    let mn_addel = q(abc, pub_ns, "addEventListener");
+    let mn_prevent = q(abc, pub_ns, "preventDefault");
+    let mn_errobj = q(abc, pub_ns, "error");
+    let mn_loader = q(abc, pub_ns, SSF2_RESOURCE_LOADER_FIELD);
+    let mn_file = q(abc, pub_ns, SSF2_RESOURCE_FILE_FIELD);
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    let mn_h = q(abc, pub_ns, "peptideOnPackageError");
+    let n_h = abc.intern_string("peptideOnPackageError");
+    let s_tag = abc.intern_string("SCRIPTERR: package threw while loading: ");
+    let s_sep = abc.intern_string(": ");
+    let s_nl = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+
+    // handler(e): mark handled so the runtime does not end the process, then record which package
+    // it was and what it threw. Recording second is deliberate -- if anything below were to fail,
+    // the game has already been kept alive.
+    let mut c = Code::default();
+    let l_skip = c.new_label();
+    let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    c.op_u30(OP_GETLOCAL, 1); c.op_u30_u30(OP_CALLPROPVOID, mn_prevent, 0);
+
+    root(&mut c); c.branch(OP_IFFALSE, l_skip);
+    root(&mut c);
+    let l_have = c.new_label();
+    let l_joined = c.new_label();
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+    c.branch(OP_IFTRUE, l_have);
+    c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank);
+    c.branch(OP_JUMP, l_joined);
+    c.place(l_have);
+    c.op(OP_CONVERT_S);
+    c.place(l_joined);
+    c.op_u30(OP_PUSHSTRING, s_tag); c.op(OP_ADD);
+    c.op(OP_GETLOCAL0); c.op_u30(OP_GETPROPERTY, mn_file); c.op(OP_CONVERT_S); c.op(OP_ADD);
+    c.op_u30(OP_PUSHSTRING, s_sep); c.op(OP_ADD);
+    c.op_u30(OP_GETLOCAL, 1); c.op_u30(OP_GETPROPERTY, mn_errobj); c.op(OP_CONVERT_S); c.op(OP_ADD);
+    c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
+    c.op_u30(OP_SETPROPERTY, mn_loadlog);
+
+    // send it now if the link allows; a package that kills the boot leaves no later chance
+    let l_sent = c.new_label();
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+    c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_sent);
+    c.place(l_skip);
+    c.op(OP_RETURNVOID);
+
+    let h = abc.add_method(MethodInfo {
+        param_types: vec![0], return_type: 0, name: n_h, flags: 0, options: vec![], param_names: vec![],
+    });
+    abc.add_body(MethodBody {
+        method: h, max_stack: 7, local_count: 3, init_scope_depth: 0, max_scope_depth: 2,
+        code: c.finish(), exceptions: vec![], traits: vec![],
+    });
+    abc.add_instance_method_trait(ci, mn_h, h);
+
+    // Attached where the load STARTS rather than in the constructor, because the loader has to
+    // exist before it can be listened to.
+    let method = abc.instances[ci].traits.iter().find_map(|t| match t.data {
+        TraitKindData::Method { method, .. }
+            if abc.multiname_local(t.name).as_deref() == Some(SSF2_RESOURCE_LOAD_METHOD) => Some(method),
+        _ => None,
+    }).ok_or_else(|| anyhow::anyhow!("{SSF2_RESOURCE_CLASS}.{SSF2_RESOURCE_LOAD_METHOD} not found"))?;
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for {SSF2_RESOURCE_LOAD_METHOD}"))?;
+
+    let mut ic = Code::default();
+    let l_noloader = ic.new_label();
+    ic.op(OP_GETLOCAL0); ic.op(OP_PUSHSCOPE);
+    // Through the public accessor, NOT the field behind it. The field is private, and a public
+    // lookup of a private name throws rather than returning nothing -- which, prepended to the
+    // method that starts every load, meant the first load threw and the queue never advanced. The
+    // symptom was a loading screen that spun forever and then reported failure at the end.
+    ic.op(OP_GETLOCAL0); ic.op_u30_u30(OP_CALLPROPERTY, mn_loader, 0); ic.branch(OP_IFFALSE, l_noloader);
+    ic.op(OP_GETLOCAL0); ic.op_u30_u30(OP_CALLPROPERTY, mn_loader, 0);
+    ic.op_u30(OP_GETPROPERTY, mn_cli); ic.op_u30(OP_GETPROPERTY, mn_ueevents);
+    ic.op_u30(OP_GETLEX, mn_uee); ic.op_u30(OP_GETPROPERTY, mn_uncaught);
+    ic.op(OP_GETLOCAL0); ic.op_u30(OP_GETPROPERTY, mn_h);
+    ic.op_u30_u30(OP_CALLPROPVOID, mn_addel, 2);
+    ic.place(l_noloader);
+    ic.op(OP_POPSCOPE);
+
+    let payload = ic.finish();
+    let body = &mut abc.bodies[body_idx];
+    prepend_code(body, &payload);
+    body.max_stack = body.max_stack.max(5);
+    body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
+    Ok(())
+}
+
+/// Name the stage part a package is missing, before the game trips over it.
+///
+/// A stage clip has a required shape, and the game walks it by name without checking as it goes.
+/// Miss one and what surfaces is a type error with no property, no file and no line -- the author
+/// is told something was undefined, not that their stage has no `foreground`. That is close to
+/// useless when the whole problem is that the clip tree has to be built a particular way and
+/// nothing says so.
+///
+/// So check the tree at the point the package is validated, and report each missing part BY NAME
+/// while there is still context to report it with. The game's own behaviour is untouched: this
+/// only reads, and it reads before the walk that would fail.
+pub fn inject_stage_shape_check(abc: &mut Abc, doc_class: &str) -> anyhow::Result<()> {
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    let mn_mc = q(abc, pub_ns, "MC");
+    let mn_id = q(abc, pub_ns, "ID");
+    let mn_type = q(abc, pub_ns, "Type");
+    let mn_stagemc = q(abc, pub_ns, SSF2_STAGE_CLIP);
+    let s_pre = abc.intern_string("SCRIPTERR: stage '");
+    let s_mid = abc.intern_string("' is missing a required part: ");
+    let s_nl = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+    let parts: Vec<(u32, u32)> = SSF2_STAGE_PARTS.iter()
+        .map(|n| (q(abc, pub_ns, n), abc.intern_string(n)))
+        .collect();
+    let mn_clip = q(abc, pub_ns, SSF2_STAGE_CLIP);
+    let s_clip = abc.intern_string(SSF2_STAGE_CLIP);
+
+    let ci = abc.find_class_by_name("ResourceManager")
+        .ok_or_else(|| anyhow::anyhow!("ResourceManager not found"))?;
+    let method = abc.classes[ci].traits.iter().find_map(|t| match t.data {
+        TraitKindData::Method { method, .. }
+            if abc.multiname_local(t.name).as_deref() == Some("validateResource") => Some(method),
+        _ => None,
+    }).ok_or_else(|| anyhow::anyhow!("ResourceManager.validateResource not found"))?;
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for validateResource"))?;
+    let base_local = abc.bodies[body_idx].local_count.max(2);
+    let (l_res, l_clip) = (base_local, base_local + 1);
+
+    let mut c = Code::default();
+    let l_done = c.new_label();
+    let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    root(&mut c); c.branch(OP_IFFALSE, l_done);           // nowhere to report to yet
+    c.op_u30(OP_GETLOCAL, 1); c.op(OP_DUP); c.op_u30(OP_SETLOCAL, l_res);
+    c.branch(OP_IFFALSE, l_done);
+    // stages only; a character or a sound has no clip tree to check
+    c.op_u30(OP_GETLOCAL, l_res); c.op_u30(OP_GETPROPERTY, mn_type);
+    c.op(OP_PUSHBYTE); c.op(SSF2_RESOURCE_TYPE_STAGE); c.branch(OP_IFNE, l_done);
+    c.op_u30(OP_GETLOCAL, l_res); c.op_u30(OP_GETPROPERTY, mn_mc); c.op(OP_DUP);
+    c.branch(OP_IFFALSE, l_done);
+    c.op_u30(OP_GETPROPERTY, mn_stagemc); c.op(OP_DUP); c.op_u30(OP_SETLOCAL, l_clip);
+
+    // One report per missing name. `report` leaves the log longer by one line; the flush at the
+    // end sends whatever accumulated, so a stage missing three parts says so three times rather
+    // than making the author fix one and run again.
+    let report = |c: &mut Code, name_str: u32| {
+        let l_have = c.new_label();
+        let l_joined = c.new_label();
+        root(c);
+        root(c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+        c.branch(OP_IFTRUE, l_have);
+        c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank);
+        c.branch(OP_JUMP, l_joined);
+        c.place(l_have);
+        c.op(OP_CONVERT_S);
+        c.place(l_joined);
+        c.op_u30(OP_PUSHSTRING, s_pre); c.op(OP_ADD);
+        c.op_u30(OP_GETLOCAL, l_res); c.op_u30(OP_GETPROPERTY, mn_id); c.op(OP_CONVERT_S); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_mid); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, name_str); c.op(OP_ADD);
+        c.op_u30(OP_PUSHSTRING, s_nl); c.op(OP_ADD);
+        c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    };
+
+    // no stage clip at all: say that and stop, since there is nothing left to look inside
+    let l_haveclip = c.new_label();
+    c.branch(OP_IFTRUE, l_haveclip);
+    report(&mut c, s_clip);
+    c.branch(OP_JUMP, l_done);
+    c.place(l_haveclip);
+    let _ = mn_clip;
+
+    for (mn_part, s_part) in &parts {
+        let l_ok = c.new_label();
+        c.op_u30(OP_GETLOCAL, l_clip); c.op_u30(OP_GETPROPERTY, *mn_part);
+        c.branch(OP_IFTRUE, l_ok);
+        report(&mut c, *s_part);
+        c.place(l_ok);
+    }
+    c.place(l_done);
+
+    // send whatever was found straight away: the walk that fails comes next
+    let l_sent = c.new_label();
+    root(&mut c); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+    c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_sent);
+    c.op(OP_POPSCOPE);
+
+    // Everything above is wrapped in a catch-all, and that is what makes it safe to run at all.
+    // This code reads a resource WHILE the game is validating it, which is the one moment it must
+    // not misbehave: an error escaping here does not just lose the report, it takes the load
+    // itself down, and the queue stops with a loading screen spinning behind it. Every read is
+    // guarded already; the handler is for the ones that turn out not to be. Whatever happens, the
+    // game's own validation runs next exactly as it would have.
+    let l_end = c.new_label();
+    c.branch(OP_JUMP, l_end);
+    let handler_at = c.len();
+    c.op(OP_POP);                 // discard whatever was thrown and fall into the original body
+    c.place(l_end);
+
+    let payload = c.finish();
+    let body = &mut abc.bodies[body_idx];
+    prepend_code(body, &payload);
+    body.exceptions.push(Exception {
+        from: 0, to: handler_at as u32, target: handler_at as u32,
+        exc_type: 0, var_name: 0,   // catch anything, bind it to nothing
+    });
+    body.max_stack = body.max_stack.max(8);
+    body.local_count = body.local_count.max(l_clip + 1);
+    body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
+    Ok(())
+}
+
+
+/// The source file and first line a method was compiled from, read out of the debug instructions
+/// the compiler left in its bytecode (`debugfile` carries the path, `debugline` the line).
+/// Absent from a stripped build, in which case there is simply nothing to say.
+fn source_location(abc: &Abc, code: &[u8]) -> Option<(String, u32)> {
+    let (mut file, mut line) = (None, None);
+    let mut i = 0usize;
+    while i < code.len() && (file.is_none() || line.is_none()) {
+        let op = code[i]; i += 1;
+        let (n30, fixed) = operand_shape(op);
+        let mut first = None;
+        for k in 0..n30 {
+            let (mut v, mut sh) = (0u32, 0u32);
+            for _ in 0..5 {
+                if i >= code.len() { break }
+                let b = code[i]; i += 1;
+                v |= ((b & 0x7f) as u32) << sh;
+                if b & 0x80 == 0 { break }
+                sh += 7;
+            }
+            if k == 0 { first = Some(v); }
+        }
+        i += fixed;
+        match op {
+            0xf1 => file = first.and_then(|f| abc.strings.get(f as usize - 1).cloned()),
+            0xf0 => line = first,
+            _ => {}
+        }
+    }
+    let f = file?;
+    // the compiler writes a full authoring path; only the file itself means anything to a reader
+    let short = f.rsplit([';', '\\', '/']).next().unwrap_or(&f).to_string();
+    Some((short, line?))
+}
+
+/// (u30 operand count, trailing fixed bytes) per opcode. Getting one entry wrong walks the rest of
+/// a method at the wrong offset, which reads as plausible nonsense rather than as an error.
+fn operand_shape(op: u8) -> (usize, usize) {
+    match op {
+        0x04|0x05|0x06|0x08|0x25|0x2c|0x2d|0x2e|0x2f|0x31|0x40|0x41|0x42|0x49|0x53|0x55|0x56|0x58
+        |0x59|0x5a|0x5d|0x5e|0x5f|0x60|0x61|0x62|0x63|0x66|0x68|0x6a|0x6c|0x6d|0x6e|0x6f|0x80|0x86
+        |0x92|0x94|0xb2|0xc2|0xc3|0xf0|0xf1|0xf2 => (1, 0),
+        0x32|0x43|0x44|0x45|0x46|0x4a|0x4c|0x4e|0x4f => (2, 0),
+        0x24|0x65 => (0, 1),
+        0x0c..=0x1a => (0, 3),
+        0xef => (3, 2),
+        _ => (0, 0),
+    }
+}
+
+/// Attribute a thrown error to the place it came from, and let it carry on.
+///
+/// The runtime shipped to players strips line information out of errors, so what surfaces is a
+/// bare code with no property, file or line -- which is the single most useless form an error can
+/// take. The bytecode, though, still carries the file and line it was compiled from. So instead of
+/// asking the error where it came from, wrap the method and let the METHOD say: anything thrown
+/// inside it is reported against its own source location and then rethrown untouched, so the game
+/// behaves exactly as it would have and the log gains the one fact it was missing.
+/// Stands in for the error message inside a report, so the place it happened and the reason it
+/// happened can sit either side of it without assembling the line in pieces at runtime.
+const MARKER: &str = "\u{1}";
+
+/// What a failure at a given place in the engine actually MEANS for the package that caused it.
+///
+/// Each of these was paid for once. The engine reports a type error or a null read from deep
+/// inside its own code, with nothing naming the package or the mistake; the mapping from "it threw
+/// here" to "your stage is built wrong in this specific way" is the expensive part, and there is no
+/// reason for the next person to buy it again. Anything not listed still reports its file and line,
+/// which is the raw material for adding a line here.
+const PACKAGE_FAULT_HINTS: &[(&str, u32, &str)] = &[
+    ("StageData.as", 409,
+     "a boundary is a CLIP, not a shape. wrap deathBoundary/camBoundary in their own sprites"),
+    ("StageData.as", 410,
+     "the smash ball boundary is a CLIP, not a shape"),
+    ("StageData.as", 411,
+     "the blast boundary is a CLIP, not a shape"),
+    ("ResourceManager.as", 659,
+     "initAPI must RETURN the class carrying BASE_CLASSES; returning nothing reads the map off null"),
+    ("ResourceManager.as", 662,
+     "initAPI must RETURN the class carrying BASE_CLASSES; returning nothing reads the map off null"),
+    ("GameController.as", 258,
+     "getProp(\"stage\") must return a CLASS. check the package registered its stage class"),
+    ("GameController.as", 150,
+     "the stage clip is missing: the game looks for a clip linked as stage_<id>"),
+];
+
+/// The explanation for a failure at this file and line, if one is known.
+fn fault_hint(file: &str, line: u32) -> Option<&'static str> {
+    PACKAGE_FAULT_HINTS.iter()
+        .find(|(f, l, _)| *l == line && file == *f)
+        .map(|(_, _, why)| *why)
+}
+
+pub fn inject_error_locator(abc: &mut Abc, doc_class: &str, class_local: &str, method_name: &str,
+    is_static: bool) -> anyhow::Result<()>
+{
+    let ci = abc.find_class_by_name(class_local)
+        .ok_or_else(|| anyhow::anyhow!("class {class_local} not found"))?;
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    let mn_lasterr = q(abc, pub_ns, PEPTIDE_LAST_ERR);
+
+    let method = if method_name == "<ctor>" {
+        abc.instances[ci].iinit
+    } else {
+        let traits = if is_static { &abc.classes[ci].traits } else { &abc.instances[ci].traits };
+        traits.iter().find_map(|t| match t.data {
+            TraitKindData::Method { method, .. }
+                if abc.multiname_local(t.name).as_deref() == Some(method_name) => Some(method),
+            _ => None,
+        }).ok_or_else(|| anyhow::anyhow!("{class_local}.{method_name} not found"))?
+    };
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for {class_local}.{method_name}"))?;
+
+    // One handler per LINE, not one per method. The compiler left a `debugline` marker at the
+    // start of every statement, so the body is already carved into regions of known line; a
+    // handler scoped to each reports the line it covers. That is how a runtime with its line
+    // information stripped can still be made to say line 219, rather than "somewhere in here".
+    let (file, regions) = {
+        let b = &abc.bodies[body_idx];
+        (source_location(abc, &b.code).map(|(f, _)| f), line_regions(&b.code))
+    };
+    let (Some(file), false) = (file, regions.is_empty()) else { return Ok(()) };
+
+    let s_nl = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+    let s_marker = abc.intern_string(MARKER);
+    let mn_replace = q(abc, pub_ns, "replace");
+    let err_local = abc.bodies[body_idx].local_count.max(1);
+    // The file already names the class, so naming it again earns nothing. `file:line method` says
+    // where and what, once each.
+    let tags: Vec<(u32, u32, u32)> = regions.iter().map(|(from, to, line)| {
+        let why = fault_hint(&file, *line).map(|w| format!("\n      {w}")).unwrap_or_default();
+        // the message goes between the two, so the hint is emitted as a suffix the handler appends
+        let t = abc.intern_string(&format!("SCRIPTERR: {file}:{line} {method_name}: {MARKER}{why}"));
+        (*from, *to, t)
+    }).collect();
+
+    let mut handlers: Vec<(u32, u32, u32)> = Vec::new();
+    let mut appended: Vec<u8> = Vec::new();
+    let base = abc.bodies[body_idx].code.len() as u32;
+    for (from, to, s_tag) in &tags {
+        let at = base + appended.len() as u32;
+        let mut h = Code::default();
+        let l_skip = h.new_label();
+        let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+        // Park the thrown object in a local. Juggling it on the stack while building a string
+        // around it is how you end up appending the message to itself.
+        h.op_u30(OP_SETLOCAL, err_local);
+        root(&mut h); h.branch(OP_IFFALSE, l_skip);
+        // Report each error ONCE, at the innermost place that saw it. An error passes through
+        // every frame on its way out, and a line per frame is the same failure restated from
+        // further and further away -- the first one is the only one that says where it happened,
+        // and in a small console the rest just push it off the top.
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_lasterr);
+        h.op_u30(OP_GETLOCAL, err_local); h.branch(OP_IFSTRICTEQ, l_skip);
+        root(&mut h); h.op_u30(OP_GETLOCAL, err_local); h.op_u30(OP_SETPROPERTY, mn_lasterr);
+        root(&mut h);
+        let l_have = h.new_label();
+        let l_joined = h.new_label();
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_loadlog); h.op(OP_DUP);
+        h.branch(OP_IFTRUE, l_have);
+        h.op(OP_POP); h.op_u30(OP_PUSHSTRING, s_blank);
+        h.branch(OP_JUMP, l_joined);
+        h.place(l_have);
+        h.op(OP_CONVERT_S);
+        h.place(l_joined);
+        // The tag carries a marker where the message belongs, so "where" and "why" can sit on
+        // either side of "what" without building the string in three separate pieces here.
+        h.op_u30(OP_PUSHSTRING, *s_tag);
+        h.op_u30(OP_PUSHSTRING, s_marker);
+        h.op_u30(OP_GETLOCAL, err_local); h.op(OP_CONVERT_S);
+        h.op_u30_u30(OP_CALLPROPERTY, mn_replace, 2);
+        h.op(OP_ADD);
+        h.op_u30(OP_PUSHSTRING, s_nl); h.op(OP_ADD);
+        h.op_u30(OP_SETPROPERTY, mn_loadlog);
+        // send at once: whatever threw here may well stop the frame that would otherwise drain it
+        let l_sent = h.new_label();
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_sock); h.branch(OP_IFFALSE, l_sent);
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_sock); h.op_u30(OP_GETPROPERTY, mn_connected);
+        h.branch(OP_IFFALSE, l_sent);
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_sock);
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_loadlog);
+        h.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+        root(&mut h); h.op_u30(OP_GETPROPERTY, mn_sock); h.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+        root(&mut h); h.op(OP_PUSHNULL); h.op_u30(OP_SETPROPERTY, mn_loadlog);
+        h.place(l_sent);
+        h.place(l_skip);
+        // rethrow untouched, so nothing downstream can tell this was here
+        h.op_u30(OP_GETLOCAL, err_local); h.op(OP_THROW);
+        appended.extend_from_slice(&h.finish());
+        handlers.push((*from, *to, at));
+    }
+
+    let body = &mut abc.bodies[body_idx];
+    body.code.extend_from_slice(&appended);
+    for (from, to, at) in handlers {
+        body.exceptions.push(Exception { from, to, target: at, exc_type: 0, var_name: 0 });
+    }
+    body.max_stack = body.max_stack.max(8);
+    body.local_count = body.local_count.max(err_local + 1);
+    Ok(())
+}
+
+/// Carve a method into (from, to, line) regions using the `debugline` markers the compiler left at
+/// the start of each statement. Capped: a handler per line on a very large method costs bytes for
+/// diminishing return.
+fn line_regions(code: &[u8]) -> Vec<(u32, u32, u32)> {
+    let mut marks: Vec<(u32, u32)> = Vec::new();
+    let mut i = 0usize;
+    while i < code.len() {
+        let at = i as u32;
+        let op = code[i]; i += 1;
+        let (n30, fixed) = operand_shape(op);
+        let mut first = None;
+        for k in 0..n30 {
+            let (mut v, mut sh) = (0u32, 0u32);
+            for _ in 0..5 {
+                if i >= code.len() { break }
+                let b = code[i]; i += 1;
+                v |= ((b & 0x7f) as u32) << sh;
+                if b & 0x80 == 0 { break }
+                sh += 7;
+            }
+            if k == 0 { first = Some(v); }
+        }
+        i += fixed;
+        if op == 0xf0 { if let Some(l) = first { marks.push((at, l)); } }
+        if marks.len() > 250 { break }
+    }
+    let end = code.len() as u32;
+    marks.iter().enumerate()
+        .map(|(n, (at, line))| (*at, marks.get(n + 1).map(|(a, _)| *a).unwrap_or(end), *line))
+        .filter(|(f, t, _)| t > f)
+        .collect()
+}
+
+/// Report every time a named method is entered, over the same channel the errors use.
+///
+/// When a package is refused, the message alone rarely says WHERE: the runtime shipped to players
+/// omits the detail, so an error reads as a bare code with no property, file or line. Knowing how
+/// far the engine got before it threw is the next best thing and is usually enough -- the last
+/// method to report is the one to read.
+///
+/// Deliberately blunt. It is a probe for triaging one bad package, not something to leave on.
+pub fn inject_method_probe(abc: &mut Abc, doc_class: &str, class_local: &str, method_name: &str, is_static: bool, subject: Option<&str>)
+    -> anyhow::Result<()>
+{
+    let ci = abc.find_class_by_name(class_local)
+        .ok_or_else(|| anyhow::anyhow!("class {class_local} not found"))?;
+    let pub_ns = { let s = abc.intern_string(""); abc.intern_namespace(NS_PACKAGE, s) };
+    let q = |abc: &mut Abc, ns: u32, nm: &str| { let s = abc.intern_string(nm); abc.intern_qname(ns, s) };
+    let mn_main = doc_class_qname(abc, doc_class);
+    let mn_root = doc_root_qname(abc, doc_class);
+    let mn_loadlog = q(abc, pub_ns, PEPTIDE_LOAD_LOG);
+    let mn_sock = q(abc, pub_ns, "peptideSock");
+    let mn_connected = q(abc, pub_ns, "connected");
+    let mn_writeutf = q(abc, pub_ns, "writeUTFBytes");
+    let mn_flush = q(abc, pub_ns, "flush");
+    // The bytecode carries the file and line it was compiled from. The runtime will not tell us
+    // where an error came from, but a probe can say where it IS -- and "the last place reached
+    // was this file at this line" is the same answer arrived at from the other side.
+    let s_nl2 = abc.intern_string("\n");
+    let s_blank = abc.intern_string("");
+
+    // A constructor is not a trait, so it cannot be found by name like everything else -- and it
+    // is often exactly where a failure lands, since that is where an object is wired up.
+    let method = if method_name == "<ctor>" {
+        abc.instances[ci].iinit
+    } else {
+        let traits = if is_static { &abc.classes[ci].traits } else { &abc.instances[ci].traits };
+        traits.iter().find_map(|t| match t.data {
+            TraitKindData::Method { method, .. }
+                if abc.multiname_local(t.name).as_deref() == Some(method_name) => Some(method),
+            _ => None,
+        }).ok_or_else(|| anyhow::anyhow!("{class_local}.{method_name} not found"))?
+    };
+    let body_idx = abc.bodies.iter().position(|b| b.method == method)
+        .ok_or_else(|| anyhow::anyhow!("no body for {class_local}.{method_name}"))?;
+
+    let s_tag = {
+        let body = abc.bodies.iter().find(|b| b.method == method);
+        let at = body.and_then(|b| source_location(abc, &b.code))
+            .map(|(f, l)| format!(" ({f}:{l})")).unwrap_or_default();
+        abc.intern_string(&format!("SCRIPTERR: reached {class_local}.{method_name}{at} "))
+    };
+
+    let mut c = Code::default();
+    let l_skip = c.new_label();
+    let root = |c: &mut Code| { c.op_u30(OP_GETLEX, mn_main); c.op_u30(OP_GETPROPERTY, mn_root); };
+    c.op(OP_GETLOCAL0); c.op(OP_PUSHSCOPE);
+    root(&mut c); c.branch(OP_IFFALSE, l_skip);
+    root(&mut c);
+    let l_have = c.new_label();
+    let l_joined = c.new_label();
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog); c.op(OP_DUP);
+    c.branch(OP_IFTRUE, l_have);
+    c.op(OP_POP); c.op_u30(OP_PUSHSTRING, s_blank);
+    c.branch(OP_JUMP, l_joined);
+    c.place(l_have);
+    c.op(OP_CONVERT_S);
+    c.place(l_joined);
+    c.op_u30(OP_PUSHSTRING, s_tag); c.op(OP_ADD);
+    // Optionally say WHICH subject, read through a public accessor. "a load started" is not
+    // actionable when thirty are in flight; "this one started and never finished" is.
+    if let Some(g) = subject {
+        // Several subjects, `|` separated, each a dotted path. Correlating two facts in one line
+        // is usually the whole job: "which resource" next to "what it exposes" answers a question
+        // that either alone only narrows.
+        let s_bar = abc.intern_string(" | ");
+        for (n, part) in g.split('|').enumerate() {
+            if n > 0 { c.op_u30(OP_PUSHSTRING, s_bar); c.op(OP_ADD); }
+            // an instance method describes itself; a static one describes what it was handed
+            if is_static { c.op_u30(OP_GETLOCAL, 1); } else { c.op(OP_GETLOCAL0); }
+            // "*" means the subject IS the argument rather than a property of it
+            if part != "*" {
+                for hop in part.split('.') {
+                    let mn_g = q(abc, pub_ns, hop);
+                    c.op_u30(OP_GETPROPERTY, mn_g);
+                }
+            }
+            c.op(OP_CONVERT_S); c.op(OP_ADD);
+        }
+    }
+    c.op_u30(OP_PUSHSTRING, s_nl2); c.op(OP_ADD);
+    c.op_u30(OP_SETPROPERTY, mn_loadlog);
+
+    let l_sent = c.new_label();
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30(OP_GETPROPERTY, mn_connected);
+    c.branch(OP_IFFALSE, l_sent);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_loadlog);
+    c.op_u30_u30(OP_CALLPROPVOID, mn_writeutf, 1);
+    root(&mut c); c.op_u30(OP_GETPROPERTY, mn_sock); c.op_u30_u30(OP_CALLPROPVOID, mn_flush, 0);
+    root(&mut c); c.op(OP_PUSHNULL); c.op_u30(OP_SETPROPERTY, mn_loadlog);
+    c.place(l_sent);
+    c.place(l_skip);
+    c.op(OP_POPSCOPE);
+
+    // A probe must never be the reason something breaks. Reading a subject can throw -- following
+    // a path into an object that does not have it is exactly the situation being investigated --
+    // so anything thrown here is dropped and the method carries on as though the probe were not
+    // there.
+    let l_end = c.new_label();
+    c.branch(OP_JUMP, l_end);
+    let handler_at = c.len();
+    c.op(OP_POP);
+    c.place(l_end);
+
+    let payload = c.finish();
+    let body = &mut abc.bodies[body_idx];
+    prepend_code(body, &payload);
+    body.exceptions.push(Exception {
+        from: 0, to: handler_at as u32, target: handler_at as u32, exc_type: 0, var_name: 0,
+    });
+    body.max_stack = body.max_stack.max(6);
     body.max_scope_depth = body.max_scope_depth.max(body.init_scope_depth + 1).max(2);
     Ok(())
 }

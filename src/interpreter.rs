@@ -275,6 +275,7 @@ pub struct MatchSettings {
     pub start_stamina: i32,  // starting stamina/HP (when using_stamina)
     pub size_ratio: f64,     // character size multiplier
     pub item_frequency: i32, // item spawn frequency (0 = items off)
+    pub hazards: bool,       // stage hazards on/off (both engines ask; stages decide what it means)
 }
 
 impl Default for MatchSettings {
@@ -289,6 +290,10 @@ impl Default for MatchSettings {
             start_stamina: 150,
             size_ratio: 1.0,
             item_frequency: 0,
+            // ON, matching both games' own default. A converted stage reads this switch and goes
+            // quiet when it's off, so defaulting it off would hide every ported hazard from the
+            // harness that exists to check them.
+            hazards: true,
         }
     }
 }
@@ -320,6 +325,7 @@ pub fn parse_match_settings(text: &str) -> MatchSettings {
                 "start_stamina" => if let Ok(n) = v.parse() { s.start_stamina = n; },
                 "size_ratio" => if let Ok(n) = v.parse() { s.size_ratio = n; },
                 "item_frequency" => if let Ok(n) = v.parse() { s.item_frequency = n; },
+                "hazards" => if let Some(x) = b(v) { s.hazards = x; },
                 _ => {}
             }
         }

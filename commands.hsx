@@ -10,12 +10,20 @@
 // live match/character context (a character script gets `self`; we are not one), so the
 // only job of commands.hsx is to expose that context. Everything else, a user writes as
 // plain hscript through `e`:
-//     match.getCharacters()[0].getStateName()
-//     match.getCharacters()[0].toState(CState.SPECIAL_NEUTRAL)
+//     p0.getStateName()                     entity-level: state, body, damage, everything
+//     p0.toState(CState.SPECIAL_NEUTRAL)
 //
 // Bound PER-EVAL by the eval hook (so these read live state at call time):
+//   match, camera, stage, self = the SANDBOX, exactly what a content script is handed. `e` runs
+//                in a live content interpreter (borrowed from the stage's own script runner), so
+//                anything a converted script can call, `e` can call: match.getCamera().getX(),
+//                match.getMatchSettingsConfig().hazards, and so on. Peptide's own names below are
+//                additive, so engine-level access content never gets is available in the same
+//                breath.
 //   p0, p1     = the match's characters (FraymakersCharacter); plumbing for getCharacters().
-//                Prefer match.getCharacters()[i] over p0 — explicit, no hidden target.
+//                Use p0..p3 (or the bare getCharacters()) for ENTITY-level access. `match` is
+//                the content api now, so match.getCharacters() hands back CharacterApi objects
+//                with the script surface, not entities: no getStateName/body/damage on those.
 //   CState, HitboxStats, Assist, MatchModifier, … = the engine script API (applyInterpreterGlobals).
 //   __td       = Tildebugger statics, for the Engine.log facade.
 
@@ -29,7 +37,7 @@ log = function(msg) { __td.log("" + msg, null, null); return "logged: " + msg; }
 // The live character list, as a NATIVE hscript array. (The raw pxf.core.Match.characters
 // ArrayObj has no usable RTTI — .length/Std.string on it return garbage — so we build a
 // fresh array from the per-eval-bound characters.) Returning an Array lets callers chain:
-// match.getCharacters()[0].getStateName(), match.getCharacters().length. p1..p3 are null
+// p0.getStateName(), getCharacters().length. p1..p3 are null
 // until the match actually has that many players (1-4 supported).
 getCharacters = function() {
   var a = [];
@@ -40,13 +48,40 @@ getCharacters = function() {
   return a;
 };
 
-// `match` facade — pxf.core.Match has no RTTI, so we expose the useful bits over the
-// reliable bound values instead of the raw object. This is the primary way to reach the
-// live characters and run any of their methods/fields.
-match = {
+// `match` facade — the fallback for when there is no live content interpreter to borrow.
+// When Peptide can borrow one (see main.rs), `match` is already the REAL MatchApi the running
+// content was handed, and it must NOT be overwritten: the stage script is still using it, and
+// replacing it with this facade breaks the stage mid-match (its own getCamera call goes null).
+// So the facade is only installed when nothing else has set `match`. Peptide sets it to null
+// on the fallback path so this test can be made without throwing on an unset name.
+matchFacade = {
   getCharacters: function() { return getCharacters(); },
   getCharacter: function(i) { return getCharacters()[i]; },
   characterCount: function() { return getCharacters().length; }
+};
+if (match == null) match = matchFacade;
+
+// animFeed(i) — one character's live ANIMATION CLOCK, the thing anything frame-accurate has
+// to be driven off. Returns "<anim>|<frame>|<total>|<x>|<y>|<state>", or "" when that
+// character doesn't exist. `frame`/`total` are what make waiting real: the host can tell a
+// playing animation from a finished one from a looping one, instead of sleeping some number
+// of milliseconds and hoping. SSF2 answers the same shape from its own display list
+// (ssf2_target::char_anim), so a frame-driven test reads identically on both engines.
+animFeed = function(i) {
+  var c = getCharacters()[i];
+  if (c == null) return "";
+  var a  = (c.animation != null) ? c.animation : null;
+  var an = (a != null && a.currentAnimation != null) ? a.currentAnimation : "?";
+  var fr = (a != null && a.currentFrame != null) ? a.currentFrame : -1;
+  var tt = (a != null && a.totalFrames != null) ? a.totalFrames : -1;
+  var b  = (c.body != null) ? c.body : null;
+  var x  = (b != null && b.x != null) ? b.x : 0;
+  var y  = (b != null && b.y != null) ? b.y : 0;
+  // NO try/catch here: the engine's hscript rejects it, and a parse error in this file
+  // takes out EVERY helper (matchStatus, getCharacters, the lot) with no error of its
+  // own — the symptom is `e` silently returning nothing. Null-guard instead.
+  var st = c.getStateName();
+  return an + "|" + fr + "|" + tt + "|" + x + "|" + y + "|" + st;
 };
 
 // animFeed(i) — one character's live ANIMATION CLOCK, the thing anything frame-accurate has

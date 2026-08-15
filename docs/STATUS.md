@@ -126,6 +126,220 @@ dimensions below are the rest.
   startup/active/recovery. the live half is the `record`/`trace` frame recorder (both
   engines push per-frame telemetry); it confirms the emitted lengths actually play that
   way, on a sample rather than the whole roster.
+- **a frame whose code ends the move is no longer emitted** (fixed). the two engines run a
+  frame's code on opposite sides of drawing it: SSF2 runs it FIRST, so a frame carrying
+  `endAttack` hands control away before anything is drawn and never appears; Fraymakers runs it
+  AFTER, so emitting that frame showed a pose the original never displayed and the move ran one
+  source frame long. the trim happens before any layer is built, because an animation's length is
+  its LONGEST layer -- trimming only the images left the labels at the old length and the
+  animation exactly as long as before, just inconsistent.
+
+  ONLY an explicit `endAttack` counts. a `gotoAndStop` is as likely to be a LOOP inside the move
+  (a smash holds its charge with one), and treating that as an ending trims a frame the original
+  does draw.
+
+  measured on the fixture, sandbag, both engines: jab, tilt_forward, tilt_up, tilt_down,
+  aerial_neutral, aerial_forward, aerial_up, aerial_down and special_down are all now exactly
+  2.00, against 2.10-2.17 before.
+
+- **split animations were losing every frame script** (fixed). the mapping files speak in parent
+  names -- `a` becomes `jab`, never `jab1` -- so looking an SSF2 animation up by a split PIECE
+  name found nothing, and nothing is indistinguishable from "this animation has no scripts".
+  sandbag's jab was emitted with zero frame scripts: no dust, no swing sound, and nothing marking
+  where the move ends. pieces resolve through their parent now, and jab went from 3 missing
+  scripts and 2.15 to 3 scripts and exactly 2.00.
+
+  worth a corpus pass: every character with a multi-hit jab was missing those scripts.
+- **stage weather is ported** (fixed). a stage can build particle weather in CODE rather than on a
+  timeline, so nothing else in the pipeline sees it: the art walk finds no placement and the hazard
+  path finds nothing that damages anyone. bowserscastle converted with every layer correct and the
+  air empty.
+
+  `abc_parser::extract_stage_weather` steps the stage's own `initialize` for the shape "construct a
+  weather object from a particle CLASS, then hand it an area and a count" -- keyed on that shape,
+  not on any stage or class name. bowserscastle reads back as 30 particles of `ember` over
+  255.5x252.5. the particle is rasterised through the bitmap-fill path (SSF2 art nearly always is a
+  bitmap fill, which the vector rasteriser declines by design), and the stage spawns that many
+  looping VFX and drifts each one itself, rolling rise, drift and alpha per particle from the same
+  ranges the source rolls them from. per-frame speeds convert through `velocity_scale` like every
+  other one: SSF2's 1..3 rise becomes 0.65..1.95.
+
+  verified live: 30 VFX in the match, positions scattered across the field and changing between
+  samples.
+
+- **weather is tethered to the camera, and sized by it** (fixed). SSF2 attaches the field to the
+  VIEW: it fills the screen wherever the camera goes and a particle leaving one edge returns at the
+  other. each particle now stores an offset from `match.getCamera()` (which reports the CENTRE of
+  the view, confirmed live) resolved every frame.
+
+  the field is sized from the camera too, not from SSF2's rectangle scaled up. SSF2's authored area
+  is that engine's screen; fraymakers' screen is a different shape (640x360 at zoom 1 vs the 498x492
+  the scaled numbers gave), so copying them across misses the sides and overshoots the top. sizing
+  off `getViewportWidth()/getZoomScaleX()` re-derived per frame is what makes it the same field, and
+  since both are one screenful the source's particle COUNT carries over unchanged.
+
+  the viewport is reported in WORLD units and already accounts for zoom, so dividing by the zoom
+  scale is wrong: it pins the field to a constant 480 half-width while the visible half-view is
+  ~690, leaving the sides bare. sizing straight off the viewport tracks it. verified live through
+  the borrowed content interpreter, which can read the stage script's own state: with the fighters
+  1200 apart, `halfW` 1035.6 against a viewport of 1380.8, particles spanning -704..935, and the
+  worst per-particle tether error across all 30 exactly 0.
+
+- **`e` reaches the script-api sandbox AND keeps engine-level access** (fixed). eval now runs in a
+  LIVE content interpreter, borrowed rather than rebuilt: `currentMatch -> stageEntity -> its
+  ApiScript -> runner -> interpreter`. an interpreted script's ambient variables are written into
+  that interpreter's variable map by its runner's constructor (`self`/`exports` from the base
+  hscript runner, `camera`/`match`/`stage` from the entity one), so `e` inherits the whole surface
+  content sees instead of reconstructing it. peptide's own names are additive on top, so both hold
+  at once. verified live:
+
+  | expression | answers |
+  | --- | --- |
+  | `match.getCamera().getX()` | 1047.4 |
+  | `match.getCamera().getViewportWidth()` | 640.0 |
+  | `match.getMatchSettingsConfig().hazards` | true |
+  | `p0.getStateName()` | STAND |
+  | `stageEntity != null` | true |
+
+  rebuilding it instead does NOT work, and the reason is why four earlier attempts failed:
+  content's `match` is a `FraymakersMatchApi`, a SUBCLASS, not the `pxf.api.MatchApi` that
+  `Match.matchApi` is typed as. hand-binding that field yields an object that identifies correctly
+  and takes the engine down on first touch. borrowing never names the type.
+
+  the borrow tries the STAGE's script first and a CHARACTER's second. only hscript content carries
+  a borrowable interpreter -- a built-in stage is compiled haxescript and has none -- so the
+  character source is what makes the sandbox available on shipped stages, which is most of them.
+  both casts are trapped: an unguarded one throws on a compiled runner and takes the engine down,
+  which is exactly what `e` did on thespire before the guard went in.
+
+  ONE vocabulary change came with it: `match` is now the content api, so
+  `match.getCharacters()` hands back CharacterApi objects rather than raw entities, and
+  `getStateName()`/`body`/`damage` are not on those. entity-level access is `p0`..`p3` or the bare
+  `getCharacters()` (both verified live), and TESTING.md plus the two test scripts use those.
+
+  two things this forced. `commands.hsx` must not redefine content's names: it used to assign
+  `match` unconditionally, which in a borrowed interpreter replaced the live stage's api mid-match
+  and broke it (its own getCamera went null on the very next frame). the facade is now installed
+  only when nothing else has set `match`. and a fallback interp is never treated as final, so an
+  `e` sent before the match starts cannot pin it -- the borrow is retried until it succeeds.
+
+- **weather is detected by the engine call it makes, not by a class name** (fixed). a stage hands
+  its weather's container to the engine's weather layer, so "the object whose `getContainer()` is
+  added to `getWeatherMC()`" identifies it exactly, on every stage that has any, without knowing a
+  single class name. keying on a name containing "weather" found 2 of the 8 stages in the corpus
+  that call it, and only if the construction sat in `initialize` (clocktown builds its rain behind
+  a state machine, smashville in `syncStage`).
+
+  the COUNT and area come from the class too, not from the call: the constructor says which
+  parameter lands in which field, and the signature carries the defaults for whatever the stage
+  did not pass. bowserscastle passes only the particle class and takes the rest from those
+  defaults, which is why reading the call site alone found nothing. its real numbers are 50
+  particles over 640x360 -- and that area being exactly one SSF2 screen is independent
+  confirmation that a weather field is meant to be one screenful.
+
+  | stage | particle | count |
+  | --- | --- | --- |
+  | bowserscastle | ember | 50 |
+  | clocktown | ClockTownRainDrop | 100 |
+  | crateria | CrateriaGreenRainDrop | 50 |
+  | fairyglade | fairyglade_particle | 8 |
+  | smashville | (rain) | 100 |
+  | finalvalley | (rain) | not readable, skipped with a warning |
+
+  a stage whose count cannot be read emits NO weather rather than a loop over nothing, which would
+  render as a stage that carries weather and shows none.
+
+- **the "revival platform frame" was the harness, not the converter** (fixed). a frame of the
+  revival pose showed up at the head of tilt_up, down_smash and walk. the emitted animations are
+  clean -- tilt_up carries a body layer and a motion smear and nothing else, and the unused image
+  layers really are blank -- because nothing was wrong with them.
+
+  the sweep parked aerials BELOW the floor, which is right on the fixture (open space, blast
+  boundary far below) and wrong everywhere else: on an ordinary stage, below the floor IS the blast
+  zone. the engine KOs and respawns the character, and the two frames of REVIVAL that follow land
+  at the start of the next move. measured on thespire, whose floor is y=73: parking at y=600 gives
+  `revival x2` then stand, parking at y=73 gives stand alone, and a bare `reset` never produces it.
+
+  two fixes. the floor is MEASURED per engine at the start of a sweep (drop the character, see
+  where it stops) instead of being the fixture's constant applied to every stage. and aerials park
+  high ABOVE the floor with enough clearance for ~100 frames of fall, so a move still gets to
+  finish: an aerial now reads `aerial_neutral x40` then fall then land, where before it was
+  whatever the respawn left behind.
+
+- **an unconvertible effect drew the character's revival frame** (fixed). a converted move that
+  asked for an effect the character does not carry spawned it anyway, and what the engine drew was
+  not nothing: `getContent` does NOT validate, it just builds `private::<resource>.<id>` from
+  whatever it is handed, so a missing id is a DANGLING reference and a VfxStats built on one falls
+  back to the resource's first animation. for a character that is `revival` -- so the move drew the
+  bag on its blue revival platform for a frame, behind itself.
+
+  which effects, and where: `effect_land` is asked for by tilt_up, walk_loop, strong_down_attack
+  and tech_roll -- up tilt, walk and down smash, exactly the moves it was reported in. these are
+  SSF2 SHARED effects, registered by whichever character's file defines them (sandbag's
+  `effect_land` lives in bandanadee's), so a character that only references one has nothing to
+  convert from its own file.
+
+  two fixes. `effect_land` and `ground_bounce` map to `GlobalVfx.LAND_DUST`, since fraymakers has
+  its own equivalent. and anything still unmapped is no longer spawned at all: with neither a
+  GlobalVfx mapping nor a local effect entity there is nothing to draw, so the emitter leaves a
+  TODO naming the effect instead of a call that draws the wrong thing
+  (`api_mappings::effect_is_spawnable`). sandbag went from 13 dangling vfx references to none.
+
+- **four animation/effect faults, all fixed.**
+
+  | fault | cause | fix |
+  | --- | --- | --- |
+  | effect placements ignored facing | the source flips the offset by hand (`self.flipX(78)`) AND fraymakers mirrors it via `flipWith`, so the two cancelled | drop the source's flip exactly when `flipWith` is set. measured live: `flipWith` + raw `x: 78` lands at +78 facing right, -78 facing left |
+  | `run_turn` faced backwards | only its FIRST frame was mirrored | a turn is drawn facing the direction turned FROM and the engine flips facing when the turn starts, so the whole animation mirrors -- scaleX, x AND rotation, since reflecting about the vertical axis maps an angle to its negative |
+  | `crouch_out` played like a second crouch | the exit slot cloned the entry FORWARD | splits carry a `reversed` flag; the exit runs the entry backwards |
+  | `fall_loop` looped wrong, and the fall looked like the jump never ended | the loop was sliced at a template constant, and the peeled entry frames were appended to the END -- so every cycle flashed the entry pose | the loop comes from the clip's OWN loop-back call |
+
+  the loop detection is structural, not a name list: a looping SSF2 stance ends by playing a label
+  again from its final frame, so `source_loop_frame` reads that call's target and looks up where
+  that label sits. the name varies across the corpus (`again` on sandbag and mario, `redo` on fox
+  and samus) and none of it is hardcoded. sandbag's fall: entry frames 0-5, loop 5-14.
+
+  the ported loop-back call is then STRIPPED from a looping animation: fraymakers loops natively
+  via `endType: LOOP`, and the label the call named was sliced off with the entry, so it threw once
+  per cycle and looped nothing.
+
+- **backdrop elements no longer emit the same picture hundreds of times** (fixed). SSF2 authors a
+  small looping element and the stage timeline it sits on runs far longer, so the art walk sees the
+  cycle over and over and every repeat was rasterised. clocktown arrived as 3379 sprites / 263MB --
+  1363 frames of bottom fire drawn from 8 distinct images, 621 frames of fire light drawn from 2 --
+  and FrayTools could not publish it at all, at any timeout.
+
+  two lossless reductions, both in the element writer: a sequence that is one cycle repeated emits
+  ONE cycle (the element loops anyway, and the tail does not have to be a whole cycle), and an
+  image used on more than one frame is written once and referenced again. clocktown: 3379 -> 726
+  sprites, 263MB -> 164MB. bowserscastle is unchanged bar 8 files.
+
+  a third reduction is in place but rarely applies: an element that is a large still picture with
+  one small moving part is emitted as a plate plus a crop of the part that moves. it samples before
+  committing, and declines when the element changes across most of its canvas -- which is what
+  clocktown's remaining 623-frame town backdrop does, so that stage is still too heavy to publish.
+
+- **crateria converts and runs clean.** 2.4MB, 27 sprites, no script errors: 50 weather particles
+  tethered to the camera (worst per-particle error 0) and spanning the view, the hazards switch
+  wired, and both caution-sign hazards spawned.
+
+- **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
+  in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
+  chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the
+  converter reads each stage's own answer out of its bytecode (`abc_parser::extract_hazard_gate`):
+  the gated region is the branch after the call, and what counts as gated is what the stage SPAWNS
+  in there. a stage that never asks runs everything regardless, and so does its port.
+
+  on bowserscastle that comes out as `gated_classes: ["Thwomp"]` -- the faller is spawned inside the
+  branch, the lava is placed regardless, and the embers update BEFORE the check. verified live both
+  ways: hazards on = lava + thwomp + spectator, hazards off = lava + spectator, thwomp gone, all 36
+  structures still there and the fighter still standing on them.
+
+  the harness had been hiding this. peptide replaces the whole match config on a headless launch, so
+  a field it never set read as false and every test match ran with hazards OFF. `hazards` is now a
+  match setting like lives and time (`match_settings.conf`, default on), which also makes the off
+  case testable on purpose.
+
 - **special-angle sentinels.** SSF2 sentinel angles (`-1`/`-2`/`-3`…) are preserved
   faithfully, we just haven't mapped them to FM's special-angle codes yet. needs the
   SSF2-sentinel → FM-angle table.

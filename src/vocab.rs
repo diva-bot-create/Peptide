@@ -145,7 +145,18 @@ const HOST_TO_SSF2_BITS: &[(u32, u32)] = &[
     (0x20, 1 << 6),  // special→ BUTTON1 (SSF2's B)
     (0x40, 1 << 4),  // action→ GRAB
     (0x80, 1 << 7),  // jump  → JUMP
+    // Found the same way as the buttons above: drive one bit, see which animation the character
+    // plays. Bit 1 puts it in DEFEND, and with a direction gives DODGEROLL / SIDESTEP, so it is
+    // the shield. Bit 2 is the taunt. Without these, `shield+right` reached SSF2 as a bare `right`
+    // and the character walked -- every dodge, roll and shield row in a cross-engine sweep was
+    // comparing a roll against a walk.
+    (0x100, 1 << 1), // shield → DEFEND
+    (0x800, 1 << 2), // taunt  → TAUNT
 ];
+
+// SSF2 has no dash BUTTON: it dashes on a double-tap of the direction, where Fraymakers has a
+// dedicated one. Anything driving both engines has to say that twice; `move_sweep.py` carries the
+// two idioms per move.
 
 /// Translate a host control mask ([`crate::interpreter::controls_mask`] output) to
 /// the SSF2 `ControlsObject.controls` bitmask the engine-side input applicator

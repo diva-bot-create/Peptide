@@ -26,6 +26,17 @@ use crate::uuid_gen::det_uuid;
 
 /// Emit the FM stage package for `model` under `out_root/<id>/`. Returns the
 /// project dir and the `.fraytools` path (for the FrayTools publish step).
+
+/// The one conversion for a per-frame SPEED, shared by everything that moves.
+///
+/// A speed is a distance per frame, and a conversion changes both: the world is `size_multiplier`
+/// bigger and a frame is half as long. Characters got this from the physics model; stages open-coded
+/// it as `scale * 0.5`, which agreed only for as long as nobody edited the frame rates in
+/// stats.jsonc. A thwomp falls by the same arithmetic a fighter does.
+fn velocity_scale() -> f64 {
+    crate::mappings::character_stats().scaling.velocity_scale()
+}
+
 pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathBuf)> {
     let id = &model.id;
     let dir = out_root.join(id);
@@ -44,7 +55,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // stage layer. Each layer is a PNG + `.meta`; the `.png` is gitignored (regenerated).
     let sprites = lib.join("sprites").join("Stage");
     std::fs::create_dir_all(&sprites).context("mkdir sprites/Stage")?;
-    let write_layer = |suffix: &str, art: &StageArt| -> Result<ArtRef> {
+    let mut write_layer = |suffix: &str, art: &StageArt| -> Result<ArtRef> {
         let guid = det_uuid(&format!("stage::{id}::{suffix}"));
         std::fs::write(sprites.join(format!("{id}_{suffix}.png")), &art.png)?;
         write_json(&sprites.join(format!("{id}_{suffix}.png.meta")), &json!({
@@ -79,24 +90,12 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
         }
     }
     let elem_ids = element_ids(&model.art.background);
-    let bg_refs: Vec<BgLayerRef> = model.art.background.iter().enumerate()
-        .map(|(i, layer)| -> Result<BgLayerRef> {
-            let eid = &elem_ids[i];
-            let frames: Vec<ArtRef> = if layer.frames.len() == 1 {
-                vec![write_layer(eid, &layer.frames[0])?]
-            } else {
-                layer.frames.iter().enumerate()
-                    .map(|(j, a)| write_layer(&format!("{eid}_{j}"), a))
-                    .collect::<Result<_>>()?
-            };
-            Ok(BgLayerRef {
-                name: bg_layer_name(&layer.name, i), eid: eid.clone(), frames,
-                plane: BgPlane::Background,
-                segments: layer.segments.iter()
-                    .map(|s| (s.label.clone(), s.frames.len(), s.next.clone())).collect(),
-            })
-        })
-        .collect::<Result<_>>()?;
+    let mut bg_refs: Vec<BgLayerRef> = Vec::new();
+    for (i, layer) in model.art.background.iter().enumerate() {
+        bg_refs.extend(build_element_layers(&elem_ids[i], bg_layer_name(&layer.name, i),
+                                            &layer.frames, &layer.segments,
+                                            BgPlane::Background, &mut write_layer)?);
+    }
     // UNIVERSAL: promote every ANIMATED backdrop element (the weather embers, jumping podoboos,
     // lava bubbles/splashes, flickering torches, a spectating Bowser, …) to its own looping VFX
     // the stage spawns, instead of baking it as a layer inside the single `stage` animation where
@@ -136,19 +135,9 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
             // name with a backdrop one — same id means same filenames, and one silently overwrites
             // the other's art.
             let eid = &format!("fge_{}", fg_elem_ids[i]);
-            let frames: Vec<ArtRef> = if layer.frames.len() == 1 {
-                vec![write_layer(eid, &layer.frames[0])?]
-            } else {
-                layer.frames.iter().enumerate()
-                    .map(|(j, a)| write_layer(&format!("{eid}_{j}"), a))
-                    .collect::<Result<_>>()?
-            };
-            promoted_bg.push(BgLayerRef {
-                name: bg_layer_name(&layer.name, i), eid: eid.clone(), frames,
-                plane: BgPlane::Foreground,
-                segments: layer.segments.iter()
-                    .map(|s| (s.label.clone(), s.frames.len(), s.next.clone())).collect(),
-            });
+            promoted_bg.extend(build_element_layers(eid, bg_layer_name(&layer.name, i),
+                                                    &layer.frames, &layer.segments,
+                                                    BgPlane::Foreground, &mut write_layer)?);
         }
     }
     // declared platforms become MOVING STRUCTURES (like the official stage-template's moving
@@ -203,12 +192,28 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     let mut spawns = structure_spawn_ids.iter()
         .map(|cid| format!("\t\t\tmatch.createStructure(self.getResource().getContent(\"{cid}\"));\n"))
         .collect::<String>();
-    spawns.push_str(&hazard_spawn_lines(model));
+    // What goes behind the hazards switch is READ OFF THE SOURCE STAGE, not decided here: SSF2
+    // stages ask the switch themselves and each one means something different by it, so the port
+    // gates exactly what the original gated (`abc_parser::extract_hazard_gate`) and nothing else.
+    // A stage that never asks runs everything regardless, and so does its port.
+    let (ungated, gated) = hazard_spawn_lines(model);
+    spawns.push_str(&ungated);
+    if !gated.trim().is_empty() {
+        spawns.push_str("\t\t\tif (m_hazardsOn) {\n");
+        for line in gated.lines() {
+            spawns.push_str(&format!("\t{line}\n"));
+        }
+        spawns.push_str("\t\t\t}\n");
+    }
     spawns.push_str(&bg_spawns);
-    write_script(&scripts.join(format!("{id}Script.hx")), &script_hx(id, animated, &spawns))?;
+    let (weather_spawn, weather_frame) = emit_weather(model, &lib)?;
+    write_script(&scripts.join(format!("{id}Script.hx")),
+                 &script_hx(id, animated, &spawns, (&weather_spawn, &weather_frame)))?;
     write_meta(&scripts.join(format!("{id}Script.hx.meta")), id, &format!("{id}Script"), "", Some("STAGE"), None)?;
     write_script(&scripts.join(format!("{id}StageStats.hx")), &stage_stats_hx(id, &art.parallax, model.scale))?;
     write_meta(&scripts.join(format!("{id}StageStats.hx.meta")), id, &format!("{id}StageStats"), "hscript", None, None)?;
+
+    crate::content_audit::audit_and_log(&lib, id);
 
     let fraytools = dir.join(format!("{id}.fraytools"));
     write_json(&fraytools, &build_fraytools())?;
@@ -621,8 +626,28 @@ struct ArtRefs { background: Vec<BgLayerRef>, parallax: Vec<ParallaxRef>, stage:
 /// Render the floor + soft platforms as filled rectangles on a transparent canvas
 /// covering their bounding box (1px = 1 stage unit). Gives the stage visible content
 /// (required for play) and shows the playable geometry.
+/// Draw a stand-in for a stage that converted with no art of its own: its collision surfaces, as
+/// coloured bands, so the stage is something you can see and stand on rather than an invisible
+/// plane. Solid ground and drop-through platforms are drawn in different colours.
+///
+/// The one rule this has to keep is that the picture sits exactly on the collision it was drawn
+/// from. Everything below is in service of that, and each part of it has been got wrong once.
 fn render_placeholder(model: &StageModel) -> StageArt {
     use image::{Rgba, RgbaImage};
+
+    // Nothing to draw from. A stage with neither art nor collision is degenerate, but it must not
+    // produce a bogus placement: the bounds below would come back inverted (from the empty folds)
+    // and land an image at 1e308, which is not a number any consumer of this recovers from.
+    if model.platforms.is_empty() {
+        let img = RgbaImage::new(1, 1);
+        let mut png = Vec::new();
+        use image::ImageEncoder;
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(img.as_raw(), 1, 1, image::ExtendedColorType::Rgba8)
+            .expect("encode placeholder png");
+        return StageArt { png, x: 0.0, y: 0.0, w: 1, h: 1, hold: 1 };
+    }
+
     // bounding box of all collision geometry, with a small margin.
     let rects: Vec<Rect> = model.platforms.iter().map(|p| p.rect).collect();
     let margin = 8.0;
@@ -630,16 +655,29 @@ fn render_placeholder(model: &StageModel) -> StageArt {
     let min_y = rects.iter().map(|r| r.top()).fold(f64::MAX, f64::min) - margin;
     let max_x = rects.iter().map(|r| r.right()).fold(f64::MIN, f64::max) + margin;
     let max_y = rects.iter().map(|r| r.bottom()).fold(f64::MIN, f64::max) + margin;
-    let w = ((max_x - min_x).ceil() as u32).clamp(1, 4096);
-    let h = ((max_y - min_y).ceil() as u32).clamp(1, 4096);
+
+    // Drawn in SOURCE units, not FM units. Every stage image is placed at the stage scale, so a
+    // raster already measured in FM units gets that scale applied a SECOND time: the art comes out
+    // `scale` too wide and slides off its own collision, which reads as collision covering only
+    // part of the shape and a floor line that does not sit on the floor. The collision geometry is
+    // in FM units, so divide by the scale here and let the one placement put it back.
+    let s = if model.scale > 0.0 { model.scale } else { 1.0 };
+    // Generous, because a raster that does not cover its own bounds is a raster drawn in the wrong
+    // place: the position and scale say it spans the whole stage, so anything cropped off the far
+    // edge is simply missing rather than merely smaller.
+    let w = (((max_x - min_x) / s).ceil() as u32).clamp(1, PLACEHOLDER_MAX_PX);
+    let h = (((max_y - min_y) / s).ceil() as u32).clamp(1, PLACEHOLDER_MAX_PX);
     let mut img = RgbaImage::new(w, h);
     for p in &model.platforms {
         let r = &p.rect;
         let color = if p.drop_through { Rgba([120, 160, 220, 235]) } else { Rgba([90, 100, 120, 255]) };
-        let x0 = ((r.left() - min_x).max(0.0)) as u32;
-        let y0 = ((r.top() - min_y).max(0.0)) as u32;
-        let x1 = ((r.right() - min_x).min(w as f64)) as u32;
-        let y1 = ((r.bottom() - min_y).min(h as f64)) as u32;
+        // Rounded OUTWARD, and never empty. A surface thinner than one pixel once divided by the
+        // scale would otherwise round to a zero-height span and vanish -- which is how a stage ends
+        // up with collision a fighter stands on and nothing drawn under their feet.
+        let x0 = (((r.left() - min_x) / s).floor().max(0.0) as u32).min(w - 1);
+        let y0 = (((r.top() - min_y) / s).floor().max(0.0) as u32).min(h - 1);
+        let x1 = (((r.right() - min_x) / s).ceil().max(0.0) as u32).clamp(x0 + 1, w);
+        let y1 = (((r.bottom() - min_y) / s).ceil().max(0.0) as u32).clamp(y0 + 1, h);
         for y in y0..y1 {
             for x in x0..x1 {
                 img.put_pixel(x, y, color);
@@ -653,8 +691,14 @@ fn render_placeholder(model: &StageModel) -> StageArt {
             .write_image(img.as_raw(), w, h, image::ExtendedColorType::Rgba8)
             .expect("encode placeholder png");
     }
+    // Position stays in FM units: a placement's x/y are already parent-space coordinates and only
+    // the image's PIXELS are scaled. Size is what had to change, not where it sits.
     StageArt { png, x: min_x, y: min_y, w, h, hold: 1 }
 }
+
+/// How large a placeholder raster may get. Big enough for every stage in the corpus at source
+/// resolution; the clamp exists so a corrupt model cannot ask for a terabyte of pixels.
+const PLACEHOLDER_MAX_PX: u32 = 8192;
 
 fn build_entity(model: &StageModel, art: &ArtRefs) -> Value {
     let id = &model.id;
@@ -887,8 +931,12 @@ fn emit_platform_structures(model: &StageModel, lib: &Path, sprites: &Path)
     // velocity), the hold × 2 (frame count), depth × scale. The previous hand-RE'd values stay as
     // the fallback for a stage whose platform class wasn't found.
     let pb = model.platform_behavior.clone().unwrap_or_default();
-    let sink_speed = pb.sink_speed.unwrap_or(30.0) * model.scale * 0.5;
-    let rise_speed = pb.rise_speed.unwrap_or(1.0) * model.scale * 0.5;
+    // A per-frame speed converts by the SAME derivation a character's does: the world scale times
+    // the frame-rate ratio. Spelled `scale * 0.5` in enough places that changing the frame rates in
+    // stats.jsonc would have moved characters and left every stage hazard behind.
+    let vscale = velocity_scale();
+    let sink_speed = pb.sink_speed.unwrap_or(30.0) * vscale;
+    let rise_speed = pb.rise_speed.unwrap_or(1.0) * vscale;
     let wait = pb.wait_frames.unwrap_or(390.0) * 2.0;
     let sink_depth = pb.sink_depth.unwrap_or(145.0) * model.scale;
     write_script(&scripts.join(format!("{script_id}.hx")), &platform_script_hx(half_w, sink_depth, sink_speed, rise_speed, wait))?;
@@ -1353,7 +1401,7 @@ fn emit_multi_anim_hazard(
                 spawn_y: model.death_box.as_ref().map(|b| b.y + 60.0)
                     .unwrap_or_else(|| cols.iter().map(|(_, y)| *y).fold(f64::MAX, f64::min) - 520.0),
                 spawn_period: fc.spawn_period.unwrap_or(600.0) * 2.0,
-                terminal: hz.max_y_speed.or(hz.behavior.fall_gravity).unwrap_or(30.0) * scale * 0.5,
+                terminal: hz.max_y_speed.or(hz.behavior.fall_gravity).unwrap_or(30.0) * velocity_scale(),
                 bob: hz.anims.iter().find(|a| sanitize_anim(&a.label) == entrance_name)
                     .map(|a| a.frame_velocities.clone()).unwrap_or_default(),
                 camera: hz.behavior.camera_target,
@@ -1381,8 +1429,8 @@ fn emit_multi_anim_hazard(
         // defaults only apply if the class declared no value.
         let b = &hz.behavior;
         let shake_amp = b.shake.unwrap_or(13.0) * scale;
-        let fall_v = b.fall_gravity.unwrap_or(30.0) * scale * 0.5;
-        let rise_v = b.rise_yspeed.map(f64::abs).unwrap_or(6.0) * scale * 0.5;
+        let fall_v = b.fall_gravity.unwrap_or(30.0) * velocity_scale();
+        let rise_v = b.rise_yspeed.map(f64::abs).unwrap_or(6.0) * velocity_scale();
         // the landing dust poof: the global-vfx shape from the mappings' global_vfx_map, at the
         // scale the hazard's own attachEffect call declared (× stage scale, a screen effect).
         let dust_scale = b.dust.as_ref().map(|(_, sx, _)| *sx).unwrap_or(2.0) * scale;
@@ -1399,7 +1447,7 @@ fn emit_multi_anim_hazard(
             .find(|a| sanitize_anim(&a.label) == entrance_name)
             .map(|a| a.frame_velocities.iter()
                 .map(|(f, v)| format!("\t\tif (m_timer.get() == {}) {{ m_vy.set({:.2}); }}\n",
-                    (f.saturating_sub(1)) * 2, v * scale * 0.5))
+                    (f.saturating_sub(1)) * 2, v * velocity_scale()))
                 .collect())
             .unwrap_or_default();
         let camera = hz.behavior.camera_target;
@@ -1797,7 +1845,7 @@ fn cgo_runnable(raw: &str, anims: &[String], scale: f64, wrap: Option<&ReconWrap
                 &c[1], g * scale * 0.25, term, g);
         } else if let Some(c) = yvel_re.captures(&s) {
             let v: f64 = c[2].parse().unwrap_or(0.0);
-            s = format!("{}self.setYVelocity({:.2}); // SSF2 setYSpeed {} @30fps", &c[1], v * scale * 0.5, v);
+            s = format!("{}self.setYVelocity({:.2}); // SSF2 setYSpeed {} @30fps", &c[1], v * velocity_scale(), v);
         }
         // screen-space args (camera shake amplitude, the dust vfx scale) x the stage scale.
         if let Some(c) = shake_re.captures(&s) {
@@ -1961,7 +2009,7 @@ fn cgo_runnable(raw: &str, anims: &[String], scale: f64, wrap: Option<&ReconWrap
         .map(|(v, _)| {
             let ladder: String = w.bob.iter()
                 .map(|(f, sp)| format!("\t\tif (_w_state_t.get() == {}) {{ self.setYVelocity({:.2}); }}\n",
-                    (f.saturating_sub(1)) * 2, sp * scale * 0.5))
+                    (f.saturating_sub(1)) * 2, sp * velocity_scale()))
                 .collect();
             format!("\t// entrance bob: the entrance sub-clip's frame scripts (setYSpeed timeline, 30->60fps)\n\
                      \tif (inLocalState({})) {{\n{ladder}\t}}\n", cname(v))
@@ -2509,6 +2557,156 @@ fn hazard_animation_stats_hx() -> String {
     "// AnimationStats for the stage hazard.\n{\n\tgameObjectIdle: { endType: AnimationEndType.NONE },\n\tgameObjectInactive: { endType: AnimationEndType.NONE }\n}\n".to_string()
 }
 
+// ── particle weather -> N looping VFX the stage drifts every frame ───────────
+//
+// Weather is neither backdrop art nor a hazard: SSF2 builds it in CODE, so it is never placed on a
+// timeline for the art walk to find, and it damages nobody so the hazard path ignores it. A stage
+// converts with every layer correct and the air empty.
+//
+// One VFX ENTITY holds the particle; the stage spawns `count` copies and moves each itself.
+// Rise, drift and alpha are rolled PER PARTICLE from the ranges the source rolls them from, so the
+// field looks scattered rather than like one animation played N times.
+
+/// The particle entity: one still frame, looping forever, reparented like any backdrop VFX.
+fn weather_entity(eid: &str, guid: &str, w: u32, h: u32, scale: f64) -> Value {
+    let g = |s: &str| det_uuid(&format!("weather::{eid}::{s}"));
+    json!({
+        "export": true, "guid": g("entity"), "id": eid, "version": 5,
+        "pluginMetadata": { "com.fraymakers.FraymakersMetadata": { "objectType": "VFX", "version": "0.1.0" } },
+        "plugins": ["com.fraymakers.FraymakersTypes", "com.fraymakers.FraymakersMetadata"],
+        "tags": [], "paletteMap": {}, "tilesets": [], "terrains": [],
+        "symbols": [ json!({
+            "$id": g("sym"), "type": "IMAGE", "imageAsset": guid,
+            // drawn around its own centre, so a particle's position is where it LOOKS like it is
+            "x": -(w as f64) * scale / 2.0, "y": -(h as f64) * scale / 2.0,
+            "pivotX": 0.0, "pivotY": 0.0, "scaleX": scale, "scaleY": scale,
+            "rotation": 0.0, "alpha": 1.0, "pluginMetadata": {}
+        }) ],
+        "keyframes": [ json!({ "$id": g("kf"), "symbol": g("sym"), "length": 1,
+            "tweened": false, "tweenType": "LINEAR", "type": "IMAGE", "pluginMetadata": {} }) ],
+        "layers": [ json!({ "$id": g("layer"), "name": "art", "type": "IMAGE", "hidden": false,
+            "locked": false, "keyframes": [g("kf")], "pluginMetadata": {} }) ],
+        "animations": [ json!({ "$id": g("anim"), "name": "active", "layers": [g("layer")],
+            "pluginMetadata": {} }) ]
+    })
+}
+
+/// Write the particle art + entity. Returns (spawn code, per-frame code) for the stage script.
+/// Ceiling on live weather particles. The source count is scaled up to keep the authored DENSITY
+/// over Fraymakers' larger view, and this stops a wide pull-out (or a misread source) turning that
+/// into a swarm.
+const WEATHER_MAX_PARTICLES: u32 = 200;
+
+fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
+    let Some(w) = &model.weather else { return Ok((String::new(), String::new())) };
+    // A count of zero means the class's own code did not yield one (the value is neither passed at
+    // the construction nor declared as a default). Emitting anyway gives a loop over nothing: the
+    // stage carries a weather entity and renders no weather, which looks like it works. Say so
+    // instead, so it reads as a known gap rather than a silent one.
+    if w.count == 0 {
+        log::warn!("stage weather: found the particle ({}x{}) but not how many, so no weather is emitted", w.art.w, w.art.h);
+        return Ok((String::new(), String::new()));
+    }
+    let eid = format!("{}_weather", model.id);
+    let sprites = lib.join("sprites").join("Stage");
+    std::fs::create_dir_all(&sprites).ok();
+    let png_name = format!("{eid}.png");
+    std::fs::write(sprites.join(&png_name), &w.art.png).context("write weather particle")?;
+    let guid = det_uuid(&format!("weather::{eid}::image"));
+    write_json(&sprites.join(format!("{png_name}.meta")), &json!({
+        "export": false, "guid": guid, "id": "", "pluginMetadata": {}, "plugins": [], "tags": [], "version": 2
+    }))?;
+    write_json(&lib.join("entities").join(format!("{eid}.entity")),
+               &weather_entity(&eid, &guid, w.art.w, w.art.h, model.scale))?;
+
+    // SSF2 scatters over about 1.5x the camera area and wraps at those edges, which keeps
+    // particles arriving from off-screen instead of appearing at the frame edge.
+    let hw = (w.width * 0.75).round() as i64;
+    let hh = (w.height * 0.75).round() as i64;
+    let count = w.count.min(WEATHER_MAX_PARTICLES);   // a stage asking for thousands is a stage we misread
+    let vs = velocity_scale();
+    // Rise and drift are per-frame speeds, so they convert like every other one.
+    let k_lo = 1.0 * vs;
+    let k_span = (2.0 * vs * 100.0).round() as i64;
+    let wind_lo = -1.5 * vs;
+    let wind_span = (4.2 * vs * 100.0).round() as i64;
+    // Both the scatter and the COUNT come off the live camera, not off the source numbers.
+    // SSF2's field is one SSF2 screenful; Fraymakers shows a good deal more world than that, so
+    // reusing the source's area scatters the particles into a band in the middle, and reusing the
+    // source's count spreads that many across a bigger screen and reads as thinner weather than
+    // the original. Scaling the count by the area ratio keeps the DENSITY the source authored,
+    // which is what actually looks the same. Capped so a big pull-out cannot spawn a swarm.
+    // The source area is what the count's DENSITY is relative to. A stage whose class names its
+    // area fields something this pass does not recognise reports none, and scaling would then be
+    // dividing by a number we do not have -- so the source count is used as-is instead.
+    let src_area = (hw.max(0) * hh.max(0)) as f64;
+    let count_calc = if src_area > 0.0 {
+        format!("\t\t\tvar wn = Std.int({count} * (shw * shh) / {src_area:.1});\n")
+    } else {
+        format!("\t\t\tvar wn = {count};\n")
+    };
+    let spawn = format!(
+        "\t\t\tvar wcam = match.getCamera();\n\
+         \t\t\tvar shw = {hw}.0;\n\
+         \t\t\tvar shh = {hh}.0;\n\
+         \t\t\tif (wcam != null) {{\n\
+         \t\t\t\tshw = wcam.getViewportWidth() * 0.75;\n\
+         \t\t\t\tshh = wcam.getViewportHeight() * 0.75;\n\
+         \t\t\t}}\n\
+{count_calc}\
+         \t\t\tif (wn < {count}) wn = {count};\n\
+         \t\t\tif (wn > {cap}) wn = {cap};\n\
+         \t\t\tm_weather = [];\n\
+         \t\t\tfor (i in 0...wn) {{\n\
+         \t\t\t\tvar v = match.createVfx(new VfxStats({{ spriteContent: self.getResource().getContent(\"{eid}\"), animation: \"active\", loop: true, timeout: -1, relativeWith: false }}));\n\
+         \t\t\t\tv.setAlpha(0.2 + Random.getInt(0, 60) / 100.0);\n\
+         \t\t\t\tself.getBackgroundEffectsContainer().addChild(v.getViewRootContainer());\n\
+         \t\t\t\tm_weather.push({{ v: v, x: (Random.getInt(0, 200) / 100.0 - 1.0) * shw, y: (Random.getInt(0, 200) / 100.0 - 1.0) * shh, k: {k_lo:.3} + Random.getInt(0, {k_span}) / 100.0, wind: {wind_lo:.3} + Random.getInt(0, {wind_span}) / 100.0 }});\n\
+         \t\t\t}}\n",
+        cap = WEATHER_MAX_PARTICLES);
+    // Weather is attached to the VIEW, not to the stage: it fills the screen wherever the camera
+    // goes, and a particle leaving one edge returns at the other. So a particle's stored position
+    // is an offset from the camera (which reports the CENTRE of the view), resolved every frame.
+    //
+    // The field is sized from the camera too, not from SSF2's rectangle scaled up. SSF2's authored
+    // area is that engine's screen; Fraymakers' screen is a different shape, so copying the numbers
+    // across gives a field that misses the sides and overshoots the top. Sizing off the viewport is
+    // what makes it the same field, and because both are "one screenful" the source's particle
+    // COUNT carries over unchanged and looks as thick as it did. Re-derived per frame so the field
+    // grows and shrinks with the camera instead of tearing at the edges when it pulls out.
+    //
+    // With no camera to ask, the SSF2 numbers are the fallback: a field over one patch of the stage
+    // is wrong, but it is the source's own wrongness rather than a field of zero size.
+    let per_frame = format!(
+        "\t\tvar cam = match.getCamera();\n\
+         \t\tvar camX = 0.0;\n\
+         \t\tvar camY = 0.0;\n\
+         \t\tvar hw = {hw}.0;\n\
+         \t\tvar hh = {hh}.0;\n\
+         \t\tif (cam != null) {{\n\
+         \t\t\tcamX = cam.getX();\n\
+         \t\t\tcamY = cam.getY();\n\
+         \t\t\t// scattered over 1.5 screens so particles arrive from off-view rather than\n\
+         \t\t\t// appearing at the frame edge. the viewport is reported in WORLD units and already\n\
+         \t\t\t// accounts for zoom, so dividing by the zoom scale pins the field to a constant and\n\
+         \t\t\t// leaves the sides bare on any shot wider than one screen.\n\
+         \t\t\thw = cam.getViewportWidth() * 0.75;\n\
+         \t\t\thh = cam.getViewportHeight() * 0.75;\n\
+         \t\t}}\n\
+         \t\tfor (p in m_weather) {{\n\
+         \t\t\tp.y -= p.k;\n\
+         \t\t\tp.x += p.wind;\n\
+         \t\t\t// leaving the field puts it back on the far side, so the count never changes\n\
+         \t\t\tif (p.y < -hh) {{ p.y = hh; p.x = (Random.getInt(0, 200) / 100.0 - 1.0) * hw; }}\n\
+         \t\t\tif (p.y > hh) {{ p.y = hh; }}\n\
+         \t\t\tif (p.x < -hw) {{ p.x = hw; }}\n\
+         \t\t\tif (p.x > hw) {{ p.x = -hw; }}\n\
+         \t\t\tp.v.setX(camX + p.x);\n\
+         \t\t\tp.v.setY(camY + p.y);\n\
+         \t\t}}\n");
+    Ok((spawn, per_frame))
+}
+
 // ── animated backdrop element -> independent-loop VFX, reparented into a background container ──
 // the architectural fix for Flash's two timeline features the single baked `stage` animation
 // can't represent: (1) a nested movieclip whose loop is INDEPENDENT of the parent (a 260-frame
@@ -2706,6 +2904,179 @@ fn bg_segment_script_hx(eid: &str, layer: &BgLayerRef) -> String {
 /// no scripts/stats/manifest entry — resolved by id via getContent, like the character port's
 /// effects) and return the stage-Script spawn lines: createVfx (loop forever, absolute position)
 /// then reparent its sprite into the stage background container for depth.
+
+
+
+/// One source element as the layer(s) that represent it: normally one, but a mostly-still element
+/// becomes a plate plus the part that moves (see `split_static_plate`).
+fn build_element_layers(
+    eid: &str,
+    name: String,
+    frames: &[crate::stage_parser::StageArt],
+    segments: &[crate::stage_parser::BgSegment],
+    plane: BgPlane,
+    write_layer: &mut impl FnMut(&str, &crate::stage_parser::StageArt) -> Result<ArtRef>,
+) -> Result<Vec<BgLayerRef>> {
+    let segs: Vec<(String, usize, Option<crate::abc_parser::LabelJump>)> =
+        segments.iter().map(|s| (s.label.clone(), s.frames.len(), s.next.clone())).collect();
+    if segs.is_empty() {
+        if let Some((plate, moving)) = split_static_plate(frames) {
+            let plate_id = format!("{eid}_plate");
+            let plate_ref = write_layer(&plate_id, &plate)?;
+            let moving_refs = write_element_frames(eid, &moving, false, write_layer)?;
+            return Ok(vec![
+                BgLayerRef { name: format!("{name} (plate)"), eid: plate_id, frames: vec![plate_ref],
+                             plane, segments: Vec::new() },
+                BgLayerRef { name, eid: eid.to_string(), frames: moving_refs, plane, segments: Vec::new() },
+            ]);
+        }
+    }
+    let refs = write_element_frames(eid, frames, !segs.is_empty(), write_layer)?;
+    Ok(vec![BgLayerRef { name, eid: eid.to_string(), frames: refs, plane, segments: segs }])
+}
+
+/// Split a mostly-static animated element into a still PLATE plus a small moving piece.
+///
+/// A backdrop element is rasterised whole on every frame, so an element that is a large static
+/// picture with one small thing moving in it costs the full canvas per frame. Clocktown's town
+/// backdrop is 623 distinct 739x437 frames -- 160MB, and FrayTools could not publish it at all --
+/// while only a ~259x258 patch of it ever changes.
+///
+/// So: frame 0 is emitted once as a full-canvas plate, and the animation is emitted cropped to the
+/// region that actually moves, offset to sit back over the plate. Nothing is lost -- the crop is
+/// the union of every frame's difference from the plate.
+///
+/// Returns None when the element is small, short, or genuinely changes across most of its canvas.
+fn split_static_plate(frames: &[crate::stage_parser::StageArt])
+    -> Option<(crate::stage_parser::StageArt, Vec<crate::stage_parser::StageArt>)>
+{
+    const MIN_FRAMES: usize = 8;
+    const MAX_MOVING_FRACTION: f64 = 0.6;
+    if frames.len() < MIN_FRAMES { return None; }
+    let plate = &frames[0];
+    let base = image::load_from_memory(&plate.png).ok()?.to_rgba8();
+    let (cw, ch) = (base.width(), base.height());
+    if cw * ch == 0 { return None; }
+
+    // Sample first: decoding every frame to find out the answer is no is the expensive way to
+    // learn it, and most elements that reach here are the whole-canvas kind (clocktown's town
+    // backdrop differs from its own first frame across all of it by the end).
+    let step = (frames.len() / 8).max(1);
+    let (mut sx0, mut sy0, mut sx1, mut sy1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for f in frames.iter().step_by(step) {
+        let im = image::load_from_memory(&f.png).ok()?.to_rgba8();
+        if im.width() != cw || im.height() != ch { return None; }
+        for y in 0..ch {
+            for x in 0..cw {
+                if im.get_pixel(x, y) != base.get_pixel(x, y) {
+                    sx0 = sx0.min(x); sy0 = sy0.min(y); sx1 = sx1.max(x); sy1 = sy1.max(y);
+                }
+            }
+        }
+    }
+    if sx0 == u32::MAX { return None; }
+    let sampled = ((sx1 - sx0 + 1) as f64 * (sy1 - sy0 + 1) as f64) / (cw as f64 * ch as f64);
+    if sampled > MAX_MOVING_FRACTION { return None; }
+
+    // union of every frame's difference from the plate
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for f in &frames[1..] {
+        let im = image::load_from_memory(&f.png).ok()?.to_rgba8();
+        if im.width() != cw || im.height() != ch { return None; }   // frames crop differently already
+        for y in 0..ch {
+            for x in 0..cw {
+                if im.get_pixel(x, y) != base.get_pixel(x, y) {
+                    x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x); y1 = y1.max(y);
+                }
+            }
+        }
+    }
+    if x0 == u32::MAX { return None; }                              // nothing moves at all
+    let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+    if (bw as f64 * bh as f64) / (cw as f64 * ch as f64) > MAX_MOVING_FRACTION { return None; }
+
+    let encode = |img: &image::RgbaImage| -> Option<Vec<u8>> {
+        use image::ImageEncoder;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8).ok()?;
+        Some(png)
+    };
+    let mut moving = Vec::with_capacity(frames.len());
+    for f in frames {
+        let im = image::load_from_memory(&f.png).ok()?.to_rgba8();
+        let crop = image::imageops::crop_imm(&im, x0, y0, bw, bh).to_image();
+        moving.push(crate::stage_parser::StageArt {
+            png: encode(&crop)?,
+            x: f.x + x0 as f64, y: f.y + y0 as f64,
+            w: bw, h: bh, hold: f.hold,
+        });
+    }
+    log::info!("backdrop element: {}x{} canvas with a {bw}x{bh} moving region — emitting a still plate plus the crop",
+               cw, ch);
+    Some((plate.clone(), moving))
+}
+
+/// Write one backdrop element's frames, collapsing what the source repeats.
+///
+/// SSF2 authors a small looping element and the stage timeline it sits on runs far longer, so the
+/// art walk sees the element's cycle over and over. Clocktown arrives with 1363 frames of bottom
+/// fire drawn from 8 distinct images, and 621 frames of fire light drawn from 2 -- rasterised
+/// frame by frame that stage emitted 263MB of sprites, enough that publishing it timed out.
+///
+/// Two reductions, both lossless:
+///   - a sequence that is one cycle repeated is emitted as ONE cycle (the element loops anyway).
+///     the tail does not have to be a whole cycle -- the source stops wherever its timeline ends.
+///   - an image that appears on more than one frame is WRITTEN once and referenced again, which
+///     covers a sequence that reuses a handful of images without repeating in a fixed period.
+fn write_element_frames(
+    eid: &str,
+    frames: &[crate::stage_parser::StageArt],
+    segmented: bool,
+    mut write_layer: impl FnMut(&str, &crate::stage_parser::StageArt) -> Result<ArtRef>,
+) -> Result<Vec<ArtRef>> {
+    // Segmented elements keep every frame: their segment lengths index into this list.
+    let src = if segmented { frames } else { &frames[..element_cycle_len(frames)] };
+    if src.len() < frames.len() {
+        log::info!("backdrop element '{eid}': {} frames are repeats of a {}-frame cycle; emitting one",
+                   frames.len(), src.len());
+    }
+    if src.len() == 1 {
+        return Ok(vec![write_layer(eid, &src[0])?]);
+    }
+    let mut out: Vec<ArtRef> = Vec::with_capacity(src.len());
+    let mut seen: Vec<(usize, ArtRef)> = Vec::new();   // index of first use -> its ref
+    let mut written = 0usize;
+    for (j, a) in src.iter().enumerate() {
+        if let Some((_, prev)) = seen.iter().find(|(i, _)| same_art(&src[*i], a)) {
+            // same picture as an earlier frame: reuse the asset, keep this frame's own hold
+            out.push(ArtRef { hold: a.hold.max(1) as usize, ..prev.clone() });
+            continue;
+        }
+        let r = write_layer(&format!("{eid}_{j}"), a)?;
+        seen.push((j, r.clone()));
+        out.push(r);
+        written += 1;
+    }
+    if written < src.len() {
+        log::info!("backdrop element '{eid}': {} frames drawn from {written} images", src.len());
+    }
+    Ok(out)
+}
+
+fn same_art(a: &crate::stage_parser::StageArt, b: &crate::stage_parser::StageArt) -> bool {
+    a.png == b.png && a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h
+}
+
+/// The smallest prefix that reproduces the whole sequence by repeating, or its full length.
+fn element_cycle_len(frames: &[crate::stage_parser::StageArt]) -> usize {
+    let n = frames.len();
+    if n < 2 { return n; }
+    (1..=n / 2)
+        .find(|&p| (p..n).all(|i| same_art(&frames[i], &frames[i % p]) && frames[i].hold == frames[i % p].hold))
+        .unwrap_or(n)
+}
+
 fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
     -> Result<(String, Vec<Value>)> {
     let mut spawns = String::new();
@@ -2788,17 +3159,24 @@ fn emit_bg_segmented(
 }
 
 /// hscript the stage Script runs to spawn its hazards (createCustomGameObject + position).
-fn hazard_spawn_lines(model: &StageModel) -> String {
-    let mut out = String::new();
+/// Spawn lines split by what the SOURCE stage put behind the hazards switch: `(always, only when
+/// hazards are on)`. A hazard is gated when the stage class only ever spawns its class inside its
+/// own `isHazardsOn` branch; one the stage places regardless stays ungated, because in SSF2 it
+/// hurts you regardless.
+fn hazard_spawn_lines(model: &StageModel) -> (String, String) {
+    let (mut ungated, mut gated) = (String::new(), String::new());
     for (i, hz) in model.hazards.iter().enumerate() {
         let hid = hazard_id(&model.id, i, hz);
         // owned by a character (a GameObject) so the hitbox registers; setX/setY positions it.
-        out.push_str(&format!(
+        let line = format!(
             "\t\t\tvar _hz{i} = match.createCustomGameObject(self.getResource().getContent(\"{hid}\"), owner);\n\
              \t\t\tif (_hz{i} != null) {{ _hz{i}.setX({:.1}); _hz{i}.setY({:.1}); }}\n",
-            hz.x, hz.y));
+            hz.x, hz.y);
+        let is_gated = hz.class_name.as_deref()
+            .is_some_and(|c| model.hazard_gate.gated_classes.iter().any(|g| g == c));
+        if is_gated { gated.push_str(&line); } else { ungated.push_str(&line); }
     }
-    out
+    (ungated, gated)
 }
 
 fn build_manifest(model: &StageModel, hazard_entries: &[Value], structure_entries: &[Value]) -> Value {
@@ -2929,25 +3307,50 @@ fn stage_stats_hx(id: &str, parallax: &[ParallaxRef], scale: f64) -> String {
 /// Stage Script.hx — pause a static stage on frame 1; let an animated stage's timeline
 /// play (the SSF2 animated clips loop). The parallax background is camera-scrolled by
 /// StageStats, so no manual scroll is needed.
-fn script_hx(id: &str, animated: bool, hazard_spawns: &str) -> String {
+fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str)) -> String {
     let init = if animated { "\t// animated stage clips play + loop on the timeline" } else { "\tself.pause();" };
     // hazards spawn DEFERRED in update() once the match is live (one-shot via a flag). owner is
     // NULL: a stage hazard belongs to no fighter, so it damages everyone (a null hitbox owner
     // passes the engine's team-hit validation), and createCustomGameObject accepts a null owner.
-    let (haz_var, haz_body) = if hazard_spawns.is_empty() {
+    // Weather spawns in the same deferred block as hazards (it needs a live match too) and then
+    // runs every frame. Its state is one array declared alongside the hazard flag.
+    let (weather_spawn, weather_frame) = weather;
+    let (w_var, w_spawn, w_frame) = if weather_spawn.is_empty() {
+        (String::new(), String::new(), String::new())
+    } else {
+        ("var m_weather = [];\n".to_string(), weather_spawn.to_string(), weather_frame.to_string())
+    };
+    let (haz_var, haz_body) = if hazard_spawns.is_empty() && w_spawn.is_empty() {
         // no hazards: keep update() a clean empty body (byte-stable with hazardless stages).
         (String::new(), String::new())
     } else {
-        ("var m_hazardsSpawned = false;\n".to_string(),
+        ("var m_hazardsSpawned = false;\nvar m_hazardsOn = true;\nvar m_weatherSpawned = false;\n".to_string(),
          format!("\tif (!m_hazardsSpawned) {{\n\
                   \t\tvar chars = match.getCharacters();\n\
                   \t\tif (chars.length > 0) {{\n\
                   \t\t\tm_hazardsSpawned = true;\n\
+                  \t\t\t// Both engines let a match turn hazards OFF, and a converted stage has to\n\
+                  \t\t\t// mean it. WHAT goes quiet is the source stage's own decision, ported: in\n\
+                  \t\t\t// SSF2 the engine does not apply the switch to a stage, the stage asks and\n\
+                  \t\t\t// skips what it chooses to, so only what the original gated is gated here.\n\
+                  \t\t\tvar cfg = match.getMatchSettingsConfig();\n\
+                  \t\t\tm_hazardsOn = cfg == null || cfg.hazards;\n\
                   \t\t\tvar owner = null;\n\
 {hazard_spawns}\
                   \t\t}}\n\
-                  \t}}\n"))
+                  \t}}\n\
+                  \t// the weather waits for a CAMERA, not just for the match: it is scattered over\n\
+                  \t// the view and sized by it, and when the fighters first exist the camera is not\n\
+                  \t// up yet -- spawning then falls back to the source area, sized for SSF2's screen\n\
+                  \tif (!m_weatherSpawned) {{\n\
+                  \t\tvar wc0 = match.getCamera();\n\
+                  \t\tif (wc0 != null) {{\n\
+                  \t\t\tm_weatherSpawned = true;\n\
+{w_spawn}\
+                  \t\t}}\n\
+                  \t}}\n{w_frame}"))
     };
+    let haz_var = format!("{w_var}{haz_var}");
     let update_fn = if haz_body.is_empty() {
         "function update() {}\n".to_string()
     } else {
@@ -3039,8 +3442,12 @@ mod hazard_tests {
         // a null hitbox owner is neutral and passes the engine's team-hit validation (hits
         // everyone), and createCustomGameObject accepts a null owner.
         let spawn = "\t\t\tvar _hz0 = match.createCustomGameObject(self.getResource().getContent(\"demohazard0\"), owner);\n";
-        let s = script_hx("demo", false, spawn);
+        let s = script_hx("demo", false, spawn, ("", ""));
         assert!(s.contains("var owner = null;"), "hazard owner should be null: {s}");
         assert!(s.contains("createCustomGameObject"), "no spawn call: {s}");
     }
 }
+
+/// The art fallback, reachable from the stage tests. Exposed rather than duplicated so the tests
+/// pin the code that actually ships.
+pub fn render_placeholder_for_test(model: &StageModel) -> StageArt { render_placeholder(model) }

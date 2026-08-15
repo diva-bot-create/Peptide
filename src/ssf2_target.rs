@@ -297,7 +297,10 @@ impl DebugTarget for Ssf2Target {
 
         // bare verb passthrough: allow raw reflection verbs (GC/GET/READ/SPAWN/…)
         let head = expr.split_whitespace().next().unwrap_or("");
-        if matches!(head, "GC"|"RM"|"STATS"|"MC"|"ROOT"|"GET"|"IDX"|"CALL"|"CALL1"|"CALLS"|"SETP"|"READ"|"PING"|"SPAWN"|"GO"|"QUEUE"|"LOADED"|"LOADNEXT") {
+        // HOLD passes the engine a RAW SSF2 control mask, bypassing the host->SSF2 translation.
+        // That is how the translation table itself gets established: drive one bit, see which
+        // animation the character plays, write the pair down.
+        if matches!(head, "GC"|"RM"|"STATS"|"MC"|"ROOT"|"GET"|"IDX"|"CALL"|"CALL1"|"CALLS"|"SETP"|"READ"|"PING"|"SPAWN"|"GO"|"QUEUE"|"LOADED"|"LOADNEXT"|"HOLD") {
             return self.op(&expr.split_whitespace().collect::<Vec<_>>().join("\t"));
         }
 

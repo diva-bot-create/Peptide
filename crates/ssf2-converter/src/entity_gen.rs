@@ -224,6 +224,7 @@ fn reorder_animations(animations: &mut Vec<Value>, layers: &mut Vec<Value>, keyf
 /// neither dropped nor sorted back into the main list.
 fn append_missing_template_animations(
     animations: &mut Vec<Value>, layers: &mut Vec<Value>, keyframes: &mut Vec<Value>, char_id: &str,
+    image_slots: usize,
 ) {
     let present: std::collections::BTreeSet<String> = animations.iter()
         .filter_map(|a| a.get("name").and_then(Value::as_str).map(String::from))
@@ -244,14 +245,22 @@ fn append_missing_template_animations(
         "name": "====MISSING ANIMATIONS====", "layers": [sep_layer], "pluginMetadata": {} }));
 
     for name in &missing {
-        let kf_id = uuid(char_id, &format!("kf_missing_{}", name));
-        let layer_id = uuid(char_id, &format!("layer_missing_{}", name));
-        keyframes.push(json!({ "$id": kf_id, "type": "IMAGE", "length": 1, "symbol": Value::Null,
-            "tweened": false, "tweenType": "LINEAR", "pluginMetadata": {} }));
-        layers.push(json!({ "$id": layer_id, "name": "Image 0", "type": "IMAGE",
-            "keyframes": [kf_id], "hidden": false, "locked": false, "pluginMetadata": {} }));
+        // A stub still has to address every image slot. These stand in for moves the character
+        // does not have, but the states are real and can be entered, and an animation that leaves
+        // a layer unaddressed shows whatever the last animation put there -- so a missing move
+        // would wear the leftovers of whatever preceded it.
+        let mut layer_ids: Vec<String> = Vec::new();
+        for slot in 0..image_slots.max(1) {
+            let kf_id = uuid(char_id, &format!("kf_missing_{}_{}", name, slot));
+            let layer_id = uuid(char_id, &format!("layer_missing_{}_{}", name, slot));
+            keyframes.push(json!({ "$id": kf_id, "type": "IMAGE", "length": 1, "symbol": Value::Null,
+                "tweened": false, "tweenType": "LINEAR", "pluginMetadata": {} }));
+            layers.push(json!({ "$id": layer_id, "name": format!("Image {}", slot), "type": "IMAGE",
+                "keyframes": [kf_id], "hidden": false, "locked": false, "pluginMetadata": {} }));
+            layer_ids.push(layer_id);
+        }
         animations.push(json!({ "$id": uuid(char_id, &format!("anim_missing_{}", name)),
-            "name": name, "layers": [layer_id], "pluginMetadata": {} }));
+            "name": name, "layers": layer_ids, "pluginMetadata": {} }));
     }
     log::info!("Added {} missing template animation stub(s) under ====MISSING ANIMATIONS====: {}",
         missing.len(), missing.join(", "));
@@ -289,6 +298,20 @@ fn strip_trailing_return(body: &str) -> String {
 /// the real logic dead after it. Dropping the bare return keeps that logic — a
 /// conditional early-exit (`if (c) { return; }`) is inside a block (depth > 0) and
 /// is left untouched. Comment-only / blank tails don't count as "more statements".
+/// Remove the source's loop-back call from the last frame of an animation that Fraymakers loops
+/// on its own. SSF2 loops a stance by playing a label again from the final frame; the converted
+/// animation expresses the same thing as `endType: LOOP`, so the ported call is redundant -- and
+/// worse than redundant, because the label it names belongs to the un-sliced clip.
+fn strip_loop_back_calls(body: &str) -> String {
+    body.lines()
+        .filter(|line| {
+            let t = line.trim();
+            !(t.starts_with("self.playLabel(") && t.ends_with(");"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn strip_unreachable_returns(body: &str) -> String {
     if !body.contains("return;") {
         return body.to_string();
@@ -331,6 +354,36 @@ fn strip_unreachable_returns(body: &str) -> String {
 /// fire on exactly ONE frame, so after doubling we split every non-blank FRAME_SCRIPT
 /// keyframe into a 1-frame script followed by a blank keyframe holding the remainder (so
 /// total timing is preserved and the script is always followed by a blank or the anim end).
+/// Calls that hand control away from the running animation. SSF2 executes a frame's code before
+/// drawing it, so a frame carrying one of these is never displayed.
+
+/// The SSF2 animation a Fraymakers animation was converted from.
+///
+/// A SPLIT piece has to ask for its parent: the mapping files say `a` becomes `jab`, never
+/// `jab1`, so looking one up by the piece name finds nothing -- and "nothing" is indistinguishable
+/// from "no scripts", which is how sandbag's jab ended up with no frame scripts at all and no idea
+/// where SSF2 leaves it.
+fn ssf2_source_name(data: &CharacterData, source_anim: &str, anim_name: &str) -> Option<String> {
+    let mut names: Vec<&str> = vec![source_anim, anim_name];
+    for n in [source_anim, anim_name] {
+        if let Some(parent) = crate::extractor::split_parent(n) { names.push(parent); }
+    }
+    for want in names {
+        if let Some((ssf2, _)) = data.ssf2_to_fm_anim.iter().find(|(_, fm)| fm.as_str() == want) {
+            return Some(ssf2.clone());
+        }
+    }
+    None
+}
+
+/// Calls that END the move. SSF2 executes a frame's code before drawing it, so a frame carrying
+/// one of these is never displayed.
+///
+/// Only an explicit end counts. A `gotoAndStop` is just as likely to be a LOOP inside the move --
+/// a smash's charge holds itself with one -- and treating that as an ending trims a frame the
+/// original does draw, which showed up as a smash coming out SHORTER than its source.
+const ANIM_TERMINATORS: &[&str] = &["endAttack"];
+
 fn enforce_one_frame_scripts(layers: &mut [Value], keyframes: &mut Vec<Value>, char_id: &str) {
     let mut new_blanks: Vec<Value> = Vec::new();
     let mut counter = 0usize;
@@ -403,7 +456,7 @@ pub fn generate_entity(
     // ── Apply animation splits ────────────────────────────────────────────────
     // The splitter expands multi-label SSF2 animations into separate FM animations.
     // Each SplitAnim carries (fm_name, source_anim, start_frame, end_frame, loop info).
-    let split_anims = crate::anim_splitter::split_animations(&data.animations, sprite_boxes, data.stats.jump_startup.round().max(0.0) as u16);
+    let split_anims = crate::anim_splitter::split_animations(&data.animations, sprite_boxes, data.stats.jump_startup.round().max(0.0) as u16, &data.scripts);
 
     for split in &split_anims {
         let anim_name = &split.fm_name;
@@ -422,13 +475,42 @@ pub fn generate_entity(
         };
         let base_len = split_len.max(1);
         let head = split.append_head_frames as u32;     // extra frames taken from source [0, head)
-        let frame_count = base_len + head;               // total emitted frames
+        let mut frame_count = base_len + head;           // total emitted frames (see the terminator
+                                                         // trim in the frame-script pass below)
         let split_start_u = split.start_frame as u32;
         // Map a logical (emitted) frame index to its SOURCE frame: the slice maps to
         // [start, end); any appended frames wrap back to the source head [0, head).
         let src_frame = move |f: u32| -> u16 {
             if f < base_len { (split_start_u + f) as u16 } else { (f - base_len) as u16 }
         };
+        // A frame whose code ENDS the move is never SEEN in SSF2, so it must not be emitted.
+        //
+        // The two engines run a frame's code on opposite sides of drawing it. SSF2 runs the code
+        // FIRST, so a frame carrying `endAttack` (or a goto) hands control away before anything is
+        // drawn: the move is already over and that frame never appears. Fraymakers runs a frame's
+        // code AFTER drawing it, so emitting the same frame puts a pose on screen the original
+        // never showed and the converted move lasts one source frame longer than its source.
+        //
+        // This has to happen before ANY layer is built. Every layer is laid out against
+        // `frame_count`, and the engine takes an animation's length from its longest layer, so
+        // trimming only some of them leaves the animation exactly as long as it was and merely
+        // inconsistent.
+        if frame_count >= 2 {
+            let ssf2_name = ssf2_source_name(data, source_anim, anim_name);
+            let frame_offset = sprite_boxes.get(source_anim.as_str())
+                .map(|sb| sb.sprite_frame_offset as u32).unwrap_or(0) + split.start_frame as u32;
+            if let Some(ssf2) = ssf2_name {
+                let want = frame_offset + frame_count - 1;
+                let prefix = format!("{}__frame", ssf2);
+                let ends = data.scripts.iter().any(|sc| {
+                    !sc.is_ext_method
+                        && sc.name.strip_prefix(&prefix).and_then(|r| r.parse::<u32>().ok()) == Some(want)
+                        && ANIM_TERMINATORS.iter().any(|t| sc.code.contains(t))
+                });
+                if ends { frame_count -= 1; }
+            }
+        }
+
         let anim_id = uuid(char_id, &format!("anim_{}", anim_name));
         let mut anim_layer_ids: Vec<String> = Vec::new();
         // IMAGE layers are collected separately so they can be emitted FIRST in
@@ -504,11 +586,8 @@ pub fn generate_entity(
         {
             let layer_id = uuid(char_id, &format!("layer_script_{}", anim_name));
 
-            // Find the SSF2 name: check source_anim first, then fm_name
-            let ssf2_name = data.ssf2_to_fm_anim.iter()
-                .find(|(_, fm)| fm.as_str() == source_anim.as_str())
-                .or_else(|| data.ssf2_to_fm_anim.iter().find(|(_, fm)| fm.as_str() == anim_name.as_str()))
-                .map(|(ssf2, _)| ssf2.clone());
+            // Find the SSF2 name (a split piece resolves through its parent).
+            let ssf2_name = ssf2_source_name(data, source_anim, anim_name);
 
             // Frame offset = sprite base offset + split start frame
             let sprite_frame_offset = sprite_boxes.get(source_anim.as_str())
@@ -571,6 +650,18 @@ pub fn generate_entity(
                                     // a statement sequence; code after `return` is a
                                     // parse error). See strip_unreachable_returns.
                                     let body = strip_unreachable_returns(&body);
+                                    // An animation that LOOPS carries the source's own loop-back
+                                    // (`stancePlayFrame("again")` -> `playLabel("again")`) on its
+                                    // last frame. Fraymakers loops it natively via endType LOOP,
+                                    // and the label the call names was sliced off with the entry,
+                                    // so leaving it in is a call to a label that no longer exists:
+                                    // it threw once per cycle and never looped anything.
+                                    let body = if split.loop_tail && local_frame + 1 == frame_count {
+                                        strip_loop_back_calls(&body)
+                                    } else {
+                                        body
+                                    };
+                                    if body.trim().is_empty() { continue; }
                                     frame_code.insert(local_frame, body);
                                 }
                             }
@@ -1075,6 +1166,10 @@ pub fn generate_entity(
 
         // ── 5. IMAGE layers (one per depth slot, back-to-front) ────────────────────
         {
+            // Every animation addresses the SAME number of slots: the deepest any of them needs.
+            // The ones it uses carry its images; the rest are blanked below.
+            let entity_image_slots = img_result.anim_images.values()
+                .map(|a| a.max_depth_slots.max(1)).max().unwrap_or(1);
             let num_slots = img_result.anim_images.get(source_anim.as_str())
                 .map(|a| a.max_depth_slots.max(1))
                 .unwrap_or(1);
@@ -1095,12 +1190,14 @@ pub fn generate_entity(
                     // and gameplay timelines are equal length this is the identity.
                     let img_len = anim_imgs.frames.keys().max()
                         .map(|m| *m as u32 + 1).unwrap_or(1).max(1);
-                    let held: Vec<Option<crate::image_extractor::FrameImageEntry>> = (0..total)
+                    let mut held: Vec<Option<crate::image_extractor::FrameImageEntry>> = (0..total)
                         .map(|f| {
                             let looped = (src_frame(f) as u32 % img_len) as u16;
                             anim_imgs.frames.get(&looped).and_then(|v| v.get(slot)).cloned()
                         })
                         .collect();
+                    // An exit slot filled from its entry animation plays the entry BACKWARDS.
+                    if split.reversed { held.reverse(); }
 
                     let mut f: u32 = 0;
                     while f < total {
@@ -1116,10 +1213,8 @@ pub fn generate_entity(
                         let world_rot = entry.map(|e| round2(e.world_rotation)).unwrap_or(0.0);
 
                         // Run-length encode consecutive frames with identical symbol + world transform.
-                        // run_turn's FIRST frame is mirrored (see below), so it never merges into
-                        // a longer run with the unmirrored frames after it.
                         let mut run = 1u32;
-                        while f + run < total && !(anim_name == "run_turn" && f == 0) {
+                        while f + run < total {
                             let next = held[(f + run) as usize].as_ref();
                             let matches = next.map(|e| e.symbol_name.as_str()) == sym_name
                                 && next.map(|e| round2(e.world_tx))       == sym_name.is_some().then_some(world_tx)
@@ -1182,10 +1277,11 @@ pub fn generate_entity(
                                 .and_then(|sid| img_result.shape_fill_scale.get(&sid))
                                 .copied()
                                 .unwrap_or((1.0, 1.0));
-                            // stand_turn mirrors every frame; run_turn mirrors only its FIRST
-                            // frame (the character still faces the old direction for one frame
-                            // before the engine's facing flip catches up).
-                            let turn_flip = anim_name == "stand_turn" || (anim_name == "run_turn" && f == 0);
+                            // A turn animation is drawn facing the direction being turned FROM,
+                            // and fraymakers flips the character's facing when the turn STARTS, so
+                            // the art needs mirroring for the whole animation -- not just its first
+                            // frame, which left the rest of a run turn facing backwards.
+                            let turn_flip = anim_name == "stand_turn" || anim_name == "run_turn";
                             let fm_sx = round2(world_sx * fsx) * if turn_flip { -1.0 } else { 1.0 };
                             let fm_sy = round2(world_sy * fsy);
 
@@ -1223,6 +1319,14 @@ pub fn generate_entity(
                             let pivot_x = 0.0_f64;
                             let pivot_y = 0.0_f64;
                             let mut emit_rot = ((world_rot % 360.0) + 360.0) % 360.0;
+                            // A mirror reflects the pose's ROTATION too: reflecting about the
+                            // vertical axis maps an angle to its negative. Negating scaleX and x
+                            // without it leaves a rotated frame turned the wrong way -- invisible
+                            // on stand_turn, whose idle pose is flat, and plain on a run turn,
+                            // whose frames are authored at 180 and 150 degrees.
+                            if turn_flip {
+                                emit_rot = ((-emit_rot % 360.0) + 360.0) % 360.0;
+                            }
                             if anim_name == "tumble" {
                                 if let Some(img) = bitmap_img {
                                     let (hw, hh) = (img.width as f64 / 2.0, img.height as f64 / 2.0);
@@ -1294,6 +1398,38 @@ pub fn generate_entity(
                     "name": format!("Image {}", slot),
                     "type": "IMAGE",
                     "keyframes": img_kf_ids,
+                    "hidden": false,
+                    "locked": false,
+                    "pluginMetadata": {}
+                }));
+                anim_image_layer_ids.push(img_layer_id);
+            }
+
+            // Then BLANK the slots this animation does not use.
+            //
+            // A layer the engine is not told about keeps whatever the previous animation put
+            // there. Sandbag's revival is five layers deep (the neutral pose plus its platform
+            // and glow); walk is one. Walk after revival therefore inherits four layers it never
+            // asked for, and the platform rides along under the character for as long as the next
+            // animation stays shallow. It reads as a stray frame of the wrong move, which is a
+            // hard thing to trace back to a layer count.
+            //
+            // SSF2 does not have the problem because a Flash timeline clears its own layers. Here
+            // each animation has to say so, which costs one empty keyframe per unused slot: the
+            // layer exists, is addressed, and is explicitly holding nothing.
+            for slot in num_slots..entity_image_slots {
+                let img_layer_id = uuid(char_id, &format!("layer_image_{}_{}", anim_name, slot));
+                let kf_id = uuid(char_id, &format!("kf_image_blank_{}_{}", anim_name, slot));
+                keyframes.push(json!({
+                    "$id": kf_id, "type": "IMAGE", "length": frame_count.max(1),
+                    "symbol": Value::Null, "tweened": false, "tweenType": "LINEAR",
+                    "pluginMetadata": {}
+                }));
+                layers.push(json!({
+                    "$id": img_layer_id,
+                    "name": format!("Image {}", slot),
+                    "type": "IMAGE",
+                    "keyframes": [kf_id],
                     "hidden": false,
                     "locked": false,
                     "pluginMetadata": {}
@@ -1389,7 +1525,10 @@ pub fn generate_entity(
     // Order template animations per the character template; relegate everything that is
     // neither a template animation nor a direct variant of one to an UNUSED section.
     reorder_animations(&mut animations, &mut layers, &mut keyframes, char_id);
-    append_missing_template_animations(&mut animations, &mut layers, &mut keyframes, char_id);
+    let entity_image_slots = img_result.anim_images.values()
+        .map(|a| a.max_depth_slots.max(1)).max().unwrap_or(1);
+    append_missing_template_animations(&mut animations, &mut layers, &mut keyframes, char_id,
+        entity_image_slots);
 
     let entity = json!({
         "animations": animations,

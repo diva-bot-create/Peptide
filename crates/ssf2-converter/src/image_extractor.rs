@@ -1190,6 +1190,17 @@ fn build_anim_frame_images(
             }
 
             log::debug!("image_extractor: fm='{}' raw_frames={} from {} sprite frames", fm_name, frames.len(), sprite.num_frames);
+            // Per-frame symbol trace, for asking what the SOURCE actually draws on a given frame
+            // (PEPTIDE_TRACE_ANIM=tilt_up). The emitted keyframes are these, so a frame that looks
+            // wrong in Fraymakers is answered here: either it came in wrong, or it was always so.
+            if std::env::var("PEPTIDE_TRACE_ANIM").ok().as_deref() == Some(fm_name.as_str()) {
+                let mut ks: Vec<_> = frames.keys().copied().collect();
+                ks.sort();
+                for f in ks {
+                    let names: Vec<&str> = frames[&f].iter().map(|e| e.symbol_name.as_str()).collect();
+                    eprintln!("[trace-anim] {fm_name} frame {f}: {names:?}");
+                }
+            }
             if !frames.is_empty() {
                 // Fill in frames that didn't get an explicit ShowFrame snapshot (inherit previous)
                 let total = sprite.num_frames;

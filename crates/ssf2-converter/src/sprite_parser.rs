@@ -541,7 +541,11 @@ pub fn parse_sprite_boxes_from_swf(
             let frames = extract_frame_boxes(sprite, &sym_names, box_base_size, xform);
             let content_switches = extract_content_switch_frames(sprite);
 
-            log::debug!("Sprite '{}' → ssf2='{}' fm='{}': {} frames with boxes, {} labels",
+            if std::env::var("PEPTIDE_TRACE_LABELS").is_ok() {
+                eprintln!("[trace-labels] {sym} ssf2='{ssf2_name}' fm='{fm_name}' frames={} labels={frame_labels:?}",
+                          sprite.num_frames);
+            }
+        log::debug!("Sprite '{}' → ssf2='{}' fm='{}': {} frames with boxes, {} labels",
                 sym, ssf2_name, fm_name, frames.len(), frame_labels.len());
 
             // Check if this animation should be split into sub-animations
@@ -772,6 +776,13 @@ fn split_taunt(frame_labels: &[(String, u16)], total_frames: u16) -> Vec<(String
 /// Missing FM anim name → best donor FM anim name. One shared table for both the
 /// collision-box fallbacks (`apply_fallbacks`) and the image fallbacks
 /// (`image_extractor::apply_image_fallbacks`) so the two can't drift apart.
+///
+/// This is the DATA phase: an FM animation whose source data is missing entirely borrows another
+/// animation's boxes and images. The SLOT phase is a different table -- `anim_splitter`'s
+/// `SLOT_ALIASES`, which fills an FM slot that has no split of its own by reusing another split,
+/// and is where a reuse that needs slicing, clipping or REVERSING belongs (`crouch_out` runs
+/// `crouch_in` backwards there). The two are disjoint by target; if a reuse is not taking effect,
+/// it is usually because it was added to this one when it belonged in that one.
 pub(crate) const ANIM_FALLBACKS: &[(&str, &str)] = &[
     // Damage / launched states
     ("stunned",           "hurt"),

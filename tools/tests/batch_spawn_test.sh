@@ -14,11 +14,11 @@ run_one() {
   # toState(...) returns true (E:true); the engine's toState telemetry emits ANIM:<state>.
   FRAY_CHAR="$c" FRAY_PORT="$port" FRAY_ENGINE_LOG=/tmp/${c}_eng.log tools/runseq.sh 3 \
       "spawn $c thespire commandervideoassist" \
-      "match.getCharacters()[0].getStateName()" \
-      "match.getCharacters()[0].toState(CState.JAB)" \
-      "match.getCharacters()[0].getStateName()" \
-      "match.getCharacters()[0].toState(CState.SPECIAL_NEUTRAL)" \
-      "match.getCharacters()[0].body.x" \
+      "p0.getStateName()" \
+      "p0.toState(CState.JAB)" \
+      "p0.getStateName()" \
+      "p0.toState(CState.SPECIAL_NEUTRAL)" \
+      "p0.body.x" \
       >/tmp/${c}_test.log 2>&1
   local stood mok crash launched bind
   stood=$(grep -c "ANIM:STAND" /tmp/${c}_test.log)

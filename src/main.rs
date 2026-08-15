@@ -951,6 +951,66 @@ fn insert_ops_front(f: &mut hlbc::types::Function, ops: Vec<Opcode>) {
 }
 
 /// Append registers of the given type indices; returns the index of the first.
+
+/// A field's index together with the TYPE it holds, so a register can be allocated for it.
+///
+/// HL registers are typed. Reading a field into an arbitrary spare register does not fail -- it
+/// yields whatever that register was declared to hold, so the value identifies as the wrong class
+/// and dies on first touch, which reads like a dispatch or engine problem rather than a register
+/// mistake. That cost four separate debugging passes in one sitting.
+///
+/// Field resolution and register allocation cannot happen in one call here: taking the function to
+/// add a register borrows the bytecode mutably. So this returns the field's type index, and the
+/// allocation site uses it instead of picking a register and hoping.
+fn field_and_type(code: &Bytecode, type_name: &str, field: &str) -> anyhow::Result<(usize, usize)> {
+    let ti = require_type(code, type_name)?;
+    let idx = find_field(code, ti, field)
+        .ok_or_else(|| anyhow::anyhow!("field not found: {type_name}.{field}"))?;
+    let ft = code.types[ti].get_type_obj()
+        .and_then(|o| o.fields.get(idx))
+        .map(|fl| fl.t.0)
+        .ok_or_else(|| anyhow::anyhow!("field type missing: {type_name}.{field}"))?;
+    Ok((idx, ft))
+}
+
+/// One hop of a guarded field walk: which field to read, and the typed register to read it into.
+struct Hop {
+    field: usize,
+    reg: Reg,
+}
+
+/// Emit `out = <root>.f1.f2…` as a Dynamic, or null if ANY hop is null, and patch every guard to
+/// land on the same join point.
+///
+/// This walk appears more than twenty times in the injector, and each copy hand-computes its own
+/// jump offsets. One wrong offset is a wrong branch target in live engine code, which is the worst
+/// failure mode in this file, so the arithmetic lives here once.
+fn emit_guarded_chain(
+    ops: &mut Vec<Opcode>,
+    root: Reg,
+    out_dyn: Reg,
+    hops: &[Hop],
+) {
+    ops.push(Opcode::Null { dst: out_dyn });
+    let mut guards: Vec<usize> = Vec::with_capacity(hops.len() + 1);
+    guards.push(ops.len());
+    ops.push(Opcode::JNull { reg: root, offset: 0 });
+    let mut obj = root;
+    for (i, hop) in hops.iter().enumerate() {
+        ops.push(Opcode::Field { dst: hop.reg, obj, field: hlbc::types::RefField(hop.field) });
+        // the LAST hop's null-check doubles as the guard on the value itself
+        guards.push(ops.len());
+        ops.push(Opcode::JNull { reg: hop.reg, offset: 0 });
+        obj = hop.reg;
+        let _ = i;
+    }
+    ops.push(Opcode::ToDyn { dst: out_dyn, src: obj });
+    let join = ops.len();
+    for g in guards {
+        if let Opcode::JNull { offset, .. } = &mut ops[g] { *offset = join as i32 - g as i32 - 1; }
+    }
+}
+
 fn add_regs(f: &mut hlbc::types::Function, types: &[usize]) -> u32 {
     let base = f.regs.len() as u32;
     for &t in types {
@@ -1104,6 +1164,7 @@ fn connect_edit(
     let teamattack_str = add_string(code, "teamAttack");
     let teams_str = add_string(code, "teams");
     let itemfreq_str = add_string(code, "itemFrequency");
+    let hazards_str = add_string(code, "hazards");
     let create_mode = require_fn(code, "createMode", Some("fraymakers.util.$FraymakersClassFactory"))?;
     let mode_start_match = require_fn(code, "startMatch", Some("fraymakers.core.FraymakersMode"))?;
     // FM's native pre-match loading screen factory. The menus set
@@ -1124,8 +1185,8 @@ fn connect_edit(
     let buf_cap_idx = add_int(code, 512);
     let cfg = load_match_settings();
     eprintln!(
-        "match-settings: lives={} time={} teamDamage={} itemFrequency={} (FM applies lives/time/items/teamAttack; damage/size floats are SSF2-only)",
-        cfg.lives, cfg.time, cfg.team_damage, cfg.item_frequency
+        "match-settings: lives={} time={} teamDamage={} itemFrequency={} hazards={} (FM applies lives/time/items/teamAttack/hazards; damage/size floats are SSF2-only)",
+        cfg.lives, cfg.time, cfg.team_damage, cfg.item_frequency, cfg.hazards
     );
     // Int constant slots applied to the TrainingMode matchSettings virtual.
     // team_damage is a Bool emitted inline at the build site.
@@ -1133,6 +1194,7 @@ fn connect_edit(
     let time_idx = add_int(code, cfg.time);
     let itemfreq_idx = add_int(code, cfg.item_frequency);
     let cfg_team_damage = cfg.team_damage;
+    let cfg_hazards = cfg.hazards;
     let nl_idx = add_int(code, '\n' as i32);
     let two_idx = add_int(code, 2);
     let three_idx = add_int(code, 3);
@@ -1506,11 +1568,33 @@ fn connect_edit(
     let stage_entity_t = require_type(code, "pxf.entity.Stage")?;
     let stage_field = find_field(code, match_t, "stageEntity")
         .ok_or_else(|| anyhow::anyhow!("Match.stageEntity field not found"))?;
-    // NOT bound: the stage's script-API object (pxf.api.StageApi), the sandbox an entity
-    // script sees as its ambient `stage`. It's the right conceptual surface and it can be
-    // constructed correctly here (`new StageApi(stageEntity)`, back-reference verified set),
-    // but its methods are not callable through the interpreter Peptide drives: every call
-    // lands in the engine with a null receiver. Entity methods (p0.getStateName()) work, API
+    // ---- borrow a LIVE content interpreter for eval ----
+    // The stage entity owns an ApiScript whose runner already holds an interpreter with the
+    // content bindings in it (self/exports/camera/match/stage), put there by the runner's ctor.
+    // Using that interpreter is the difference between asking the engine what content can see and
+    // reconstructing it from the side. Our own names are additive on top, so `e` keeps p0..p3,
+    // characters and stageEntity as well.
+    let (stage_apiscript_field, api_script_t) = field_and_type(code, "pxf.entity.Stage", "_baseApiScriptObj")?;
+    let (apiscript_runner_field, runner_iface_t) = field_and_type(code, "pxf.api.ApiScript", "runner")?;
+    let hscript_runner_t = require_type(code, "pxf.api.runners.hscript.HscriptRunner")?;
+    // `_baseApiScriptObj` lives on the base Entity, so the same walk reaches a CHARACTER's script.
+    // That matters because only hscript content carries a borrowable interpreter: a built-in stage
+    // is compiled and has none, but a converted character on that stage does.
+    let entity_base_t = require_type(code, "pxf.entity.Entity")?;
+    let runner_interp_field = require_field(code, "pxf.api.runners.hscript.HscriptRunner", "interpreter")?;
+    // The script-api sandbox IS reachable from `e`, by borrowing rather than rebuilding (see the
+    // interp acquisition further down). An interpreted script's ambient variables are written into
+    // its interpreter's variable map by its runner's constructor -- `self`/`exports` from the base
+    // hscript runner, `camera`/`match`/`stage` from the entity one -- so `e` runs in that same
+    // interpreter and inherits all of it.
+    //
+    // Rebuilding it instead does NOT work, and the reason is worth keeping: content's `match` is a
+    // fraymakers.api.FraymakersMatchApi, a SUBCLASS, not the pxf.api.MatchApi that Match.matchApi
+    // is typed as. Hand-binding that field gives an object that identifies correctly and takes the
+    // engine down on first touch. Same for reading Match.camera.cameraApi directly. Borrowing
+    // sidesteps the whole question by never naming the type.
+    //
+    // Entity methods (p0.getStateName()) work, API
     // methods do not, so the sandbox has to be reached in bytecode the way `tree` is.
     let m_idx = add_int(code, 'm' as i32);
     let t_idx = add_int(code, 't' as i32);
@@ -1620,6 +1704,7 @@ fn connect_edit(
     let eval_match_g = add_string_const(code, "match"); // bound to MatchController.currentMatch each eval
     let eval_chars_g = add_string_const(code, "characters"); // bound to the live character ArrayObj each eval
     let eval_stage_ent_g = add_string_const(code, "stageEntity"); // the raw entity behind it (tooling)
+    let eval_match_facade_probe_g = add_string_const(code, "match"); // pre-declared null on the fallback path
     // The command implementations, in hscript (ported from bytecode). Loaded ONCE into
     // the interp after applyInterpreterGlobals; every friendly command calls into these.
     // commands.hsx holds the end-user-facing helpers; the host-owned matchStatus icon
@@ -1888,6 +1973,11 @@ fn connect_edit(
     // single engine-linked interp into which all commands eventually move as one hscript file.
     let g_interp = code.globals.len();
     code.globals.push(hlbc::types::RefType(506)); // hscript.Interp
+    // Whether the cached interp is a borrowed CONTENT one. Without this, an `e` sent before the
+    // match starts would build the fallback interp and pin it forever, so the sandbox surface
+    // would never appear no matter what was running later.
+    let g_interp_is_content = code.globals.len();
+    code.globals.push(hlbc::types::RefType(7)); // Bool
 
     // Injected HELD-control bitmask for the input-override handler ('i'). The
     // epilogue appended to Character.updateGameInput ORs this into
@@ -1936,6 +2026,12 @@ fn connect_edit(
         (Reg(eval_regs_base), Reg(eval_regs_base + 1), Reg(eval_regs_base + 2), Reg(eval_regs_base + 3));
     // Scratch for the `stage` binding (a typed Field read needs a register of the field's type).
     let stage_reg = Reg(add_regs(f, &[stage_entity_t]));
+    // one register per api class statics, each of exactly that statics type
+    let cached_interp_reg = Reg(add_regs(f, &[506]));   // hscript.Interp
+    let borrow_entity_reg = Reg(add_regs(f, &[entity_base_t]));
+    let apiscript_reg = Reg(add_regs(f, &[api_script_t]));
+    let runner_iface_reg = Reg(add_regs(f, &[runner_iface_t]));
+    let hscript_runner_reg = Reg(add_regs(f, &[hscript_runner_t]));
     // PlayerConfig scratch for post-start spawnPlayer of extra players.
     let cfg_pc_reg = Reg(add_regs(f, &[player_config_t]));
     // Scratch for the headless pre-match loading-screen factory set: the MatchController
@@ -2830,6 +2926,13 @@ fn connect_edit(
     ops.push(Opcode::Bool { dst: rr(64), value: ValBool(cfg_team_damage) });
     ops.push(Opcode::ToDyn { dst: rr(28), src: rr(64) });
     ops.push(Opcode::DynSet { obj: rr(34), field: RS(teamattack_str), src: rr(28) });
+    // hazards: the switch a stage reads to decide what of itself to run. Replacing matchConfig
+    // wholesale means an unset field is FALSE, so leaving this out launched every match with
+    // hazards off -- and a converted stage that honours the switch then looked broken rather than
+    // obedient. Both engines have the switch, so it lives in the shared match settings.
+    ops.push(Opcode::Bool { dst: rr(64), value: ValBool(cfg_hazards) });
+    ops.push(Opcode::ToDyn { dst: rr(28), src: rr(64) });
+    ops.push(Opcode::DynSet { obj: rr(34), field: RS(hazards_str), src: rr(28) });
     // teams=false (free-for-all): MatchSettingsConfig.teams (field 23, Bool) drives prepTeams@6237.
     ops.push(Opcode::Bool { dst: rr(64), value: ValBool(false) });
     ops.push(Opcode::ToDyn { dst: rr(28), src: rr(64) });
@@ -4163,12 +4266,139 @@ fn connect_edit(
     // readies every script). Created once, reused for every eval; this is the single
     // engine-linked interp all commands eventually move into as one hscript file. ----
     let _ = (hs_execute, eval_cs_g);
-    ops.push(Opcode::GetGlobal { dst: e_interp, global: RefGlobal(g_interp) });
+    ops.push(Opcode::GetGlobal { dst: cached_interp_reg, global: RefGlobal(g_interp) });
+    ops.push(Opcode::GetGlobal { dst: rr(64), global: RefGlobal(g_interp_is_content) });
+    ops.push(Opcode::Mov { dst: e_interp, src: cached_interp_reg });
     let idx_e_haveinterp = ops.len();
-    ops.push(Opcode::JNotNull { reg: e_interp, offset: 0 });            // already built -> reuse
+    ops.push(Opcode::JTrue { cond: rr(64), offset: 0 });                // content interp cached -> reuse
+    // Prefer a LIVE content interpreter: currentMatch -> stageEntity -> its ApiScript -> runner ->
+    // interpreter. That one already holds the content bindings, so the sandbox surface is present
+    // by construction rather than reconstructed. Falls back to building our own when there is no
+    // match or the stage carries no script.
+    ops.push(Opcode::Null { dst: e_interp });
+    ops.push(Opcode::GetGlobal { dst: rr(43), global: RefGlobal(mc_g) });
+    ops.push(Opcode::Field { dst: rr(44), obj: rr(43), field: RefField(cm_field) });
+    let idx_bi_nomatch = ops.len();
+    ops.push(Opcode::JNull { reg: rr(44), offset: 0 });
+    ops.push(Opcode::Field { dst: stage_reg, obj: rr(44), field: RefField(stage_field) });
+    let idx_bi_nostage = ops.len();
+    ops.push(Opcode::JNull { reg: stage_reg, offset: 0 });
+    ops.push(Opcode::Field { dst: apiscript_reg, obj: stage_reg, field: RefField(stage_apiscript_field) });
+    let idx_bi_noscript = ops.len();
+    ops.push(Opcode::JNull { reg: apiscript_reg, offset: 0 });
+    ops.push(Opcode::Field { dst: runner_iface_reg, obj: apiscript_reg, field: RefField(apiscript_runner_field) });
+    let idx_bi_norunner = ops.len();
+    ops.push(Opcode::JNull { reg: runner_iface_reg, offset: 0 });
+    // The cast is GUARDED: only content authored as hscript runs on an HscriptRunner. A built-in
+    // stage is compiled haxescript and runs on a different runner entirely, so an unguarded cast
+    // throws and takes the engine down -- `e` would crash on every shipped stage. On a failed cast
+    // the trap leaves the interpreter null and the fallback below builds our own.
+    ops.push(Opcode::Null { dst: hscript_runner_reg });
+    let idx_bi_trap = ops.len();
+    ops.push(Opcode::Trap { exc: rr(28), offset: 0 });
+    ops.push(Opcode::SafeCast { dst: hscript_runner_reg, src: runner_iface_reg });
+    ops.push(Opcode::EndTrap { exc: rr(28) });
+    let idx_bi_castdone = ops.len();
+    ops.push(Opcode::JAlways { offset: 0 });
+    let idx_bi_castfail = ops.len();
+    ops.push(Opcode::EndTrap { exc: rr(28) });
+    ops.push(Opcode::Null { dst: hscript_runner_reg });
+    let idx_bi_castjoin = ops.len();
+    if let Opcode::Trap { offset, .. } = &mut ops[idx_bi_trap] { *offset = idx_bi_castfail as i32 - idx_bi_trap as i32; }
+    if let Opcode::JAlways { offset, .. } = &mut ops[idx_bi_castdone] { *offset = idx_bi_castjoin as i32 - idx_bi_castdone as i32 - 1; }
+    let idx_bi_nocast = ops.len();
+    ops.push(Opcode::JNull { reg: hscript_runner_reg, offset: 0 });
+    ops.push(Opcode::Field { dst: e_interp, obj: hscript_runner_reg, field: RefField(runner_interp_field) });
+    let idx_bi_done = ops.len();
+    for j in [idx_bi_nomatch, idx_bi_nostage, idx_bi_noscript, idx_bi_norunner, idx_bi_nocast] {
+        if let Opcode::JNull { offset, .. } = &mut ops[j] { *offset = idx_bi_done as i32 - j as i32 - 1; }
+    }
+    // borrowed successfully? mark the cache as content-backed and skip building
+    // Second source: a live CHARACTER's script. Converted characters are hscript, so this covers
+    // every built-in stage, which is most of them.
+    let idx_c_haveinterp = ops.len();
+    ops.push(Opcode::JNotNull { reg: e_interp, offset: 0 });    // stage gave us one -> done
+    ops.push(Opcode::GetGlobal { dst: rr(43), global: RefGlobal(mc_g) });
+    ops.push(Opcode::Field { dst: rr(44), obj: rr(43), field: RefField(cm_field) });
+    let idx_c_nomatch = ops.len();
+    ops.push(Opcode::JNull { reg: rr(44), offset: 0 });
+    ops.push(Opcode::Field { dst: rr(33), obj: rr(44), field: RefField(characters_field) });
+    let idx_c_noarr = ops.len();
+    ops.push(Opcode::JNull { reg: rr(33), offset: 0 });
+    ops.push(Opcode::Field { dst: rr(16), obj: rr(33), field: RefField(0) });   // length
+    ops.push(Opcode::Int { dst: rr(39), ptr: RefInt(zero_idx) });
+    let idx_c_empty = ops.len();
+    ops.push(Opcode::JSGte { a: rr(39), b: rr(16), offset: 0 });                // 0 >= length -> none
+    ops.push(Opcode::Field { dst: rr(32), obj: rr(33), field: RefField(1) });   // native array
+    ops.push(Opcode::GetArray { dst: rr(28), array: rr(32), index: rr(39) });   // characters[0]
+    ops.push(Opcode::Null { dst: borrow_entity_reg });
+    let idx_c_trap = ops.len();
+    ops.push(Opcode::Trap { exc: rr(29), offset: 0 });
+    ops.push(Opcode::SafeCast { dst: borrow_entity_reg, src: rr(28) });
+    ops.push(Opcode::EndTrap { exc: rr(29) });
+    let idx_c_castok = ops.len();
+    ops.push(Opcode::JAlways { offset: 0 });
+    let idx_c_castfail = ops.len();
+    ops.push(Opcode::EndTrap { exc: rr(29) });
+    ops.push(Opcode::Null { dst: borrow_entity_reg });
+    let idx_c_castjoin = ops.len();
+    if let Opcode::Trap { offset, .. } = &mut ops[idx_c_trap] { *offset = idx_c_castfail as i32 - idx_c_trap as i32; }
+    if let Opcode::JAlways { offset, .. } = &mut ops[idx_c_castok] { *offset = idx_c_castjoin as i32 - idx_c_castok as i32 - 1; }
+    let idx_c_nocast = ops.len();
+    ops.push(Opcode::JNull { reg: borrow_entity_reg, offset: 0 });
+    ops.push(Opcode::Field { dst: apiscript_reg, obj: borrow_entity_reg, field: RefField(stage_apiscript_field) });
+    let idx_c_noscript = ops.len();
+    ops.push(Opcode::JNull { reg: apiscript_reg, offset: 0 });
+    ops.push(Opcode::Field { dst: runner_iface_reg, obj: apiscript_reg, field: RefField(apiscript_runner_field) });
+    let idx_c_norunner = ops.len();
+    ops.push(Opcode::JNull { reg: runner_iface_reg, offset: 0 });
+    ops.push(Opcode::Null { dst: hscript_runner_reg });
+    let idx_c_trap2 = ops.len();
+    ops.push(Opcode::Trap { exc: rr(29), offset: 0 });
+    ops.push(Opcode::SafeCast { dst: hscript_runner_reg, src: runner_iface_reg });
+    ops.push(Opcode::EndTrap { exc: rr(29) });
+    let idx_c_cast2ok = ops.len();
+    ops.push(Opcode::JAlways { offset: 0 });
+    let idx_c_cast2fail = ops.len();
+    ops.push(Opcode::EndTrap { exc: rr(29) });
+    ops.push(Opcode::Null { dst: hscript_runner_reg });
+    let idx_c_cast2join = ops.len();
+    if let Opcode::Trap { offset, .. } = &mut ops[idx_c_trap2] { *offset = idx_c_cast2fail as i32 - idx_c_trap2 as i32; }
+    if let Opcode::JAlways { offset, .. } = &mut ops[idx_c_cast2ok] { *offset = idx_c_cast2join as i32 - idx_c_cast2ok as i32 - 1; }
+    let idx_c_nocast2 = ops.len();
+    ops.push(Opcode::JNull { reg: hscript_runner_reg, offset: 0 });
+    ops.push(Opcode::Field { dst: e_interp, obj: hscript_runner_reg, field: RefField(runner_interp_field) });
+    let idx_c_done = ops.len();
+    for j in [idx_c_nomatch, idx_c_noarr, idx_c_nocast, idx_c_noscript, idx_c_norunner, idx_c_nocast2] {
+        if let Opcode::JNull { offset, .. } = &mut ops[j] { *offset = idx_c_done as i32 - j as i32 - 1; }
+    }
+    if let Opcode::JNotNull { offset, .. } = &mut ops[idx_c_haveinterp] { *offset = idx_c_done as i32 - idx_c_haveinterp as i32 - 1; }
+    if let Opcode::JSGte { offset, .. } = &mut ops[idx_c_empty] { *offset = idx_c_done as i32 - idx_c_empty as i32 - 1; }
+
+    let idx_bi_have = ops.len();
+    ops.push(Opcode::JNull { reg: e_interp, offset: 0 });      // nothing borrowed -> fall through
+    ops.push(Opcode::Bool { dst: rr(64), value: ValBool(true) });
+    ops.push(Opcode::SetGlobal { global: RefGlobal(g_interp_is_content), src: rr(64) });
+    let idx_bi_borrowed = ops.len();
+    ops.push(Opcode::JAlways { offset: 0 });                   // -> prepare
+    // nothing to borrow: keep the fallback interp we built earlier, if any
+    ops.push(Opcode::Mov { dst: e_interp, src: cached_interp_reg });
+    let idx_bi_reuse_fallback = ops.len();
+    ops.push(Opcode::JNotNull { reg: e_interp, offset: 0 });
     ops.push(Opcode::New { dst: e_interp });
     ops.push(Opcode::Call1 { dst: r_ret, fun: RefFun(hs_interp_ctor), arg0: e_interp });
     ops.push(Opcode::Call1 { dst: r_ret, fun: RefFun(hs_apply_globals), arg0: e_interp }); // load engine API
+    // a fallback interp is NOT final: leaving the flag false means the next eval tries the borrow
+    // again, so `e` upgrades itself to the content interpreter as soon as a match is running.
+    ops.push(Opcode::Bool { dst: rr(64), value: ValBool(false) });
+    ops.push(Opcode::SetGlobal { global: RefGlobal(g_interp_is_content), src: rr(64) });
+    // Fallback path only: declare `match` as null so commands.hsx can test for a real one without
+    // throwing on an unset name. On the borrowed path the runner's own `match` must survive.
+    ops.push(Opcode::Null { dst: rr(28) });
+    ops.push(Opcode::GetGlobal { dst: rr(14), global: RefGlobal(eval_match_facade_probe_g) });
+    ops.push(Opcode::Call3 { dst: r_ret, fun: RefFun(hs_setvar), arg0: e_interp, arg1: rr(14), arg2: rr(28) });
+    let idx_bi_built = ops.len();
+    if let Opcode::JNotNull { offset, .. } = &mut ops[idx_bi_have] { *offset = idx_bi_built as i32 - idx_bi_have as i32 - 1; }
     ops.push(Opcode::SetGlobal { global: RefGlobal(g_interp), src: e_interp });
     // load the hscript command script (commands.hsx) (the ported command implementations) into the interp, once.
     ops.push(Opcode::New { dst: e_parser });
@@ -4190,7 +4420,10 @@ fn connect_edit(
     ops.push(Opcode::GetGlobal { dst: rr(14), global: RefGlobal(eval_td_g) });
     ops.push(Opcode::Call3 { dst: r_ret, fun: RefFun(hs_setvar), arg0: e_interp, arg1: rr(14), arg2: rr(28) });
     let idx_e_interp_ready = ops.len();
-    if let Opcode::JNotNull { offset, .. } = &mut ops[idx_e_haveinterp] { *offset = idx_e_interp_ready as i32 - idx_e_haveinterp as i32 - 1; }
+    if let Opcode::JTrue { offset, .. } = &mut ops[idx_e_haveinterp] { *offset = idx_e_interp_ready as i32 - idx_e_haveinterp as i32 - 1; }
+    if let Opcode::JNotNull { offset, .. } = &mut ops[idx_bi_reuse_fallback] { *offset = idx_e_interp_ready as i32 - idx_bi_reuse_fallback as i32 - 1; }
+    if let Opcode::JNull { offset, .. } = &mut ops[idx_bi_have] { *offset = idx_bi_borrowed as i32 - idx_bi_have as i32; }
+    if let Opcode::JAlways { offset, .. } = &mut ops[idx_bi_borrowed] { *offset = idx_bi_built as i32 - idx_bi_borrowed as i32 - 1; }
     // ---- bind p0 = MatchController.currentMatch.characters[0] (as Dynamic; null if no match) ----
     // so scripts can reach the live character: `p0.toState(...)`, `p0.body.x`, etc.
     ops.push(Opcode::GetGlobal { dst: rr(43), global: RefGlobal(mc_g) });
@@ -4268,19 +4501,11 @@ fn connect_edit(
     // imply a parity with converted scripts that doesn't hold (see the note at stage_field).
     // This is the raw entity, for tooling that needs what's actually in the match rather
     // than what content is allowed to touch — placement diffing against SSF2's display list.
-    ops.push(Opcode::Null { dst: rr(28) });                                            // default null
     ops.push(Opcode::GetGlobal { dst: rr(43), global: RefGlobal(mc_g) });
-    ops.push(Opcode::Field { dst: rr(44), obj: rr(43), field: RefField(cm_field) });   // currentMatch
-    let idx_st_jnomatch = ops.len();
-    ops.push(Opcode::JNull { reg: rr(44), offset: 0 });                                // no match -> null
-    ops.push(Opcode::Field { dst: stage_reg, obj: rr(44), field: RefField(stage_field) });
-    let idx_st_jnostage = ops.len();
-    ops.push(Opcode::JNull { reg: stage_reg, offset: 0 });                             // no stage -> null
-    ops.push(Opcode::ToDyn { dst: rr(28), src: stage_reg });
-    let idx_st_set = ops.len();
-    for j in [idx_st_jnomatch, idx_st_jnostage] {
-        if let Opcode::JNull { offset, .. } = &mut ops[j] { *offset = idx_st_set as i32 - j as i32 - 1; }
-    }
+    emit_guarded_chain(&mut ops, rr(43), rr(28), &[
+        Hop { field: cm_field, reg: rr(44) },        // currentMatch
+        Hop { field: stage_field, reg: stage_reg },  // .stageEntity
+    ]);
     ops.push(Opcode::GetGlobal { dst: rr(14), global: RefGlobal(eval_stage_ent_g) });
     ops.push(Opcode::Call3 { dst: r_ret, fun: RefFun(hs_setvar), arg0: e_interp, arg1: rr(14), arg2: rr(28) });
     // ---- crash-proof eval: parse + run inside a Trap. On ANY error (parse OR runtime)

@@ -833,6 +833,30 @@ impl Drop for EffectAnimGuard {
     }
 }
 
+
+/// Whether an `attachEffect("name")` can actually be spawned in the converted output: either the
+/// name maps to one of the engine's own global VFX, or this character emitted an effect entity
+/// for it.
+///
+/// Anything else is a SHARED SSF2 effect that lives in some other character's file (sandbag's
+/// `effect_land` is defined in bandanadee's), and referencing one is not harmless. `getContent`
+/// does not validate: it builds `private::<resource>.<id>` from whatever it is handed, so a
+/// missing id yields a DANGLING reference, and a VfxStats built on one renders the resource's
+/// first animation instead of nothing. For a character that is `revival` -- so a move with an
+/// unconvertible effect drew the character on its revival platform for a frame or two, in
+/// whatever move happened to spawn it.
+pub fn effect_is_spawnable(name: &str) -> bool {
+    if crate::mappings::api_commands().global_vfx_map.contains_key(name) { return true; }
+    EFFECT_PRIMARY_ANIMS.with(|cell| cell.borrow().contains_key(name))
+}
+
+/// The note left where an unspawnable effect was asked for.
+fn unspawnable_note(name: &str) -> String {
+    format!("attachEffect(\"{name}\") not spawned: no GlobalVfx mapping and no local effect entity \
+(an SSF2 shared effect defined in another character's file). Add a global_vfx_map entry in \
+commands.jsonc, or supply a {name}.entity")
+}
+
 /// Rewrite `self.attachEffect("name")` and `self.attachEffect("name", { props })`
 /// to `match.createVfx(new VfxStats({ spriteContent: …, animation: "<primary>", <translated props> }), self)`.
 ///
@@ -891,6 +915,7 @@ pub fn rewrite_attach_effect_calls(code: &str) -> String {
         for (key, value) in parse_prop_bag(props_block) {
             translate_attach_effect_prop(&key, &value, &mut fm_fields, &mut todo_lines);
         }
+        drop_redundant_flip(&mut fm_fields);
         let mut bag = build_vfx_head(name);
         for (k, v) in &fm_fields {
             bag.push_str(&format!(", {}: {}", k, v));
@@ -913,9 +938,15 @@ pub fn rewrite_attach_effect_calls(code: &str) -> String {
             out.push('\n');
         }
         out.push_str(indent);
-        out.push_str(&format!(
-            "match.createVfx(new VfxStats({{ {bag} }}), self)"
-        ));
+        if effect_is_spawnable(name) {
+            out.push_str(&format!(
+                "match.createVfx(new VfxStats({{ {bag} }}), self)"
+            ));
+        } else {
+            // Not spawnable: leave the intent visible and spawn NOTHING. Emitting the call anyway
+            // draws the entity's first animation (see effect_is_spawnable).
+            out.push_str(&format!("// TODO: {}", unspawnable_note(name)));
+        }
         out
     });
 
@@ -928,6 +959,9 @@ pub fn rewrite_attach_effect_calls(code: &str) -> String {
         let name = &caps[1];
         let props_block = &caps[2];
         let (bag, todos) = build_bag(name, props_block);
+        if !effect_is_spawnable(name) {
+            return format!("null /* TODO: {} */", unspawnable_note(name));
+        }
         let call = format!("match.createVfx(new VfxStats({{ {bag} }}), self)");
         if todos.is_empty() {
             call
@@ -939,6 +973,9 @@ pub fn rewrite_attach_effect_calls(code: &str) -> String {
     // 1-arg form — no props to translate; the head alone is the bag.
     let after_1arg = re_1arg.replace_all(&after_any_2arg, |caps: &regex::Captures| {
         let name = &caps[1];
+        if !effect_is_spawnable(name) {
+            return format!("null /* TODO: {} */", unspawnable_note(name));
+        }
         let head = build_vfx_head(name);
         format!("match.createVfx(new VfxStats({{ {head} }}), self)")
     });
@@ -1020,6 +1057,47 @@ fn parse_prop_bag(body: &str) -> Vec<(String, String)> {
 /// `fm_fields`. On an explicit `todo` or an unknown key, push a
 /// `// TODO:` note onto `todo_lines`. Both arrays are caller-owned so
 /// the rewrite can emit them in source order.
+
+/// Drop the source's own horizontal flip from an effect offset when the engine is already doing it.
+///
+/// SSF2 does not mirror an attached effect with its owner, so its scripts flip the offset by hand
+/// (`x: self.flipX(78)`). Fraymakers DOES mirror it, via the `flipWith` that `parentLock` expands
+/// to -- measured in-engine: with `flipWith: true` and a raw `x: 78`, the effect lands at +78
+/// facing right and -78 facing left. Porting both flips means they cancel, and every effect with a
+/// sideways offset appears on the wrong side of a character facing left.
+///
+/// So the flip is removed from the VALUE exactly when `flipWith` is set, and kept when it is not.
+fn drop_redundant_flip(fm_fields: &mut [(String, String)]) {
+    let engine_flips = fm_fields.iter().any(|(k, v)| k == "flipWith" && v.trim() != "false");
+    if !engine_flips { return; }
+    for (k, v) in fm_fields.iter_mut() {
+        if k != "x" { continue; }
+        if let Some(inner) = strip_call(v.trim(), "self.flipX(") {
+            *v = inner;
+        }
+    }
+}
+
+/// `self.flipX(<expr>)` -> `<expr>`, respecting nesting. None when the text is not that call.
+fn strip_call(text: &str, open: &str) -> Option<String> {
+    let rest = text.strip_prefix(open)?;
+    let mut depth = 1usize;
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // only a bare call, not `self.flipX(1) + 2`
+                    return rest[i + 1..].trim().is_empty().then(|| rest[..i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn translate_attach_effect_prop(
     key: &str,
     value: &str,

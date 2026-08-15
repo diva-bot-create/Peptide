@@ -204,6 +204,16 @@ output is a FrayTools character package directory (full layout in [`README.md`](
 after unwrapping, `swf_parser::parse` uses the Ruffle `swf` crate (`decompress_swf` +
 `parse_swf`) to turn the bytes into a tag tree.
 
+### what a package must contain to LOAD (not just to parse)
+
+peptide's reader is deliberately forgiving, so a stage package can convert cleanly and still be a
+file the game will not open: the container form, the tag ORDER, the class graph, the clip tree and
+the api layer are all load-bearing, and none of them announce themselves when wrong.
+
+that is its own subject and it has its own home:
+[`docs/SSF2_PACKAGE_FORMAT.md`](docs/SSF2_PACKAGE_FORMAT.md) covers every requirement, why each one
+fails silently, and how to diagnose a package that will not load.
+
 ### SWF structure for SSF2 characters
 
 ```

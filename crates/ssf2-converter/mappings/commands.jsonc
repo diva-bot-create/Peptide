@@ -58,6 +58,11 @@
     { "from": "SSF2API.getCamBounds()", "to": "match.getStage().getCameraBounds()" },   // returns RectCollisionArea, not a MovieClip
     { "from": "SSF2API.getDeathBounds()", "to": "match.getStage().getDeathBounds()" },
     { "from": "SSF2API.getGameSettings()", "to": "match.getMatchSettingsConfig()" },    // field shape differs — manual touch-up
+    // the hazards switch, same question on both engines: a stage asks whether the match wants its
+    // hazards. Fraymakers' own stages read the field this lowers to, so this is an exact route, not
+    // an approximation. WHAT a stage skips when it's off is the stage's own decision and is ported
+    // separately (abc_parser::extract_hazard_gate).
+    { "from": "SSF2API.isHazardsOn()", "to": "match.getMatchSettingsConfig().hazards" },
     //   Engine / AudioClip statics:
     { "from": "SSF2API.generateUID()", "to": "Engine.makeUid()" },
     { "from": "SSF2API.getUID()", "to": "Engine.makeUid()" },
@@ -623,7 +628,13 @@
     "global_sparkle":       "SPARKLE_LIGHT",
     "global_smash_spark":   "SPARKLE_HEAVY",
     // Item pickup indicator.
-    "itempickup_effect":    "ITEM_INDICATOR"
+    "itempickup_effect":    "ITEM_INDICATOR",
+    // SSF2 SHARED effects — registered by whichever character's file defines them (sandbag's
+    // `effect_land` lives in bandanadee's), so a character that only REFERENCES one has nothing
+    // to convert. Fraymakers has its own equivalents, so they map here rather than dangling.
+    // Anything left unmapped is not spawned at all: see api_mappings::effect_is_spawnable.
+    "effect_land":          "LAND_DUST",
+    "ground_bounce":        "LAND_DUST"
   },
 
   // global_sound_map: SSF2 *shared* sound ids (not extracted into a

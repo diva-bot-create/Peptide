@@ -313,7 +313,7 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
             Some((ch, stage)) => {
                 // Headless quick boot: skip the disclaimer/menus at the call site and queue
                 // the match's char + stage so they load during the boot loading screen.
-                ssf2_converter::abc_inject::inject_quickboot(abc, ch, stage)?;
+                ssf2_converter::abc_inject::inject_quickboot(abc, ch, stage, std::env::var("PEPTIDE_PRIME_STAGE").ok().as_deref())?;
             }
             None => {
                 // Normal boot: the disclaimer plays and fires the event-driven READY.
@@ -328,11 +328,66 @@ pub fn install_patched(port: u16, fastboot: Option<(&str, &str)>) -> Result<Path
         // between sending input and starting to watch). See inject_frame_recorder.
         ssf2_converter::abc_inject::inject_frame_recorder(abc, SSF2_DOC_CLASS, 0)?;
         // engine-error telemetry, the SSF2 half of Fraymakers' SCRIPTERR channel
-        ssf2_converter::abc_inject::inject_error_reporter(abc, SSF2_DOC_CLASS)
+        ssf2_converter::abc_inject::inject_error_reporter(abc, SSF2_DOC_CLASS)?;
+        // and the load-time half: a package the engine refuses names itself instead of
+        // failing silently, which is the only signal a custom-content author ever gets
+        ssf2_converter::abc_inject::inject_load_error_reporter(abc, SSF2_DOC_CLASS)?;
+        // and the surface nothing was watching: an error thrown by a package's OWN code as it
+        // loads goes to the loader, not the app, and unhandled there it ends the process
+        ssf2_converter::abc_inject::inject_package_error_reporter(abc, SSF2_DOC_CLASS)?;
+        // and the one an author can act on: which part of the stage clip tree is missing, by
+        // name, instead of an undefined-value error from somewhere inside the engine.
+        //
+        // OPT-IN (`PEPTIDE_STAGE_CHECK`), because of WHERE it has to run. It reads a resource
+        // while the game is validating it, and even wrapped in a catch-all it still perturbs the
+        // load: with it on, the queue gets a fraction of the way it otherwise does. A diagnostic
+        // that degrades the thing it is diagnosing is worse than no diagnostic, so it stays off
+        // by default until it can run somewhere off the load path.
+        if std::env::var("PEPTIDE_STAGE_CHECK").is_ok() {
+            ssf2_converter::abc_inject::inject_stage_shape_check(abc, SSF2_DOC_CLASS)?;
+        }
+        // Attribute a thrown error to the method it came from. The runtime strips line
+        // information out of errors, so without this an author gets a bare code and no idea
+        // which file to open; each of these reports against its own compiled-in source location
+        // and rethrows, leaving behaviour untouched.
+        for (class, method, is_static) in if std::env::var("PEPTIDE_NO_LOCATOR").is_ok() { vec![] } else { vec![
+            ("GameController", "actuallyStartMatch", true),
+            ("GameController", "startMatch", true),
+            ("StageData", "<ctor>", false),
+            ("StageData", "startGame", false),
+            ("Resource", "getProp", false),
+            ("ResourceManager", "validateResource", true),
+            ("StageData", "findObjects", false),
+            ("MovingPlatform", "<ctor>", false),
+            ("Platform", "<ctor>", false),
+            ("BitmapCollisionBoundary", "<ctor>", false),
+        ] } {
+            ssf2_converter::abc_inject::inject_error_locator(abc, SSF2_DOC_CLASS, class, method, is_static)?;
+        }
+        if std::env::var("PEPTIDE_PROBE_LOAD").is_ok() {
+            for (class, method, is_static, subject) in [
+                ("Resource", "load", false, Some("ID")),
+                ("Resource", "loadComplete", false, Some("ID")),
+            ] {
+                ssf2_converter::abc_inject::inject_method_probe(
+                    abc, SSF2_DOC_CLASS, class, method, is_static, subject)?;
+            }
+        }
+        // make the physics fixture askable by id. the engine's id-to-file map comes from a
+        // manifest it carries, so a package outside that manifest is never opened; this adds
+        // the one entry without rewriting the manifest or touching any shipped data file.
+        ssf2_converter::abc_inject::inject_extra_resource(
+            abc, ssf2_converter::test_fixture::FIXTURE_ID, FIXTURE_DAT_FILE,
+            ssf2_converter::test_fixture::FIXTURE_GUID,
+            ssf2_converter::abc_inject::SSF2_RESOURCE_TYPE_STAGE)
     })?;
     macos_resign(&dst_app);
     Ok(dst_app)
 }
+
+/// The data-directory name the fixture package is installed under. Deliberately far above the
+/// shipped numbering so it can never collide with a future one.
+pub const FIXTURE_DAT_FILE: &str = "DAT9000.ssf";
 
 /// `peptide ssf2 selftest` — install, boot, confirm injected code executed
 /// (the marker file appears). Proves the code-execution bridge end-to-end.
