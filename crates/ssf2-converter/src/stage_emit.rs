@@ -108,8 +108,20 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // animated bg element on any stage is treated this way. `PEPTIDE_BG_INLINE` forces the old
     // all-baked behavior for debugging/diffing.
     let inline_bg = std::env::var("PEPTIDE_BG_INLINE").is_ok();
-    let (baked_bg, mut promoted_bg): (Vec<BgLayerRef>, Vec<BgLayerRef>) =
-        bg_refs.into_iter().partition(|l| inline_bg || l.frames.len() <= 1);
+    // Promotion moves an element out of the stage entity into a background CONTAINER, and the
+    // containers draw in front of every baked IMAGE layer. So a baked element SSF2 draws in FRONT
+    // of a promoted one has to move as well, or it vanishes behind it -- clocktown's wooden deck
+    // (static, drawn over the animated town backdrop) was hidden by it completely. Layers behind
+    // the first promoted element keep their place; the ones after it are emitted PAST the
+    // containers instead, which restores the source order across the plane.
+    let is_promoted = |l: &BgLayerRef| !(inline_bg || l.frames.len() <= 1);
+    let first_promoted = bg_refs.iter().position(&is_promoted);
+    let (mut baked_bg, mut baked_front, mut promoted_bg) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, layer) in bg_refs.into_iter().enumerate() {
+        if is_promoted(&layer) { promoted_bg.push(layer); }
+        else if first_promoted.is_some_and(|p| i > p) { baked_front.push(layer); }
+        else { baked_bg.push(layer); }
+    }
     // an ANIMATED foreground element hits the SAME shared-master-clock bug as an animated
     // background one: baked into the stage entity it gets tiled/truncated to the master length
     // instead of running its own loop. Promotion was background-only, so it never reached the
@@ -151,6 +163,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
         emit_platform_structures(model, &lib, &sprites)?;
     let art = ArtRefs {
         background: baked_bg,
+        background_front: baked_front,
         parallax: parallax_refs,
         stage: stage_refs,
         // emptied when the foreground was promoted to its own looping VFX above, so it isn't
@@ -187,7 +200,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // bowserscastle) animates just as much as the stage plane, so checking only the stage plane
     // froze background-animated stages (the Script paused the whole timeline).
     // the foreground glow flickers (its own animated layer), so it also requires a playing timeline.
-    let animated = art.background.iter().any(|l| l.frames.len() > 1) || art.stage.len() > 1
+    let animated = art.background.iter().chain(&art.background_front).any(|l| l.frames.len() > 1) || art.stage.len() > 1
         || !art.foreground.is_empty();
     // the stage spawns its moving-platform structures + hazards in its Script.
     let mut spawns = structure_spawn_ids.iter()
@@ -621,7 +634,11 @@ fn bg_layer_name(sym: &str, idx: usize) -> String {
 
 /// The depth layers the entity lays out. `stage` is the frame sequence (1 = static);
 /// `background` is the ordered per-element backdrop layers (each 1 = static).
-struct ArtRefs { background: Vec<BgLayerRef>, parallax: Vec<ParallaxRef>, stage: Vec<ArtRef>, foreground: Vec<ArtRef>, foreground_occluders: Vec<ArtRef>, platform_sprites: Vec<(String, f64, f64, u8)>,
+struct ArtRefs { background: Vec<BgLayerRef>,
+    /// Baked background layers that sit IN FRONT of a promoted (container-hosted) element, so they
+    /// are laid out after the background containers instead of before them.
+    background_front: Vec<BgLayerRef>,
+    parallax: Vec<ParallaxRef>, stage: Vec<ArtRef>, foreground: Vec<ArtRef>, foreground_occluders: Vec<ArtRef>, platform_sprites: Vec<(String, f64, f64, u8)>,
     /// see `StageArtSet::foreground_is_blend_overlay`
     foreground_is_blend_overlay: bool,
     /// see `StageArtSet::foreground_alpha`
@@ -712,7 +729,7 @@ fn build_entity(model: &StageModel, art: &ArtRefs) -> Value {
     // (each frame carries its own hold = the run length of identical source frames at FM's
     // 60fps), so the loop matches the SSF2 duration. a static layer holds for the whole loop.
     let layer_len = |refs: &[ArtRef]| refs.iter().map(|a| a.hold).sum::<usize>();
-    let bg_max_len = art.background.iter().map(|l| layer_len(&l.frames)).max().unwrap_or(0);
+    let bg_max_len = art.background.iter().chain(&art.background_front).map(|l| layer_len(&l.frames)).max().unwrap_or(0);
     b.frame_len = bg_max_len.max(layer_len(&art.stage)).max(1);
 
     // ── render order (first = back): the painted backdrop, background depth containers,
@@ -733,6 +750,14 @@ fn build_entity(model: &StageModel, art: &ArtRefs) -> Value {
     b.add_container("Background Effects", "BACKGROUND_EFFECTS_CONTAINER");
     b.add_container("Background Shadows", "BACKGROUND_SHADOWS_CONTAINER");
     b.add_container("Background Structures", "BACKGROUND_STRUCTURES_CONTAINER");
+    // baked art the source draws over a promoted element (see the split in `emit_stage`)
+    for layer in &art.background_front {
+        match layer.frames.as_slice() {
+            [] => {}
+            [a] => b.add_image(&layer.name, &a.guid, a.x, a.y),
+            frames => b.add_image_frames(&layer.name, &frames.iter().map(|a| (a.guid.clone(), a.x, a.y, a.hold)).collect::<Vec<_>>()),
+        }
+    }
     if !art.stage.is_empty() {
         let frames: Vec<(String, f64, f64, usize)> = art.stage.iter().map(|a| (a.guid.clone(), a.x, a.y, a.hold)).collect();
         b.add_image_frames("Stage Art", &frames);
