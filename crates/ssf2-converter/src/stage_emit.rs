@@ -61,7 +61,8 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
         write_json(&sprites.join(format!("{id}_{suffix}.png.meta")), &json!({
             "export": false, "guid": guid, "id": "", "pluginMetadata": {}, "plugins": [], "tags": [], "version": 2
         }))?;
-        Ok(ArtRef { guid, x: art.x, y: art.y, w: art.w, h: art.h, hold: art.hold.max(1) as usize })
+        Ok(ArtRef { guid, x: art.x, y: art.y, w: art.w, h: art.h, hold: art.hold.max(1) as usize,
+                    rotation: art.rotation, scale_x: art.scale_x, scale_y: art.scale_y })
     };
     let stage_fallback;
     let stage_frames: Vec<&StageArt> = if !model.art.stage_frames.is_empty() {
@@ -558,7 +559,10 @@ impl<'a> EntityBuilder<'a> {
 
 /// A written art layer the entity references: the sprite `.meta` guid + placement + size.
 #[derive(Clone)]
-struct ArtRef { guid: String, x: f64, y: f64, w: u32, h: u32, hold: usize }
+struct ArtRef { guid: String, x: f64, y: f64, w: u32, h: u32, hold: usize,
+    /// Orientation for this frame. Non-zero when the element is a few cels the source MOVES or
+    /// TURNS: the art is emitted once per cel and oriented here, rather than baked per angle.
+    rotation: f64, scale_x: f64, scale_y: f64 }
 
 /// A parallax camera-background layer: the written sprite + its scroll mode + pan rate.
 struct ParallaxRef { art: ArtRef, mode: ParallaxMode, x_pan: f64, y_pan: f64 }
@@ -645,7 +649,7 @@ fn render_placeholder(model: &StageModel) -> StageArt {
         image::codecs::png::PngEncoder::new(&mut png)
             .write_image(img.as_raw(), 1, 1, image::ExtendedColorType::Rgba8)
             .expect("encode placeholder png");
-        return StageArt { png, x: 0.0, y: 0.0, w: 1, h: 1, hold: 1 };
+        return StageArt { png, x: 0.0, y: 0.0, w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 };
     }
 
     // bounding box of all collision geometry, with a small margin.
@@ -693,7 +697,7 @@ fn render_placeholder(model: &StageModel) -> StageArt {
     }
     // Position stays in FM units: a placement's x/y are already parent-space coordinates and only
     // the image's PIXELS are scaled. Size is what had to change, not where it sits.
-    StageArt { png, x: min_x, y: min_y, w, h, hold: 1 }
+    StageArt { png, x: min_x, y: min_y, w, h, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 }
 }
 
 /// How large a placeholder raster may get. Big enough for every stage in the corpus at source
@@ -2760,7 +2764,10 @@ fn bg_element_entity(eid: &str, layer: &BgLayerRef, scale: f64) -> Value {
     let symbols: Vec<Value> = layer.frames.iter().enumerate().map(|(j, f)| json!({
         "$id": g(&format!("sym{j}")), "type": "IMAGE", "imageAsset": f.guid,
         "x": f.x - ox, "y": f.y - oy, "pivotX": 0.0, "pivotY": 0.0,
-        "scaleX": scale, "scaleY": scale, "rotation": 0.0, "alpha": alpha, "pluginMetadata": {}
+        // the frame's own orientation composes with the stage scale: an element emitted as cels
+        // plus placements carries its turn here instead of in its pixels
+        "scaleX": scale * f.scale_x, "scaleY": scale * f.scale_y, "rotation": f.rotation,
+        "alpha": alpha, "pluginMetadata": {}
     })).collect();
     let mut keyframes: Vec<Value> = layer.frames.iter().enumerate().map(|(j, f)| json!({
         "$id": g(&format!("kf{j}")), "symbol": g(&format!("sym{j}")), "length": f.hold.max(1),
@@ -3009,8 +3016,7 @@ fn split_static_plate(frames: &[crate::stage_parser::StageArt])
         moving.push(crate::stage_parser::StageArt {
             png: encode(&crop)?,
             x: f.x + x0 as f64, y: f.y + y0 as f64,
-            w: bw, h: bh, hold: f.hold,
-        });
+            w: bw, h: bh, hold: f.hold, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 });
     }
     log::info!("backdrop element: {}x{} canvas with a {bw}x{bh} moving region — emitting a still plate plus the crop",
                cw, ch);
@@ -3050,7 +3056,7 @@ fn write_element_frames(
     for (j, a) in src.iter().enumerate() {
         if let Some((_, prev)) = seen.iter().find(|(i, _)| same_art(&src[*i], a)) {
             // same picture as an earlier frame: reuse the asset, keep this frame's own hold
-            out.push(ArtRef { hold: a.hold.max(1) as usize, ..prev.clone() });
+            out.push(ArtRef { hold: a.hold.max(1) as usize, rotation: a.rotation, scale_x: a.scale_x, scale_y: a.scale_y, x: a.x, y: a.y, ..prev.clone() });
             continue;
         }
         let r = write_layer(&format!("{eid}_{j}"), a)?;

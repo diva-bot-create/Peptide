@@ -40,6 +40,17 @@ impl Mat {
     }
     /// `+1.0` if this matrix preserves x-orientation, `-1.0` if mirrored (scaleX < 0).
     fn x_sign(&self) -> f64 { if self.a < 0.0 { -1.0 } else { 1.0 } }
+    /// This placement in the form the emitter draws from -- the SAME conversion the character art
+    /// path uses, so a shape on a backdrop is placed like a shape on a character.
+    fn placement(&self) -> crate::fm_placement::WorldPlacement {
+        crate::fm_placement::WorldPlacement {
+            tx: self.tx, ty: self.ty,
+            sx: (self.a * self.a + self.b * self.b).sqrt() * if self.a < 0.0 { -1.0 } else { 1.0 },
+            sy: (self.c * self.c + self.d * self.d).sqrt() * if self.d < 0.0 { -1.0 } else { 1.0 },
+            rotation: self.b.atan2(self.a).to_degrees(),
+            a: self.a, b: self.b, c: self.c, d: self.d,
+        }
+    }
     /// `(flip_x, flip_y)` for an AXIS-ALIGNED placement (a mirrored decorative element). A
     /// negative scale on an axis means the art is drawn reversed there; the raster path composites
     /// onto an axis-aligned AABB and so must mirror the tile to match. Rotated/skewed matrices (b/c
@@ -395,6 +406,13 @@ pub struct StageArt {
     /// this is the run length of identical source frames times the 30->60fps doubling, so the
     /// loop matches the SSF2 duration and held frames read as pauses. 1 for a static layer.
     pub hold: u32,
+    /// Orientation for this frame, when the element is ONE shape the source moves or turns rather
+    /// than a composite redrawn each frame. The art is then emitted once and placed by these --
+    /// the same thing the character path does, and the difference between a rotating clock hand
+    /// costing one bitmap and costing one per angle.
+    pub rotation: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
 }
 
 impl StageModel {
@@ -457,6 +475,10 @@ struct Instance {
     /// grouping splits them into independent elements that each loop on their OWN period (a
     /// merged capture cuts every child whose cycle doesn't divide the parent's).
     inst_path: u64,
+    /// This leaf's world placement, in the shared form (`fm_placement`). An element whose frames
+    /// are ONE shape being moved or turned is emitted as that shape once plus these per frame,
+    /// instead of a fresh raster per angle.
+    place: crate::fm_placement::WorldPlacement,
     /// This leaf's OWN placement depth inside its owning clip. Sibling shapes in one clip share
     /// `inst_path` (they belong to the same clip), so this is what tells them apart -- the static
     /// backdrop plate from the clock hands animating over it.
@@ -1093,7 +1115,7 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
                 .write_image(&rgba, w_px, h_px, image::ExtendedColorType::Rgba8).ok()?;
         }
         Some(Weather {
-            art: StageArt { png, x: 0.0, y: 0.0, w: w_px, h: h_px, hold: 1 },
+            art: StageArt { png, x: 0.0, y: 0.0, w: w_px, h: h_px, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 },
             count: w.count,
             width: w.width * scale,
             height: w.height * scale,
@@ -1675,6 +1697,7 @@ fn walk_frame(
                 hazard: None,  // hazards come from the geometry walk, not the art-frame walk
                 inst_anchor,
                 inst_path,
+                place: world.placement(),
                 leaf_depth: *pdepth,
                 blend: pblend.or(blend),
                 inst_clip,
@@ -1820,7 +1843,7 @@ fn fit_blend_overlay(mask: &StageArt, base: &StageArt) -> Option<StageArt> {
     use image::ImageEncoder;
     image::codecs::png::PngEncoder::new(&mut png)
         .write_image(out.as_raw(), out.width(), out.height(), image::ExtendedColorType::Rgba8).ok()?;
-    Some(StageArt { png, x: mask.x, y: mask.y, w: mask.w, h: mask.h, hold: 1 })
+    Some(StageArt { png, x: mask.x, y: mask.y, w: mask.w, h: mask.h, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 })
 }
 
 /// Paint a shape's bitmap FILL into a `tw` x `th` tile by mapping through the fill's own matrix,
@@ -2371,8 +2394,7 @@ fn render_art_layers(
             // both broke the animated test (collapsing the element to one static frame) and
             // compressed the quiet stretches out of the loop.
             let blank = || bounds.map(|(l, t, _, _)| StageArt {
-                png: blank_png(), x: (l - ox) * scale, y: (t - oy) * scale, w: 1, h: 1, hold: 1,
-            });
+                png: blank_png(), x: (l - ox) * scale, y: (t - oy) * scale, w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 });
             let per_frame: Vec<StageArt> = sampled.iter().filter_map(|(insts, _)| {
                 let grp: Vec<&Instance> = insts.iter().filter(|i| matches(i)).collect();
                 composite_grp(grp, bounds).or_else(blank)
@@ -2392,6 +2414,21 @@ fn render_art_layers(
                 for s in &mut segments { s.frames = rle(std::mem::take(&mut s.frames)); }
                 let frames = segments.iter().flat_map(|s| s.frames.iter().cloned()).collect();
                 return Some(BgLayer { name: sname.clone(), frames, segments });
+            }
+            // ONE shape the source moves or turns is emitted as that shape ONCE, placed by a
+            // transform each frame -- the same thing the character path does with an arm. Baking
+            // instead gives a fresh raster per angle: clocktown's clock rings arrived as five
+            // elements of 200-460 frames with every frame unique, ~67MB for art the source stores
+            // as five bitmaps. The rasteriser fits a shape to its axis-aligned bounds, so the art
+            // is taken from the frame where the shape sits squarest (the least rotated), and the
+            // rest is rotation.
+            if animated {
+                if let Some(fs) = single_shape_frames(&all, &sampled, &matches, ox, oy, scale,
+                                                      shape_defs, bitmaps) {
+                    let p = loop_period(&fs);
+                    return Some(BgLayer { name: sname.clone(), frames: rle(fs[..p].to_vec()),
+                                          segments: Vec::new() });
+                }
             }
             let frames = if animated {
                 // truncate to the element's OWN loop period (it was sampled over the stage's
@@ -2774,7 +2811,7 @@ fn engine_added_bg_layers(
         let im = image::RgbaImage::from_raw(*bw, *bh, rgba.clone())?;
         let mut png = Vec::new();
         image::DynamicImage::ImageRgba8(im).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
-        Some(StageArt { png, x: x_fm, y: y_fm, w: *bw, h: *bh, hold: 1 })
+        Some(StageArt { png, x: x_fm, y: y_fm, w: *bw, h: *bh, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 })
     };
     let mut bg_layers: Vec<BgLayer> = Vec::new();
     let mut fg_arts: Vec<StageArt> = Vec::new();
@@ -2845,6 +2882,102 @@ fn resize_to(img: &image::RgbaImage, tw: u32, th: u32) -> image::RgbaImage {
         return img.clone();
     }
     image::imageops::resize(img, tw, th, image::imageops::FilterType::Triangle)
+}
+
+
+/// An element that is a FEW shapes being moved or turned, as art-once-per-shape plus placements.
+///
+/// SSF2 stores a turning clock ring as a bitmap and a matrix per frame; rasterising each frame
+/// separately stores it as one bitmap PER ANGLE. This detects the case and emits what the source
+/// has -- each distinct shape rasterised once, with the per-frame orientation carried on the
+/// frames, which is the same shape the character path emits for a rotating limb. Frames sharing a
+/// shape share the art, so the writer's dedupe collapses them to one file.
+///
+/// Returns None for anything else (several shapes at once on a frame, a shape whose content
+/// changes, or more distinct shapes than this can pay for), which the compositor still bakes.
+#[allow(clippy::too_many_arguments)]
+fn single_shape_frames(
+    all: &[&Instance],
+    sampled: &[(Vec<Instance>, Option<StageArt>)],
+    matches: &dyn Fn(&Instance) -> bool,
+    ox: f64, oy: f64, scale: f64,
+    shape_defs: &BTreeMap<u16, &swf::Shape>,
+    bitmaps: &BTreeMap<u16, (u32, u32, Vec<u8>)>,
+) -> Option<Vec<StageArt>> {
+    /// A ceiling on distinct cels, so a pathological element cannot emit hundreds of rasters. It
+    /// can be generous: the real guard is that each FRAME shows at most one of them, which is what
+    /// separates "a few cels being moved" from "a picture redrawn out of many shapes". Clocktown's
+    /// clock rings are ten cels that also turn.
+    const MAX_SHAPES: usize = 32;
+    if all.is_empty() { return None; }
+    let shapes: std::collections::BTreeSet<u16> = all.iter().map(|i| i.shape_id).collect();
+    let dbg = std::env::var("PEPTIDE_PLACE_DEBUG").is_ok();
+    if dbg { eprintln!("[place] sym={:?} shapes={} ({:?})", all[0].sym_name, shapes.len(), shapes.iter().take(6).collect::<Vec<_>>()); }
+    if shapes.len() > MAX_SHAPES { if dbg { eprintln!("[place]   reject: too many shapes"); } return None; }
+    // A frame shows at most ONE of them, or the frames are not a re-placement. Showing NONE is
+    // fine and common -- an element that blinks out (a bubble between pops) is drawn blank that
+    // frame, exactly as the compositor path does it.
+    let mut per_frame: Vec<Option<&Instance>> = Vec::with_capacity(sampled.len());
+    for (insts, _) in sampled.iter() {
+        let mut it = insts.iter().filter(|i| matches(i));
+        let one = it.next();
+        if it.next().is_some() {
+            if dbg { eprintln!("[place]   reject: a frame shows several of them at once"); }
+            return None;
+        }
+        per_frame.push(one);
+    }
+    if per_frame.iter().flatten().count() == 0 { return None; }
+    // only worth it when the placement actually varies; still art is already one raster
+    let shown: Vec<&Instance> = per_frame.iter().flatten().copied().collect();
+    if !shown.windows(2).any(|w| w[0].place.rotation != w[1].place.rotation
+                              || w[0].place.sx != w[1].place.sx
+                              || w[0].place.sy != w[1].place.sy) {
+        if dbg { eprintln!("[place]   reject: placement never varies"); }
+        return None;
+    }
+    // Rasterise each shape from the frame where it is LEAST rotated: the compositor fits a shape
+    // to its axis-aligned bounds, so that frame's pixels are closest to the source artwork rather
+    // than a squeezed copy of it.
+    let squareness = |i: &Instance| {
+        let r = crate::fm_placement::normalise_degrees(i.place.rotation);
+        (r % 90.0).min(90.0 - (r % 90.0))
+    };
+    let mut art_for: BTreeMap<u16, (StageArt, f64)> = BTreeMap::new();
+    for sid in shapes {
+        let best = shown.iter().copied().filter(|i| i.shape_id == sid)
+            .min_by(|a, b| squareness(a).partial_cmp(&squareness(b)).unwrap_or(std::cmp::Ordering::Equal))?;
+        let art = composite_layer(&[best], shape_defs, bitmaps, ox, oy, None)?;
+        art_for.insert(sid, (art, crate::fm_placement::normalise_degrees(best.place.rotation)));
+    }
+    let anchor = shown[0];
+    Some(per_frame.into_iter().map(|slot| match slot {
+        Some(i) => {
+            let (art, base_rot) = &art_for[&i.shape_id];
+            let p = crate::fm_placement::image_placement(&i.place, (0.0, 0.0), (1.0, 1.0));
+            // Position by CENTRE, not by the bounds. The art is the UNROTATED cel, while the
+            // instance's box is the rotated one -- a different size -- so using its top-left slides
+            // the piece as it turns. A rotation keeps the centre still, and FrayTools draws an
+            // IMAGE centred at `x + scaleX*w/2`, so that is what to solve for.
+            let cx = (i.aabb.left() + i.aabb.w / 2.0 - ox) * scale;
+            let cy = (i.aabb.top() + i.aabb.h / 2.0 - oy) * scale;
+            StageArt {
+                png: art.png.clone(),
+                x: cx - art.w as f64 * scale / 2.0,
+                y: cy - art.h as f64 * scale / 2.0,
+                w: art.w, h: art.h, hold: 1,
+                // relative to the frame the art came from, which already carries that much turn
+                rotation: crate::fm_placement::normalise_degrees(p.rotation - base_rot),
+                scale_x: 1.0, scale_y: 1.0,
+            }
+        }
+        None => StageArt {
+            png: blank_png(),
+            x: (anchor.aabb.left() - ox) * scale,
+            y: (anchor.aabb.top() - oy) * scale,
+            w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0,
+        },
+    }).collect())
 }
 
 fn composite_layer(
@@ -2990,7 +3123,7 @@ fn composite_layer(
         image::codecs::png::PngEncoder::new(&mut png)
             .write_image(canvas.as_raw(), cw, ch, image::ExtendedColorType::Rgba8).ok()?;
     }
-    Some(StageArt { png, x: min_x - ox, y: min_y - oy, w: cw, h: ch, hold: 1 })
+    Some(StageArt { png, x: min_x - ox, y: min_y - oy, w: cw, h: ch, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 })
 }
 
 /// Extract a clip's labelled sub-animations as rasterized frame sequences. Each frame label in the
@@ -3404,7 +3537,7 @@ fn walk<'a>(
                 x_sign: world.x_sign(), flip: world.flips(),
                 moving: here_moving,
                 hazard: here_hazard,
-                inst_anchor: (0.0, 0.0), inst_path: 0, leaf_depth: 0, blend: None, inst_clip: None, alpha: 1.0, // geometry walk feeds collision/hazards, not art grouping
+                inst_anchor: (0.0, 0.0), inst_path: 0, place: Default::default(), leaf_depth: 0, blend: None, inst_clip: None, alpha: 1.0, // geometry walk feeds collision/hazards, not art grouping
             });
         }
         if let Some(child) = sprites.get(&id) {
@@ -3460,8 +3593,8 @@ mod hazard_classifier_tests {
         let insts = vec![
             Instance { shape_id: 1, inst_name: None, sym_name: "x".into(), plane: None,
                 aabb: Rect { x: 0.0, y: 0.0, w: 100.0, h: 20.0 }, cx: 50.0, cy: 10.0, x_sign: 1.0, flip: (false, false),
-                moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, leaf_depth: 0, blend: None, inst_clip: None, alpha: 1.0 },
-            Instance { shape_id: 2, inst_name: None, sym_name: "x".into(), plane: None,
+                moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, place: Default::default(), leaf_depth: 0, blend: None, inst_clip: None, alpha: 1.0 },
+            Instance { shape_id: 2, inst_name: None, sym_name: "x".into(), plane: None, leaf_depth: 0, place: Default::default(),
                 aabb: Rect { x: 110.0, y: 0.0, w: 100.0, h: 20.0 }, cx: 160.0, cy: 10.0, x_sign: 1.0, flip: (false, false),
                 moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, blend: None, inst_clip: None, alpha: 1.0 },
         ];

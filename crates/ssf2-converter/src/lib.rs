@@ -35,6 +35,7 @@ pub mod api_mappings;
 pub mod mappings;
 pub mod project;
 pub mod fraytools_transform;
+pub mod fm_placement;
 pub mod vector_raster;
 pub mod physics_sim;
 pub mod abc_codec;

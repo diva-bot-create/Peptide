@@ -374,11 +374,27 @@ dimensions below are the rest.
   18MB .fra, ~110s) and renders with no script errors. bowserscastle: 8.8MB/739 -> 8.7MB/732, i.e.
   untouched.
 
-  what is left is rotation. the rings of the clock face are ONE shape the source turns, and the art
-  path bakes a raster per angle instead of emitting the bitmap once and rotating it -- ~67MB of
-  clocktown's remaining 81MB, in five elements whose every frame is unique. the emitter can express
-  a per-frame rotation (character art already uses it); the stage art path fits each shape into its
-  axis-aligned bounds instead, so this needs that path to carry a transform rather than bake one.
+- **art the source MOVES is emitted once and moved, not baked per angle** (fixed). a turning clock
+  ring is a handful of cels and a matrix per frame in SSF2; rasterising each frame stored it as a
+  bitmap per ANGLE -- clocktown's rings alone were ~67MB across five elements whose every frame was
+  unique. an element whose frames show at most ONE shape each (from a small set of cels) is now
+  emitted as those cels, once, with the per-frame orientation carried on the frame. "at most one
+  per frame" is the guard that separates a few things moving from a picture redrawn out of many
+  shapes, so the cel ceiling can be generous.
+
+  position by CENTRE, not by bounds: the art is the unrotated cel while the source's box is the
+  rotated one, so placing by top-left slides the piece as it turns (visible as the clock's rings
+  drifting apart). rotation keeps a centre still, and fraymakers draws an IMAGE centred at
+  `x + scaleX*w/2`.
+
+  clocktown: 263MB/3379 sprites -> 7.5MB/245, exporting in 25s to a 3MB .fra and rendering with the
+  rings concentric and no script errors. bowserscastle: 8.7MB/732, untouched throughout.
+
+  the conversion from an SWF placement to a fraymakers IMAGE is now ONE piece of code
+  (`fm_placement`) shared by the character and stage paths -- SSF2 content is SSF2 content, and an
+  arm on a character is placed by the same kind of matrix as a hand on a clock. the character path
+  moved onto it with its golden snapshot unchanged, and mirroring (scale, position AND rotation)
+  lives there too rather than being spelled out twice.
 
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and

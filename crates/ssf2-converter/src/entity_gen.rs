@@ -1277,34 +1277,38 @@ pub fn generate_entity(
                                 .and_then(|sid| img_result.shape_fill_scale.get(&sid))
                                 .copied()
                                 .unwrap_or((1.0, 1.0));
+                            // Where a placed shape lands is ONE conversion, shared with the stage
+                            // art path: SSF2 content is SSF2 content, and a clock hand on a
+                            // backdrop is placed by the same kind of matrix as an arm on a
+                            // character (see `fm_placement`).
+                            let placement = crate::fm_placement::image_placement(
+                                &crate::fm_placement::WorldPlacement {
+                                    tx: world_tx, ty: world_ty, sx: world_sx, sy: world_sy,
+                                    rotation: world_rot,
+                                    a: entry.map(|e| e.world_a).unwrap_or(1.0),
+                                    b: entry.map(|e| e.world_b).unwrap_or(0.0),
+                                    c: entry.map(|e| e.world_c).unwrap_or(0.0),
+                                    d: entry.map(|e| e.world_d).unwrap_or(1.0),
+                                },
+                                shape_id.and_then(|sid| img_result.shape_pivot.get(&sid)).copied()
+                                    .unwrap_or((0.0, 0.0)),
+                                (fsx, fsy),
+                            );
                             // A turn animation is drawn facing the direction being turned FROM,
                             // and fraymakers flips the character's facing when the turn STARTS, so
-                            // the art needs mirroring for the whole animation -- not just its first
-                            // frame, which left the rest of a run turn facing backwards.
+                            // the art mirrors for the whole animation -- not just its first frame,
+                            // which left the rest of a run turn facing backwards.
                             let turn_flip = anim_name == "stand_turn" || anim_name == "run_turn";
-                            let fm_sx = round2(world_sx * fsx) * if turn_flip { -1.0 } else { 1.0 };
-                            let fm_sy = round2(world_sy * fsy);
+                            let placement = if turn_flip {
+                                crate::fm_placement::mirrored(placement)
+                            } else {
+                                placement
+                            };
+                            let fm_sx = placement.scale_x;
+                            let fm_sy = placement.scale_y;
+                            let mut fm_x = placement.x;
+                            let fm_y = placement.y;
 
-                            // World-space matrix components
-                            let wa = entry.map(|e| e.world_a).unwrap_or(1.0);
-                            let wb = entry.map(|e| e.world_b).unwrap_or(0.0);
-                            let wc = entry.map(|e| e.world_c).unwrap_or(0.0);
-                            let wd = entry.map(|e| e.world_d).unwrap_or(1.0);
-
-                            let (off_x, off_y) = shape_id
-                                .and_then(|sid| img_result.shape_pivot.get(&sid))
-                                .copied()
-                                .unwrap_or((0.0, 0.0));
-                            let (off_x, off_y) = (off_x * fsx, off_y * fsy);
-                            let mut fm_x = round2(world_tx + wa * off_x + wc * off_y);
-                            let fm_y = round2(world_ty + wb * off_x + wd * off_y);
-                            // stand_turn mirrors the idle pose IN PLACE about the character's
-                            // vertical axis (entity x=0). Negating scaleX alone flips about the
-                            // sprite's own left edge, sliding it sideways; also negate the x
-                            // position so the whole placement reflects about the origin.
-                            if turn_flip {
-                                fm_x = round2(-fm_x);
-                            }
                             // FM's engine applies its OWN rotation during the TUMBLE state, about
                             // the entity position, so a baked SSF2 per-frame rotation/offset fights
                             // it (the sprite orbits without spinning). For tumble ONLY: strip the
@@ -1318,15 +1322,7 @@ pub fn generate_entity(
                             let mut fm_y = fm_y;
                             let pivot_x = 0.0_f64;
                             let pivot_y = 0.0_f64;
-                            let mut emit_rot = ((world_rot % 360.0) + 360.0) % 360.0;
-                            // A mirror reflects the pose's ROTATION too: reflecting about the
-                            // vertical axis maps an angle to its negative. Negating scaleX and x
-                            // without it leaves a rotated frame turned the wrong way -- invisible
-                            // on stand_turn, whose idle pose is flat, and plain on a run turn,
-                            // whose frames are authored at 180 and 150 degrees.
-                            if turn_flip {
-                                emit_rot = ((-emit_rot % 360.0) + 360.0) % 360.0;
-                            }
+                            let mut emit_rot = placement.rotation;
                             if anim_name == "tumble" {
                                 if let Some(img) = bitmap_img {
                                     let (hw, hh) = (img.width as f64 / 2.0, img.height as f64 / 2.0);
