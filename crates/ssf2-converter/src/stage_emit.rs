@@ -3442,7 +3442,7 @@ mod hazard_tests {
         // a null hitbox owner is neutral and passes the engine's team-hit validation (hits
         // everyone), and createCustomGameObject accepts a null owner.
         let spawn = "\t\t\tvar _hz0 = match.createCustomGameObject(self.getResource().getContent(\"demohazard0\"), owner);\n";
-        let s = script_hx("demo", false, spawn);
+        let s = script_hx("demo", false, spawn, ("", ""));
         assert!(s.contains("var owner = null;"), "hazard owner should be null: {s}");
         assert!(s.contains("createCustomGameObject"), "no spawn call: {s}");
     }

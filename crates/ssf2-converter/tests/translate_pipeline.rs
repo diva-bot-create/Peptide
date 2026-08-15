@@ -400,15 +400,17 @@ fn play_voice_sound_call_routed_to_bare_helper() {
 // ─── rewrite_attach_effect_calls ─────────────────────────────────────────
 
 #[test]
-fn attach_effect_1arg_unknown_falls_back_to_active() {
+fn attach_effect_unknown_is_not_spawned() {
+    // An effect with no GlobalVfx mapping and no local entity cannot be spawned: getContent does
+    // not validate, so naming one yields a DANGLING reference and the engine draws the resource's
+    // first animation instead -- for a character, its revival pose, mid-move. It used to be
+    // emitted anyway with an "active" fallback, which is where that came from.
     let input = "self.attachEffect(\"some_unmapped_effect\");";
     let out = rewrite_attach_effect_calls(input);
-    assert!(out.contains("match.createVfx(new VfxStats("),
-        "1-arg attachEffect should become createVfx; got: {}", out);
-    assert!(out.contains("animation: \"active\""),
-        "unknown effects fall back to the 'active' animation; got: {}", out);
-    assert!(out.contains("getContent(\"some_unmapped_effect\")"),
-        "spriteContent should reference the local effect by name; got: {}", out);
+    assert!(!out.contains("getContent(\"some_unmapped_effect\")"),
+        "an effect the character does not carry must not be referenced; got: {}", out);
+    assert!(out.contains("TODO") && out.contains("some_unmapped_effect"),
+        "and the intent should stay visible, naming the effect; got: {}", out);
 }
 
 #[test]
@@ -445,6 +447,11 @@ fn attach_effect_2arg_translates_props() {
     // attach_effect_props in commands.jsonc maps:
     //   x → x (Simple)
     //   parentLock → relativeWith + resizeWith + flipWith (expand_to)
+    // The effect has to be one the character carries, or there is no call to translate props
+    // into (see attach_effect_unknown_is_not_spawned).
+    let mut map = BTreeMap::new();
+    map.insert("trail_foo".to_string(), "active".to_string());
+    let _guard = EffectAnimGuard::install(map);
     let input = "\tself.attachEffect(\"trail_foo\", { x: 10, y: 20 });";
     let out = rewrite_attach_effect_calls(input);
     assert!(out.contains("match.createVfx(new VfxStats("),
@@ -456,6 +463,9 @@ fn attach_effect_2arg_translates_props() {
 
 #[test]
 fn attach_effect_2arg_unknown_prop_emits_todo() {
+    let mut map = BTreeMap::new();
+    map.insert("trail_foo".to_string(), "active".to_string());
+    let _guard = EffectAnimGuard::install(map);
     let input = "\tself.attachEffect(\"trail_foo\", { wibbleWobble: 99 });";
     let out = rewrite_attach_effect_calls(input);
     assert!(out.contains("TODO") && out.contains("wibbleWobble"),
@@ -466,6 +476,9 @@ fn attach_effect_2arg_unknown_prop_emits_todo() {
 fn attach_effect_value_with_inner_call_is_one_field() {
     // parse_prop_bag must respect parens — Random.getFloat(0, 1) is ONE
     // value, not two split on the inner comma.
+    let mut map = BTreeMap::new();
+    map.insert("trail_foo".to_string(), "active".to_string());
+    let _guard = EffectAnimGuard::install(map);
     let input = "\tself.attachEffect(\"trail_foo\", { x: Random.getFloat(0, 1) });";
     let out = rewrite_attach_effect_calls(input);
     // The Random.getFloat call should round-trip as a single argument.
