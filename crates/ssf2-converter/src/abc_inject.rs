@@ -74,6 +74,7 @@ pub const SSF2_NS_CONTROLLERS: &str = "com.mcleodgaming.ssf2.controllers"; // Ga
 pub const SSF2_NS_ENGINE: &str = "com.mcleodgaming.ssf2.engine"; // Character, StageData, AttackData/Object, Stats
 pub const SSF2_NS_UTIL: &str = "com.mcleodgaming.ssf2.util";     // Controller, ControlsObject, ResourceManager
 pub const SSF2_NS_ENUMS: &str = "com.mcleodgaming.ssf2.enums";   // Mode
+pub const SSF2_NS_API: &str = "com.mcleodgaming.ssf2.api";       // SSF2API (the content-facing api)
 
 /// The loader that opens one data package, and the two handlers it routes a failed open through.
 /// Both are hooked so a package that fails names itself instead of vanishing.
@@ -697,6 +698,14 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
     let mn_menuctrl = q(abc, ctrl_ns, "MenuController");
     let mn_disposemenus = q(abc, pub_ns, "disposeAllMenus");
     let s_v_mc = abc.intern_string("MC");
+    // CAM root verb (cur = the live camera): the camera is behind a static accessor, not on the
+    // display list, so no amount of GET/IDX navigation from the root reaches it. With the cursor
+    // on it, the camera's own methods (mode, targets, focus) are callable like any other object's,
+    // which is what lets one `cam` command drive both engines.
+    let api_ns = { let s = abc.intern_string(SSF2_NS_API); abc.intern_namespace(NS_PACKAGE, s) };
+    let mn_ssf2api = q(abc, api_ns, "SSF2API");
+    let mn_getcamera = q(abc, pub_ns, "getCamera");
+    let s_v_cam = abc.intern_string("CAM");
     // runtime-named multiname (MultinameL) bound to the public ns-set
     let pub_nsset = abc.intern_ns_set(vec![pub_ns]);
     let mnl = abc.intern_multinamel(pub_nsset);
@@ -939,6 +948,13 @@ pub fn inject_socket_bridge(abc: &mut Abc, doc_class_local: &str, host: &str, po
     c.place(next); next = c.new_label();
     c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_mc); c.branch(OP_IFSTRICTNE, next);
     c.op(OP_GETLOCAL0); c.op_u30(OP_GETLEX, mn_menuctrl); c.op_u30(OP_SETPROPERTY, mn_cur);
+    c.op_u30(OP_PUSHSTRING, s_ok); c.op_u30(OP_SETLOCAL, l_res); c.branch(OP_JUMP, l_done);
+    // CAM: cur = SSF2API.getCamera()
+    c.place(next); next = c.new_label();
+    c.op_u30(OP_GETLOCAL, l_verb); c.op_u30(OP_PUSHSTRING, s_v_cam); c.branch(OP_IFSTRICTNE, next);
+    c.op(OP_GETLOCAL0);
+    c.op_u30(OP_GETLEX, mn_ssf2api); c.op_u30_u30(OP_CALLPROPERTY, mn_getcamera, 0);
+    c.op_u30(OP_SETPROPERTY, mn_cur);
     c.op_u30(OP_PUSHSTRING, s_ok); c.op_u30(OP_SETLOCAL, l_res); c.branch(OP_JUMP, l_done);
     // SETP <name> <n>: cur[name] = Number(n)  (e.g. set YSpeed to launch a jump)
     c.place(next); next = c.new_label();

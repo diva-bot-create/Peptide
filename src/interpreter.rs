@@ -62,6 +62,9 @@ pub const COMMANDS: &[Cmd] = &[
           args: "",                              help: "run the engine's debug console `help` command (RAN) — a side-effecting call hscript can't make, so it stays a wire byte" },
     Cmd { name: "shot",    aliases: &["screenshot", "png"],  wire: '\0',
           args: "[path]",                        help: "screenshot the LIVE frame from inside the engine to a PNG (default /tmp/peptide-shot.png). the object tree proves an object exists; this proves it was drawn. CAPTURES THE DISPLAY ROOT, NOT THE CAMERA -- on both engines it can show off-camera art and carries no camera zoom, so set the camera first before comparing frames or calling it \"what the player sees\"" },
+    Cmd { name: "cam",     aliases: &["camera"],            wire: '\0',
+          args: "[stage|free|normal|<x> <y>] [zoom]",
+          help: "drive the CAMERA, the same way on both engines: `cam` reports where it is, `cam stage` frames the whole stage (the mode both engines have for showing a stage rather than following fighters), `cam normal` gives it back to the fighters, `cam <x> <y> [zoom]` parks it. the way to compare a converted stage against its source frame for frame" },
     Cmd { name: "tree",    aliases: &["dump"],              wire: '\0',
           args: "[depth]",                       help: "dump the live object tree (name/class/position/size/frame per node) — the stage-triage ground truth. SSF2 walks the display list; depth defaults to 6" },
     Cmd { name: "await",   aliases: &["settle", "playout"],  wire: '\0',
@@ -364,6 +367,16 @@ pub enum Command {
     /// Dump the live object tree to the given depth — the stage-triage ground truth
     /// (every live game object with its name/class/position/size/frame).
     Tree(u32),
+    /// Drive the camera. Both engines have the same handful of controls (a mode, a
+    /// locked position, a zoom), so this is one command rather than two dialects.
+    /// Every field `None` = report the camera instead of moving it.
+    Camera {
+        /// `stage` / `normal` / `free`, as the engines name their own modes.
+        mode: Option<String>,
+        /// Park the camera here (engine coordinates).
+        pos: Option<(f64, f64)>,
+        zoom: Option<f64>,
+    },
     /// Screenshot the live frame to a PNG path, captured inside the engine.
     Shot(std::path::PathBuf),
     /// Watch a character's animation until it finishes, loops, changes, or stalls,
@@ -493,6 +506,14 @@ pub fn parse(line: &str) -> Command {
                 return Command::Eval(format!("{player}.setY({player}.getY() + 3000)"));
             }
             "console" => return Command::Console,
+            "cam" | "camera" => {
+                let mode = rest.first().filter(|t| t.parse::<f64>().is_err()).map(|t| t.to_ascii_lowercase());
+                let nums: Vec<f64> = rest.iter().filter_map(|t| t.parse().ok()).collect();
+                let pos = (nums.len() >= 2).then(|| (nums[0], nums[1]));
+                // with a position the third number is the zoom; with a mode the first one is
+                let zoom = if pos.is_some() { nums.get(2).copied() } else { nums.first().copied() };
+                return Command::Camera { mode, pos, zoom };
+            }
             "tree" => {
                 let depth = rest.first().and_then(|d| d.parse().ok()).unwrap_or(6);
                 return Command::Tree(depth);
@@ -637,6 +658,32 @@ const FM_DEFAULT_ASSIST: &str = "commandervideoassist";
 /// Max players a Fraymakers match supports (4 ports). `spawn` rejects a larger roster.
 pub const FM_MAX_PLAYERS: usize = 4;
 
+/// The Fraymakers side of `cam`: its camera API takes a mode constant, a locked position and a
+/// locked zoom, and reports where it is. An unknown mode name reports the modes rather than
+/// guessing one.
+fn fm_camera_expr(mode: Option<&str>, pos: Option<(f64, f64)>, zoom: Option<f64>) -> String {
+    let mut e = String::from("var c = match.getCamera(); ");
+    if let Some(m) = mode {
+        let konst = match m {
+            "stage" => Some("STAGE"),
+            "normal" | "follow" | "default" => Some("NORMAL"),
+            "free" => Some("FREE"),
+            "locked" | "lock" => Some("LOCKED"),
+            _ => None,
+        };
+        match konst {
+            Some(k) => e.push_str(&format!("c.setMode(CameraMode.{k}); ")),
+            None => return format!("\"cam: unknown mode '{m}' (stage / normal / free / locked)\""),
+        }
+    }
+    if let Some((x, y)) = pos {
+        e.push_str(&format!("c.setMode(CameraMode.LOCKED); c.setLockedPosition({x}, {y}); "));
+    }
+    if let Some(z) = zoom { e.push_str(&format!("c.setLockedZoom({z}); ")); }
+    e.push_str("\"cam \" + c.getX() + \",\" + c.getY() + \" zoom \" + c.getZoomScaleX() + \" mode \" + c.getMode() + \" view \" + c.getViewportWidth() + \"x\" + c.getViewportHeight()");
+    e
+}
+
 pub fn command_to_wire(cmd: &Command) -> Translated {
     match cmd {
         Command::Help => Translated::Client(help_text()),
@@ -682,6 +729,8 @@ pub fn command_to_wire(cmd: &Command) -> Translated {
         // FM tree walk: the 'w' wire handler walks currentMatch.gameObjects in bytecode (hl ArrayObj
         // doesn't reflect length/index in hscript, so the walk can't be eval-side).
         Command::Tree(_) => Translated::Wire("w".into()),
+        // the camera is scriptable on Fraymakers, so it lowers to eval rather than a wire byte
+        Command::Camera { mode, pos, zoom } => Translated::Wire(format!("e {}", fm_camera_expr(mode.as_deref(), *pos, *zoom))),
         Command::Shot(_) => Translated::Wire("y".into()),
         Command::AddCharacter => Translated::Wire("n".into()),
         Command::Exit => Translated::Wire("x".into()),

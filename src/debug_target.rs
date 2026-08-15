@@ -50,6 +50,15 @@ pub trait DebugTarget {
         Ok(non_empty(strip_eval(self.eval(&format!("iconFeed({slot})"))?)))
     }
 
+    /// Drive the camera: set its mode, park it, zoom it, or report it.
+    ///
+    /// Both engines have the same controls under different names, which is why this is a trait
+    /// method and not two dialects of eval: the point of it is to put the SAME view on both
+    /// engines so a converted stage can be compared with its source frame for frame.
+    fn camera(&mut self, _mode: Option<&str>, _pos: Option<(f64, f64)>, _zoom: Option<f64>) -> Result<String> {
+        Ok("cam: no camera control on this engine yet".into())
+    }
+
     /// Dump the live object tree to `depth` — the stage-triage ground truth (every
     /// live object's name/class/position/size/frame). SSF2 walks its display list
     /// via reflection; an engine without a tree walk declares the gap.
@@ -521,6 +530,7 @@ pub fn run_command(target: &mut dyn DebugTarget, line: &str) -> Result<Option<St
         Command::Trace { raw } => Some(target.frame_trace(raw)?),
         Command::Console => Some(target.console()?),
         Command::Tree(depth) => Some(target.tree(depth)?),
+        Command::Camera { ref mode, pos, zoom } => Some(target.camera(mode.as_deref(), pos, zoom)?),
         Command::Shot(ref p) => Some(target.shot(p)?),
         Command::AddCharacter => Some(target.add_character()?),
         Command::Exit => { target.exit()?; Some("exit".into()) }
@@ -675,6 +685,11 @@ impl DebugTarget for FraymakersTarget {
     fn tree(&mut self, depth: u32) -> Result<String> {
         let raw = self.run(&Command::Tree(depth))?;
         Ok(fmt_fm_tree(&raw))
+    }
+
+    fn camera(&mut self, mode: Option<&str>, pos: Option<(f64, f64)>, zoom: Option<f64>) -> Result<String> {
+        let out = self.run(&Command::Camera { mode: mode.map(str::to_string), pos, zoom })?;
+        Ok(strip_eval(out).trim().to_string())
     }
 
     // The engine encodes the PNG and hands it back as hex on the SAME socket the commands ride

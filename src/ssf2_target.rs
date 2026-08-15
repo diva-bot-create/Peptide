@@ -557,6 +557,30 @@ impl DebugTarget for Ssf2Target {
         anyhow::bail!("ssf2 could not capture a frame: {}", reply.trim())
     }
 
+    /// SSF2's camera, driven through the reflection bridge's `CAM` root verb (the camera is
+    /// behind a static accessor, so it is not reachable by navigating the display list).
+    ///
+    /// The modes are the same three concepts Fraymakers has, so the command's names map onto
+    /// SSF2's numbers rather than the caller having to know either engine's spelling.
+    fn camera(&mut self, mode: Option<&str>, pos: Option<(f64, f64)>, zoom: Option<f64>) -> Result<String> {
+        if let Some(m) = mode {
+            let n = match m {
+                "normal" | "follow" | "default" => 0,
+                "zoom" => 1,
+                "stage" => 2,
+                _ => return Ok(format!("cam: unknown mode '{m}' (stage / normal / zoom)")),
+            };
+            self.op("CAM")?;
+            self.op(&format!("CALL1\tsetMode\t{n}"))?;
+        }
+        if pos.is_some() || zoom.is_some() {
+            return Ok("cam: SSF2's camera takes targets, not a locked position or zoom —                        mode is what it can be driven with here".into());
+        }
+        self.op("CAM")?;
+        let mode = self.op("CALL\tgetMode").and_then(|_| self.op("READ")).unwrap_or_default();
+        Ok(format!("cam mode {}", mode.trim()))
+    }
+
     fn tree(&mut self, depth: u32) -> Result<String> {
         // ONE round trip: the engine walks its own display list recursively (the TREE verb)
         // and returns every record at once. Besides being fast, it's ATOMIC — the host-driven
