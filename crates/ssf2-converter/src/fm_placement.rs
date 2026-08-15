@@ -122,3 +122,22 @@ mod tests {
         assert_eq!((m.y, m.scale_y), (5.0, 1.0), "the vertical axis is untouched");
     }
 }
+
+impl WorldPlacement {
+    /// Where this placement sends a point given in the SHAPE's own space.
+    pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+        (self.a * x + self.c * y + self.tx, self.b * x + self.d * y + self.ty)
+    }
+
+    /// The point in the SHAPE's own space that this placement sends to `(wx, wy)`.
+    ///
+    /// The inverse is what lets one raster be re-placed by a different frame's matrix: the cel was
+    /// cropped from the frame it was rasterised in, so to know where it goes in another frame you
+    /// first ask which part of the shape it was.
+    pub fn unapply(&self, wx: f64, wy: f64) -> Option<(f64, f64)> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-9 { return None; }
+        let (dx, dy) = (wx - self.tx, wy - self.ty);
+        Some(((self.d * dx - self.c * dy) / det, (-self.b * dx + self.a * dy) / det))
+    }
+}

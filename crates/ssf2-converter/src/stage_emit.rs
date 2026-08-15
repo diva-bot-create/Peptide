@@ -62,7 +62,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
             "export": false, "guid": guid, "id": "", "pluginMetadata": {}, "plugins": [], "tags": [], "version": 2
         }))?;
         Ok(ArtRef { guid, x: art.x, y: art.y, w: art.w, h: art.h, hold: art.hold.max(1) as usize,
-                    rotation: art.rotation, scale_x: art.scale_x, scale_y: art.scale_y })
+                    rotation: art.rotation, scale_x: art.scale_x, scale_y: art.scale_y, alpha: art.alpha })
     };
     let stage_fallback;
     let stage_frames: Vec<&StageArt> = if !model.art.stage_frames.is_empty() {
@@ -78,7 +78,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
         .collect::<Result<_>>()?;
     let mut parallax_refs: Vec<ParallaxRef> = model.art.parallax.iter().enumerate()
         .map(|(i, layer)| write_layer(&format!("parallax{i}"), &layer.art)
-            .map(|r| ParallaxRef { frames: vec![r], w: layer.art.w, h: layer.art.h,
+            .map(|r| ParallaxRef { tracks: vec![vec![r]], w: layer.art.w, h: layer.art.h,
                                    mode: layer.mode, x_pan: layer.x_pan, y_pan: layer.y_pan }))
         .collect::<Result<_>>()?;
     // each backdrop ELEMENT is its own layer (the SSF2 movieclip model). a static element is one
@@ -96,7 +96,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     for (i, layer) in model.art.background.iter().enumerate() {
         bg_refs.extend(build_element_layers(&elem_ids[i], bg_layer_name(&layer.name, i),
                                             &layer.frames, &layer.segments,
-                                            BgPlane::Background, layer.pan, &mut write_layer)?);
+                                            BgPlane::Background, layer.pan, layer.fades, layer.authored_alpha, &mut write_layer)?);
     }
     // UNIVERSAL: promote every ANIMATED backdrop element (the weather embers, jumping podoboos,
     // lava bubbles/splashes, flickering torches, a spectating Bowser, …) to its own looping VFX
@@ -134,7 +134,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     if promote_fg {
         promoted_bg.push(BgLayerRef {
             name: "Foreground Art".to_string(), eid: "fg".to_string(),
-            frames: fg_refs.clone(), plane: BgPlane::Foreground, segments: Vec::new(), pan: None,
+            frames: fg_refs.clone(), plane: BgPlane::Foreground, segments: Vec::new(), pan: None, fades: false, authored_alpha: model.art.foreground_alpha,
         });
     }
     // PER-ELEMENT foreground: the parser now splits the in-front plane the same way it splits the
@@ -151,7 +151,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
             let eid = &format!("fge_{}", fg_elem_ids[i]);
             promoted_bg.extend(build_element_layers(eid, bg_layer_name(&layer.name, i),
                                                     &layer.frames, &layer.segments,
-                                                    BgPlane::Foreground, layer.pan, &mut write_layer)?);
+                                                    BgPlane::Foreground, layer.pan, layer.fades, layer.authored_alpha, &mut write_layer)?);
         }
     }
     // declared platforms become MOVING STRUCTURES (like the official stage-template's moving
@@ -166,15 +166,42 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // hscript, the parallax the engine already has.
     let (cam_bg_elems, promoted_bg): (Vec<BgLayerRef>, Vec<BgLayerRef>) =
         promoted_bg.into_iter().partition(|l| l.pan.is_some());
-    for layer in &cam_bg_elems {
-        // the layer's size is its LARGEST frame, not its first: an element whose first frame is
-        // the blank one (it starts off-screen) would otherwise declare a 1x1 background.
-        let w = layer.frames.iter().map(|f| f.w).max().unwrap_or(1);
-        let h = layer.frames.iter().map(|f| f.h).max().unwrap_or(1);
-        let (x_pan, y_pan) = layer.pan.unwrap_or((0.0, 0.0));
-        parallax_refs.push(ParallaxRef {
-            frames: layer.frames.clone(), w, h, mode: ParallaxMode::Pan, x_pan, y_pan,
-        });
+    if !cam_bg_elems.is_empty() {
+        // ONE background holding every object of the source's backdrop, in draw order. Its size is
+        // the whole picture's extent, not one object's, and each object keeps its place inside it:
+        // the engine centres a background on the view, so anything emitted as its own background
+        // would be re-centred and the arrangement lost.
+        // The picture is the backdrop PLATE: the biggest object that is solid throughout. Neither
+        // the union of everywhere anything ever goes (a moon crossing the sky, a fog sheet drawn
+        // far wider than the view) nor simply the biggest object works -- the biggest is usually a
+        // full-screen FADE sheet, which is invisible almost always, and anchoring the picture on
+        // it leaves the actual backdrop off in a corner of an empty canvas.
+        let biggest = |it: &mut dyn Iterator<Item = &ArtRef>| it.max_by_key(|f| f.w as u64 * f.h as u64).cloned();
+        let plate = biggest(&mut cam_bg_elems.iter().filter(|l| !l.fades).flat_map(|l| l.frames.iter()))
+            .or_else(|| biggest(&mut cam_bg_elems.iter().flat_map(|l| l.frames.iter())));
+        let plate = plate.as_ref();
+        if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok() {
+            for l in &cam_bg_elems {
+                let w = l.frames.iter().map(|f| f.w).max().unwrap_or(0);
+                let h = l.frames.iter().map(|f| f.h).max().unwrap_or(0);
+                eprintln!("[cambg] {:32} fades={} {}x{} frames={}", l.name, l.fades, w, h, l.frames.len());
+            }
+            eprintln!("[cambg] plate = {:?}", plate.map(|f| (f.w, f.h, f.x, f.y)));
+        }
+        let (w, h) = plate.map(|f| (f.w, f.h)).unwrap_or((1, 1));
+        let (l, t) = plate.map(|f| (f.x, f.y)).unwrap_or((0.0, 0.0));
+        // Every object's position, from the picture's own top-left and in the picture's own
+        // PIXELS. The track positions are in stage units (they were laid out against the world),
+        // while a camera background draws its images unscaled and lets the layer transform do the
+        // scaling -- so they have to come back to pixels or the arrangement is off by the stage
+        // scale.
+        let tracks: Vec<Vec<ArtRef>> = cam_bg_elems.iter()
+            .map(|layer| layer.frames.iter().cloned()
+                .map(|mut f| { f.x = (f.x - l) / model.scale; f.y = (f.y - t) / model.scale; f })
+                .collect())
+            .collect();
+        let (x_pan, y_pan) = cam_bg_elems[0].pan.unwrap_or((0.0, 0.0));
+        parallax_refs.push(ParallaxRef { tracks, w, h, mode: ParallaxMode::Pan, x_pan, y_pan });
     }
     let (platform_sprites, structure_contents, structure_spawn_ids) =
         emit_platform_structures(model, &lib, &sprites)?;
@@ -270,7 +297,7 @@ struct EntityBuilder<'a> {
     anim_layers: Vec<String>,
     /// One `(animationName, layerId)` per parallax camera-background layer (`parallax0`,
     /// `parallax1`, …) — each `_cambg` layer scrolls at its own rate, so each is its own.
-    parallax_anims: Vec<(String, String)>,
+    parallax_anims: Vec<(String, Vec<String>)>,
     /// Length of the stage animation in engine frames (static layers hold for this many).
     frame_len: usize,
     /// SSF2 -> FM art scale (`size_multiplier`): native-resolution art PNGs render at this
@@ -508,21 +535,73 @@ impl<'a> EntityBuilder<'a> {
     /// would double it.
     fn add_image_parallax(&mut self, idx: usize, image_asset: &str, x: f64, y: f64) {
         let lid = self.make_image(&format!("Parallax {idx}"), image_asset, x, y, 1.0);
-        self.parallax_anims.push((format!("parallax{idx}"), lid));
+        self.parallax_anims.push((format!("parallax{idx}"), vec![lid]));
     }
     /// An ANIMATED camera background: the same per-frame layer an animated stage layer gets, but
     /// registered as its own `parallax{idx}` animation. It has to live in the STAGE entity like
     /// the still ones do -- a background entry pointed at a separate entity does not draw.
-    fn add_image_frames_parallax(&mut self, idx: usize, frames: &[(String, f64, f64, usize)]) {
-        let name = format!("Parallax {idx}");
-        // scale 1 on the images: a camera background is scaled by its OWN layer transform
-        // (`scaleMultiplier`), so scaling the images too would apply the stage scale twice.
-        self.add_image_frames_scaled(&name, frames, 1.0, 1.0);
-        // it is a background, not a layer of the stage animation
-        if let Some(lid) = self.anim_layers.pop() {
-            self.parallax_anims.push((format!("parallax{idx}"), lid));
+    /// A camera background ported as a TIMELINE: each keyframe carries that frame's own image,
+    /// position, rotation and alpha, so the source's fades and turns survive as transforms instead
+    /// of being baked into a picture per frame.
+    ///
+    /// `cx`/`cy` centre the layer on its own origin (the engine anchors a background at the centre
+    /// of the view), and each frame's own offset rides on top of that.
+    fn add_image_tracks_parallax(&mut self, idx: usize, cx: f64, cy: f64, tracks: &[Vec<ArtRef>]) {
+        // ONE camera background holding one layer per source object. The engine centres a
+        // background layer on the view, so emitting each object as its own background would pile
+        // them all on the same point and lose the arrangement -- the town, its clock and its moon
+        // sit at different places in one picture, which is exactly what a single animation with
+        // several layers expresses.
+        let mut lids = Vec::new();
+        for (t, frames) in tracks.iter().enumerate() {
+            let lid = self.parallax_track_layer(&format!("Parallax {idx}.{t}"), cx, cy, frames);
+            lids.push(lid);
         }
+        self.parallax_anims.push((format!("parallax{idx}"), lids));
     }
+
+    /// One object's track as an IMAGE layer: a keyframe per change carrying that frame's image,
+    /// position, rotation and alpha. Returns the layer id (the caller decides what it belongs to).
+    fn parallax_track_layer(&mut self, name: &str, cx: f64, cy: f64, frames: &[ArtRef]) -> String {
+        let name = name.to_string();
+        let target = self.frame_len.max(1);
+        let mut kfs = Vec::new();
+        let mut filled = 0usize;
+        let mut sym_of: std::collections::HashMap<usize, String> = Default::default();
+        'tile: loop {
+            for (i, a) in frames.iter().enumerate() {
+                let mut len = a.hold.max(1);
+                if filled + len > target { len = target - filled; }
+                if len == 0 { break 'tile; }
+                // one symbol per distinct FRAME of the track, made the first time it is laid down
+                let sym = sym_of.entry(i).or_insert_with(|| {
+                    self.seq += 1;
+                    let sym = det_uuid(&format!("stage::{}::sym:{name}:{i}::{}", self.id, self.seq));
+                    self.symbols.push(json!({
+                        "$id": sym, "type": "IMAGE", "imageAsset": a.guid, "alpha": a.alpha,
+                        "x": cx + a.x, "y": cy + a.y, "scaleX": a.scale_x, "scaleY": a.scale_y,
+                        "rotation": a.rotation, "pivotX": 0, "pivotY": 0, "pluginMetadata": {}
+                    }));
+                    sym
+                }).clone();
+                self.seq += 1;
+                let kf = det_uuid(&format!("stage::{}::kf:{name}:{filled}:{i}::{}", self.id, self.seq));
+                self.keyframes.push(json!({ "$id": kf, "length": len, "pluginMetadata": {},
+                    "symbol": sym, "tweenType": "LINEAR", "tweened": false, "type": "IMAGE" }));
+                kfs.push(kf);
+                filled += len;
+                if filled >= target { break 'tile; }
+            }
+            if frames.is_empty() { break; }
+        }
+        let lid = self.uid(&format!("layer:{name}"));
+        self.layers.push(json!({
+            "$id": lid, "hidden": false, "locked": false, "name": name, "type": "IMAGE",
+            "keyframes": kfs, "pluginMetadata": {}
+        }));
+        lid
+    }
+
     /// Add an animated IMAGE layer to the `stage` animation: one keyframe per frame, each
     /// referencing that frame's image, so the layer plays through them (loops).
     fn add_image_frames(&mut self, name: &str, frames: &[(String, f64, f64, usize)]) {
@@ -605,7 +684,7 @@ impl<'a> EntityBuilder<'a> {
 
 /// A written art layer the entity references: the sprite `.meta` guid + placement + size.
 #[derive(Clone)]
-struct ArtRef { guid: String, x: f64, y: f64, w: u32, h: u32, hold: usize,
+struct ArtRef { guid: String, x: f64, y: f64, w: u32, h: u32, hold: usize, alpha: f64,
     /// Orientation for this frame. Non-zero when the element is a few cels the source MOVES or
     /// TURNS: the art is emitted once per cel and oriented here, rather than baked per angle.
     rotation: f64, scale_x: f64, scale_y: f64 }
@@ -619,10 +698,11 @@ struct ArtRef { guid: String, x: f64, y: f64, w: u32, h: u32, hold: usize,
 /// the stage script instead would be a second, parallel implementation of what the engine's own
 /// parallax already does.
 struct ParallaxRef {
-    /// The layer's frames: one for a still backdrop, its loop for an animated one. Both live in
-    /// the STAGE entity as a `parallax{i}` animation -- a background entry pointed at a separate
-    /// entity does not draw.
-    frames: Vec<ArtRef>,
+    /// The background's objects, back to front, each as its own track of keyframes. A still
+    /// backdrop is one track of one frame. All of them live in the STAGE entity as ONE
+    /// `parallax{i}` animation: a background entry pointed at a separate entity does not draw,
+    /// and one entry per object would centre each of them on the same point.
+    tracks: Vec<Vec<ArtRef>>,
     w: u32,
     h: u32,
     mode: ParallaxMode,
@@ -637,6 +717,10 @@ struct BgLayerRef {
     /// branches between them instead of looping. Frame counts index into `frames`, which is the
     /// segments concatenated in timeline order. Empty for an ordinary looping element.
     segments: Vec<(String, usize, Option<crate::abc_parser::LabelJump>)>,
+    /// `true` when the source animates this object's opacity (see `BgLayer::fades`).
+    fades: bool,
+    /// The opacity the source authored for this element (see `BgLayer::authored_alpha`).
+    authored_alpha: f64,
     /// Set when the element came out of a CAMERA BACKGROUND: the fraction of the camera's movement
     /// it scrolls by. The stage drives it from the live camera each frame, which is how an animated
     /// camera-background object stays animated AND stays in the parallax.
@@ -720,7 +804,7 @@ fn render_placeholder(model: &StageModel) -> StageArt {
         image::codecs::png::PngEncoder::new(&mut png)
             .write_image(img.as_raw(), 1, 1, image::ExtendedColorType::Rgba8)
             .expect("encode placeholder png");
-        return StageArt { png, x: 0.0, y: 0.0, w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 };
+        return StageArt { png, x: 0.0, y: 0.0, w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 1.0 };
     }
 
     // bounding box of all collision geometry, with a small margin.
@@ -768,7 +852,7 @@ fn render_placeholder(model: &StageModel) -> StageArt {
     }
     // Position stays in FM units: a placement's x/y are already parent-space coordinates and only
     // the image's PIXELS are scaled. Size is what had to change, not where it sits.
-    StageArt { png, x: min_x, y: min_y, w, h, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 }
+    StageArt { png, x: min_x, y: min_y, w, h, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 1.0 }
 }
 
 /// How large a placeholder raster may get. Big enough for every stage in the corpus at source
@@ -784,7 +868,11 @@ fn build_entity(model: &StageModel, art: &ArtRefs) -> Value {
     // 60fps), so the loop matches the SSF2 duration. a static layer holds for the whole loop.
     let layer_len = |refs: &[ArtRef]| refs.iter().map(|a| a.hold).sum::<usize>();
     let bg_max_len = art.background.iter().chain(&art.background_front).map(|l| layer_len(&l.frames)).max().unwrap_or(0);
-    b.frame_len = bg_max_len.max(layer_len(&art.stage)).max(1);
+    // the camera backgrounds count too: a stage's longest timeline is often the backdrop's own
+    // (clocktown's day/night cycle), and leaving it out cuts that cycle to whatever the nearer
+    // layers happened to need.
+    let px_max_len = art.parallax.iter().flat_map(|p| p.tracks.iter()).map(|t| layer_len(t)).max().unwrap_or(0);
+    b.frame_len = bg_max_len.max(px_max_len).max(layer_len(&art.stage)).max(1);
 
     // ── render order (first = back): the painted backdrop, background depth containers,
     // the stage art (behind fighters), the character containers, the foreground art (in
@@ -917,23 +1005,22 @@ fn build_entity(model: &StageModel, art: &ArtRefs) -> Value {
     // each SSF2 camera-background layer -> its own `parallax{i}` animation (each scrolls at its
     // own rate, set in StageStats).
     for (i, p) in art.parallax.iter().enumerate() {
-        // The engine anchors a camera background at the CENTRE of the view, so the layer's art is
-        // placed centred on its own origin rather than at the world position it has on the stage.
+        // The engine anchors a camera background at the CENTRE of the view, so the art is placed
+        // centred on the background's own origin rather than at its world position on the stage.
         let (cx, cy) = (-(p.w as f64) / 2.0, -(p.h as f64) / 2.0);
-        match p.frames.as_slice() {
+        match p.tracks.as_slice() {
             [] => {}
-            [a] => b.add_image_parallax(i, &a.guid, cx, cy),
-            frames => b.add_image_frames_parallax(i,
-                &frames.iter().map(|a| (a.guid.clone(), cx, cy, a.hold)).collect::<Vec<_>>()),
+            [one] if one.len() == 1 => b.add_image_parallax(i, &one[0].guid, cx, cy),
+            tracks => b.add_image_tracks_parallax(i, cx, cy, tracks),
         }
     }
 
     let mut animations = vec![json!({
         "$id": b.uid("anim:stage"), "name": "stage", "pluginMetadata": {}, "layers": b.anim_layers
     })];
-    for (name, lid) in b.parallax_anims.clone() {
+    for (name, lids) in b.parallax_anims.clone() {
         let aid = b.uid(&format!("anim:{name}"));
-        animations.push(json!({ "$id": aid, "name": name, "pluginMetadata": {}, "layers": [lid] }));
+        animations.push(json!({ "$id": aid, "name": name, "pluginMetadata": {}, "layers": lids }));
     }
     animations.extend(b.extra_anims.clone());
 
@@ -3037,6 +3124,8 @@ fn build_element_layers(
     segments: &[crate::stage_parser::BgSegment],
     plane: BgPlane,
     pan: Option<(f64, f64)>,
+    fades: bool,
+    authored_alpha: f64,
     write_layer: &mut impl FnMut(&str, &crate::stage_parser::StageArt) -> Result<ArtRef>,
 ) -> Result<Vec<BgLayerRef>> {
     let segs: Vec<(String, usize, Option<crate::abc_parser::LabelJump>)> =
@@ -3048,13 +3137,13 @@ fn build_element_layers(
             let moving_refs = write_element_frames(eid, &moving, false, write_layer)?;
             return Ok(vec![
                 BgLayerRef { name: format!("{name} (plate)"), eid: plate_id, frames: vec![plate_ref],
-                             plane, segments: Vec::new(), pan },
-                BgLayerRef { name, eid: eid.to_string(), frames: moving_refs, plane, segments: Vec::new(), pan },
+                             plane, segments: Vec::new(), pan, fades, authored_alpha },
+                BgLayerRef { name, eid: eid.to_string(), frames: moving_refs, plane, segments: Vec::new(), pan, fades, authored_alpha },
             ]);
         }
     }
     let refs = write_element_frames(eid, frames, !segs.is_empty(), write_layer)?;
-    Ok(vec![BgLayerRef { name, eid: eid.to_string(), frames: refs, plane, segments: segs, pan }])
+    Ok(vec![BgLayerRef { name, eid: eid.to_string(), frames: refs, plane, segments: segs, pan, fades, authored_alpha }])
 }
 
 /// Split a mostly-static animated element into a still PLATE plus a small moving piece.
@@ -3131,7 +3220,7 @@ fn split_static_plate(frames: &[crate::stage_parser::StageArt])
         moving.push(crate::stage_parser::StageArt {
             png: encode(&crop)?,
             x: f.x + x0 as f64, y: f.y + y0 as f64,
-            w: bw, h: bh, hold: f.hold, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 });
+            w: bw, h: bh, hold: f.hold, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 });
     }
     log::info!("backdrop element: {}x{} canvas with a {bw}x{bh} moving region — emitting a still plate plus the crop",
                cw, ch);
@@ -3169,9 +3258,13 @@ fn write_element_frames(
     let mut seen: Vec<(usize, ArtRef)> = Vec::new();   // index of first use -> its ref
     let mut written = 0usize;
     for (j, a) in src.iter().enumerate() {
-        if let Some((_, prev)) = seen.iter().find(|(i, _)| same_art(&src[*i], a)) {
+        // by the PICTURE alone: where it sits, how it is turned and how solid it is all ride on
+        // the keyframe, so the same cel moved across the screen is one image, not one per step.
+        if let Some((_, prev)) = seen.iter().find(|(i, _)| src[*i].png == a.png) {
             // same picture as an earlier frame: reuse the asset, keep this frame's own hold
-            out.push(ArtRef { hold: a.hold.max(1) as usize, rotation: a.rotation, scale_x: a.scale_x, scale_y: a.scale_y, x: a.x, y: a.y, ..prev.clone() });
+            out.push(ArtRef { hold: a.hold.max(1) as usize, rotation: a.rotation, scale_x: a.scale_x,
+                              scale_y: a.scale_y, x: a.x, y: a.y, alpha: a.alpha,
+                              w: a.w, h: a.h, ..prev.clone() });
             continue;
         }
         let r = write_layer(&format!("{eid}_{j}"), a)?;
@@ -3217,10 +3310,20 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
         // of the static background art and behind the fighters. no owner / no VfxLayer: the
         // container reparent is the authoritative depth control.
         let (ox, oy) = bg_element_origin(layer);
+        // at the opacity the SOURCE authored for its plane. A promoted element used to spawn fully
+        // opaque whatever the source said, so clocktown's lighting sheet -- a screen-sized overlay
+        // its own placements set to zero -- was drawn over the whole stage at full strength.
+        // on the reparented CONTAINER, which is what actually draws: a VFX's own setAlpha does not
+        // reach the view once it has been moved into a stage container.
+        let a = layer.authored_alpha;
+        let set_alpha = if a < 1.0 {
+            format!("\t\t\tif (_bg{i} != null) {{ _bg{i}.getViewRootContainer().alpha = {a:.3}; }}\n")
+        } else { String::new() };
         spawns.push_str(&format!(
             "\t\t\tvar _bg{i} = match.createVfx(new VfxStats({{ spriteContent: self.getResource().getContent(\"{eid}\"), \
              animation: \"active\", x: {ox}, y: {oy}, loop: true, timeout: -1, relativeWith: false, resizeWith: false }}));\n\
-             \t\t\tif (_bg{i} != null) {{ self.{container}().addChild(_bg{i}.getViewRootContainer()); }}\n",
+             \t\t\tif (_bg{i} != null) {{ self.{container}().addChild(_bg{i}.getViewRootContainer()); }}\n\
+{set_alpha}",
             container = layer.plane.container()));
     }
     Ok((spawns, entries))

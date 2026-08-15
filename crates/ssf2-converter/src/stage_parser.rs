@@ -374,6 +374,14 @@ pub struct ParallaxLayer {
 pub struct BgLayer {
     pub name: String,
     pub frames: Vec<StageArt>,
+    /// The opacity the SOURCE authored for this element (the lowest its placements carry). SSF2
+    /// makes an overlay subtle -- or hides it entirely, leaving it for code to raise -- by setting
+    /// alpha on the clip, so an element spawned at full strength paints over the whole stage.
+    pub authored_alpha: f64,
+    /// `true` when the SOURCE animates this object's opacity. Recorded before the fade is baked
+    /// into the pictures, because after that nothing in the frames says it ever faded -- and a
+    /// fading object is a fade/flash sheet, not the backdrop the picture should be anchored on.
+    pub fades: bool,
     /// Set when this element came out of a CAMERA BACKGROUND: the fraction of the camera's
     /// movement it scrolls by. An animated one cannot be a flattened parallax plate (that is what
     /// froze clocktown's clock), so it stays an element and carries its layer's pan instead.
@@ -419,6 +427,17 @@ pub struct StageArt {
     pub rotation: f64,
     pub scale_x: f64,
     pub scale_y: f64,
+    /// The opacity the SOURCE gives this frame. SSF2 fades a backdrop between its day and night
+    /// skies, and flashes the screen white, by animating alpha -- so a port that carries only
+    /// pixels loses the transition and shows a hard cut.
+    pub alpha: f64,
+}
+
+impl Default for StageArt {
+    fn default() -> Self {
+        StageArt { png: Vec::new(), x: 0.0, y: 0.0, w: 0, h: 0, hold: 1,
+                   rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 1.0 }
+    }
 }
 
 impl StageModel {
@@ -1124,7 +1143,7 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
                 .write_image(&rgba, w_px, h_px, image::ExtendedColorType::Rgba8).ok()?;
         }
         Some(Weather {
-            art: StageArt { png, x: 0.0, y: 0.0, w: w_px, h: h_px, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 },
+            art: StageArt { png, x: 0.0, y: 0.0, w: w_px, h: h_px, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 },
             count: w.count,
             width: w.width * scale,
             height: w.height * scale,
@@ -1433,7 +1452,7 @@ fn clip_attack_boxes(
     ) {
         if depth > 3 { return; }
         for frame in build_frames(tags) {
-            for (id, local, name, _, _, _, _) in &frame {
+            for (id, local, name, _, _, _, _, _) in &frame {
                 let m = mat.mul(local);
                 let is_box = name.as_deref() == Some("attackBox")
                     || sym_names.get(id).is_some_and(|s| {
@@ -1444,7 +1463,7 @@ fn clip_attack_boxes(
                     // the box sprite's inner shape, through its own placement matrix.
                     if let Some(btags) = sprites.get(id) {
                         for inner in build_frames(btags) {
-                            for (sid, smat, _, _, _, _, _) in &inner {
+                            for (sid, smat, _, _, _, _, _, _) in &inner {
                                 if let Some((x0, y0, x1, y1)) = shape_bounds.get(sid) {
                                     let mm = m.mul(smat);
                                     let c = [mm.apply(*x0, *y0), mm.apply(*x1, *y0), mm.apply(*x1, *y1), mm.apply(*x0, *y1)];
@@ -1604,11 +1623,14 @@ fn union_rect(a: &Rect, b: &Rect) -> Rect {
 /// (character id, local matrix, instance name, graphic frame, placement depth). The depth is the
 /// SWF display-list slot — stable per child across frames, so it discriminates same-anchor
 /// siblings (a clip whose children all sit at the clip origin, like a multi-emitter bubble set).
-/// A placed child: `(id, matrix, name, pinned-frame, depth, blend, alpha)`. `alpha` is the
+/// A placed child: `(id, matrix, name, pinned-frame, depth, blend, alpha, visible)`. `alpha` is the
 /// placement's own colour-transform alpha multiplier (1.0 when it has none) — SSF2 authors a
 /// translucent plane by setting alpha on the PARENT movieclip, so it has to be read from the
-/// source and carried down rather than assumed.
-type PlacedChild = (u16, Mat, Option<String>, Option<u16>, u16, Option<swf::BlendMode>, f64);
+/// source and carried down rather than assumed. `visible` is the placement's own visibility flag:
+/// a clip Flash is told to hide is still ON the display list, so a walk that ignores the flag
+/// draws it -- clocktown's storm sheet is a screen-filling grey rectangle that spends most of the
+/// day hidden.
+type PlacedChild = (u16, Mat, Option<String>, Option<u16>, u16, Option<swf::BlendMode>, f64, bool);
 
 /// instance/symbol name -> AS3-assigned render plane (from `stage_abc::extract_stage`). empty when
 /// the stage has no parseable SSF2Stage subclass, in which case `plane_tag` falls back to heuristics.
@@ -1652,12 +1674,25 @@ fn build_frames(tags: &[swf::Tag]) -> Vec<Vec<PlacedChild>> {
                         })
                         .or_else(|| prev.map(|e| e.6))
                         .unwrap_or(1.0);
-                    depth.insert(po.depth, (*id, mat, name, pinned, po.depth, blend, alpha));
+                    let visible = po.is_visible.or_else(|| prev.map(|e| e.7)).unwrap_or(true);
+                    depth.insert(po.depth, (*id, mat, name, pinned, po.depth, blend, alpha, visible));
                 }
                 swf::PlaceObjectAction::Modify => {
+                    // A Modify carries whatever the timeline is CHANGING this frame -- and a
+                    // Flash alpha tween is exactly that: the same object, modified with a new
+                    // colour transform every frame. Reading only the matrix here dropped every
+                    // fade in the corpus (clocktown crossfades its day and night skies, and
+                    // flashes the screen white, entirely through these).
                     if let Some(e) = depth.get_mut(&po.depth) {
                         if let Some(m) = mat_of(po) { e.1 = m; }
                         if let Some(n) = name_of(po) { e.2 = Some(n); }
+                        if let Some(r) = po.ratio { e.3 = Some(r); }
+                        if let Some(b) = po.blend_mode { e.5 = Some(b); }
+                        if let Some(ct) = po.color_transform {
+                            let m = f32::from(ct.a_multiply) as f64;
+                            e.6 = (m + f32::from(ct.a_add) as f64 / 255.0).clamp(0.0, 1.0);
+                        }
+                        if let Some(v) = po.is_visible { e.7 = v; }
                     }
                 }
             },
@@ -1679,7 +1714,7 @@ fn collect_clip_positions(
     sprite_frames: &BTreeMap<u16, Vec<Vec<PlacedChild>>>, out: &mut Vec<(i64, i64)>,
 ) {
     if out.len() > 100_000 { return; }
-    for (id, local, _, _, _, _, _) in children {
+    for (id, local, _, _, _, _, _, _) in children {
         let world = parent.mul(local);
         if let Some(frames) = sprite_frames.get(id) {
             out.push((world.tx.round() as i64, world.ty.round() as i64));
@@ -1702,7 +1737,10 @@ fn walk_frame(
     alpha: f64,
 ) {
     if rec > 8 { return; }
-    for (id, local, name, pinned, pdepth, pblend, palpha) in children {
+    for (id, local, name, pinned, pdepth, pblend, palpha, pvisible) in children {
+        // hidden by the timeline: still on the display list, drawn by nothing. Its whole subtree
+        // goes with it.
+        if !*pvisible { continue; }
         let world = parent.mul(local);
         let sym = sym_names.get(id).cloned().unwrap_or_default();
         // an instance establishes a plane for its subtree: the stage's AS3 plane map (authoritative)
@@ -1795,6 +1833,68 @@ fn walk_frame(
 /// mask is greyscale, which is what decides whether HardLight can be reproduced by ALPHA LAYERS
 /// instead of baked: the black/white decomposition needs one alpha per pixel, so it is exact for a
 /// greyscale mask and cannot express a mask whose channels disagree.
+/// Multiply each frame's pixels by the alpha the source gives it, and reset the frame to opaque.
+///
+/// The engine draws a camera background's sprite at the LAYER's alpha, overwriting whatever a
+/// keyframe asks for (measured: a layer emitted at alpha 0 throughout still drew at full strength).
+/// Alpha is how SSF2 fades and flashes, so for a background it has to go into the pixels.
+///
+/// The number of levels is chosen per object against a size budget, because that is what decides
+/// whether this is cheap: a flash sheet is a flat colour that costs a couple of KB a level, and a
+/// detailed picture is a hundred times that. A fade sheet gets a smooth ramp; a big picture gets a
+/// coarse one rather than hundreds of megabytes.
+fn bake_frame_alpha(frames: &mut [StageArt], name: &str) {
+    use std::collections::{HashMap, HashSet};
+    /// About how much one object's faded copies may add up to.
+    const BUDGET_BYTES: usize = 2_000_000;
+    const MAX_STEPS: f64 = 64.0;
+
+    let faded: Vec<&StageArt> = frames.iter().filter(|f| f.alpha < 1.0).collect();
+    if faded.is_empty() { return; }
+    // the cost is one copy per (picture, level): an object with many cels AND a fade multiplies
+    let cels: HashSet<&[u8]> = faded.iter().map(|f| f.png.as_slice()).collect();
+    let bytes = faded.iter().map(|f| f.png.len()).max().unwrap_or(0).max(1);
+    let steps = (BUDGET_BYTES / (bytes * cels.len().max(1))).min(MAX_STEPS as usize);
+    if steps < 2 {
+        // Not affordable: this object keeps the source's pictures but loses its fade. Say so --
+        // a backdrop that cuts where the source dissolves is a visible difference, and a silent
+        // one is worse than a stated one.
+        log::warn!("camera background '{name}': its fade is not carried ({} pictures at {}KB each \
+                    would cost more than the budget); it cuts where the source dissolves",
+                   cels.len(), bytes / 1024);
+        for f in frames.iter_mut() { f.alpha = 1.0; }
+        return;
+    }
+    let quant = steps as f64;
+    let mut done: HashMap<(u64, u8), Vec<u8>> = HashMap::new();
+    for f in frames.iter_mut() {
+        let q = ((f.alpha.clamp(0.0, 1.0) * quant).round() / quant).clamp(0.0, 1.0);
+        if q >= 1.0 { f.alpha = 1.0; continue; }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            f.png.hash(&mut h);
+            (h.finish(), (q * quant) as u8)
+        };
+        if let Some(png) = done.get(&key) { f.png = png.clone(); f.alpha = 1.0; continue; }
+        let Ok(img) = image::load_from_memory(&f.png) else { f.alpha = 1.0; continue };
+        let mut rgba = img.to_rgba8();
+        for px in rgba.pixels_mut() { px.0[3] = (px.0[3] as f64 * q).round() as u8; }
+        let mut png = Vec::new();
+        {
+            use image::ImageEncoder;
+            if image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(rgba.as_raw(), rgba.width(), rgba.height(), image::ExtendedColorType::Rgba8).is_err() {
+                f.alpha = 1.0;
+                continue;
+            }
+        }
+        done.insert(key, png.clone());
+        f.png = png;
+        f.alpha = 1.0;
+    }
+}
+
 /// Pad every frame of an element to one canvas size, keeping each frame's content CENTRED.
 ///
 /// A frame drawn as its own crop carries its position in `x`/`y`; growing the canvas around the
@@ -1901,7 +2001,7 @@ fn fit_blend_overlay(mask: &StageArt, base: &StageArt) -> Option<StageArt> {
     use image::ImageEncoder;
     image::codecs::png::PngEncoder::new(&mut png)
         .write_image(out.as_raw(), out.width(), out.height(), image::ExtendedColorType::Rgba8).ok()?;
-    Some(StageArt { png, x: mask.x, y: mask.y, w: mask.w, h: mask.h, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 })
+    Some(StageArt { png, x: mask.x, y: mask.y, w: mask.w, h: mask.h, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 })
 }
 
 /// Paint a shape's bitmap FILL into a `tw` x `th` tile by mapping through the fill's own matrix,
@@ -2460,13 +2560,16 @@ fn render_art_layers(
             // stays put while its content animates (no wiggle as the flame bbox flickers).
             let all: Vec<&Instance> = sampled.iter()
                 .flat_map(|(insts, _)| insts.iter().filter(|i| matches(i))).collect();
+            // the opacity the source authored for this element: the lowest any of its placements
+            // carries (SSF2 sets it on the clip, so every leaf under it inherits the same value)
+            let elem_alpha = all.iter().map(|i| i.alpha).fold(1.0_f64, f64::min);
             let bounds = union_bounds(&all);
             // a frame where the element is INVISIBLE (a bubble between pops, a podoboo between
             // leaps) is a real frame of its loop: emit it as a blank, not a gap. dropping it
             // both broke the animated test (collapsing the element to one static frame) and
             // compressed the quiet stretches out of the loop.
             let blank = || bounds.map(|(l, t, _, _)| StageArt {
-                png: blank_png(), x: (l - ox) * scale, y: (t - oy) * scale, w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 });
+                png: blank_png(), x: (l - ox) * scale, y: (t - oy) * scale, w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 });
             let per_frame: Vec<StageArt> = sampled.iter().filter_map(|(insts, _)| {
                 let grp: Vec<&Instance> = insts.iter().filter(|i| matches(i)).collect();
                 composite_grp(grp, bounds).or_else(blank)
@@ -2485,7 +2588,7 @@ fn render_art_layers(
                 let mut segments = segments;
                 for s in &mut segments { s.frames = rle(std::mem::take(&mut s.frames)); }
                 let frames = segments.iter().flat_map(|s| s.frames.iter().cloned()).collect();
-                return Some(((sname.clone(), *ax, *ay, *apath), BgLayer { name: sname.clone(), frames, segments, pan: None }));
+                return Some(((sname.clone(), *ax, *ay, *apath), BgLayer { name: sname.clone(), frames, segments, pan: None, fades: false, authored_alpha: elem_alpha }));
             }
             // ONE shape the source moves or turns is emitted as that shape ONCE, placed by a
             // transform each frame -- the same thing the character path does with an arm. Baking
@@ -2499,7 +2602,7 @@ fn render_art_layers(
                                                       shape_defs, bitmaps) {
                     let p = loop_period(&fs);
                     return Some(((sname.clone(), *ax, *ay, *apath),
-                                 BgLayer { name: sname.clone(), pan: None, frames: rle(fs[..p].to_vec()), segments: Vec::new() }));
+                                 BgLayer { name: sname.clone(), pan: None, fades: false, authored_alpha: elem_alpha, frames: rle(fs[..p].to_vec()), segments: Vec::new() }));
                 }
             }
             let frames = if animated {
@@ -2512,7 +2615,7 @@ fn render_art_layers(
                 composite_grp(grp, bounds).into_iter().collect()
             };
             (!frames.is_empty()).then(|| ((sname.clone(), *ax, *ay, *apath),
-                                          BgLayer { name: sname.clone(), frames, segments: Vec::new(), pan: None }))
+                                          BgLayer { name: sname.clone(), frames, segments: Vec::new(), pan: None, fades: false, authored_alpha: elem_alpha }))
         }).collect();
 
         // Parts of ONE source clip run off ONE timeline. Split into separate elements they each
@@ -2630,7 +2733,14 @@ fn render_art_layers(
         };
         let mode = if std::env::var("PEPTIDE_PARALLAX_BOUNDS").is_ok() { ParallaxMode::Bounds } else { ParallaxMode::Pan };
         let (mut plates, mut moving) = (Vec::new(), Vec::new());
-        for mut l in group_bg_layers(&cam_member, true) {
+        // A camera background is ported as the source's own TIMELINE (see `timeline_tracks`):
+        // one image per shape, moved / turned / faded by keyframes, which is both how the source
+        // draws it and the only form that can carry its fades and its flash.
+        let cam_layers = {
+            let tracks = timeline_tracks(&sampled, &cam_member, ox, oy, scale, shape_defs, bitmaps);
+            if tracks.is_empty() { group_bg_layers(&cam_member, true) } else { tracks }
+        };
+        for mut l in cam_layers {
             // a pan of zero is a fixed layer: nothing to drive, so it carries no pan at all
             let pan = declared_pan(&l.name).filter(|(x, y)| *x != 0.0 || *y != 0.0);
             if l.frames.len() > 1 {
@@ -2805,7 +2915,7 @@ fn engine_added_bg_layers(
         }
     }
     for tags in sprites.values() {
-        for frame in build_frames(tags) { for (cid, _, _, _, _, _, _) in frame { note(cid, bitmaps, &mut referenced, &mut ref_dims); } }
+        for frame in build_frames(tags) { for (cid, _, _, _, _, _, _, _) in frame { note(cid, bitmaps, &mut referenced, &mut ref_dims); } }
     }
     for t in root_tags {
         if let swf::Tag::PlaceObject(po) = t {
@@ -2931,7 +3041,7 @@ fn engine_added_bg_layers(
         let im = image::RgbaImage::from_raw(*bw, *bh, rgba.clone())?;
         let mut png = Vec::new();
         image::DynamicImage::ImageRgba8(im).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
-        Some(StageArt { png, x: x_fm, y: y_fm, w: *bw, h: *bh, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 })
+        Some(StageArt { png, x: x_fm, y: y_fm, w: *bw, h: *bh, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 })
     };
     let mut bg_layers: Vec<BgLayer> = Vec::new();
     let mut fg_arts: Vec<StageArt> = Vec::new();
@@ -2965,7 +3075,7 @@ fn engine_added_bg_layers(
             (x_fm, y_fm)
         });
         if let Some(art) = to_art(&bg_id, bg_x, bg_y) {
-            bg_layers.push(BgLayer { name: format!("engineLayer{li}"), frames: vec![art], segments: Vec::new(), pan: None });
+            bg_layers.push(BgLayer { name: format!("engineLayer{li}"), frames: vec![art], segments: Vec::new(), pan: None, fades: false, authored_alpha: 1.0 });
         }
         // foreground = any same-size sibling whose deck row is clearly CUT OUT (a near parapet that
         // must draw IN FRONT of the fighter), at ITS OWN authored placement, falling back to the
@@ -3088,15 +3198,13 @@ fn single_shape_frames(
                 w: art.w, h: art.h, hold: 1,
                 // relative to the frame the art came from, which already carries that much turn
                 rotation: crate::fm_placement::normalise_degrees(p.rotation - base_rot),
-                scale_x: 1.0, scale_y: 1.0,
-            }
+                scale_x: 1.0, scale_y: 1.0, alpha: 1.0 }
         }
         None => StageArt {
             png: blank_png(),
             x: (anchor.aabb.left() - ox) * scale,
             y: (anchor.aabb.top() - oy) * scale,
-            w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0,
-        },
+            w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 1.0 },
     }).collect())
 }
 
@@ -3243,7 +3351,7 @@ fn composite_layer(
         image::codecs::png::PngEncoder::new(&mut png)
             .write_image(canvas.as_raw(), cw, ch, image::ExtendedColorType::Rgba8).ok()?;
     }
-    Some(StageArt { png, x: min_x - ox, y: min_y - oy, w: cw, h: ch, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 })
+    Some(StageArt { png, x: min_x - ox, y: min_y - oy, w: cw, h: ch, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 })
 }
 
 /// Extract a clip's labelled sub-animations as rasterized frame sequences. Each frame label in the
@@ -3305,14 +3413,14 @@ fn extract_labeled_clip_anims(
         // placement's `ratio` does NOT exclude it: ratio only means anything for a MorphShape, and
         // Flash runs a sprite's own timeline regardless (see `walk_frame`).
         let sub_len = children.iter()
-            .filter_map(|(id, _, _, _, _, _, _)| sprite_frames.get(id).map(|fr| fr.len()))
+            .filter_map(|(id, _, _, _, _, _, _, _)| sprite_frames.get(id).map(|fr| fr.len()))
             .max().unwrap_or(1).max(1);
         // hold-vs-loop comes from the DRIVING nested clip's own timeline: a sub-clip that holds
         // carries a Flash-generated `_fla.` class (frame scripts) bound in SymbolClass. `stop()`
         // freezes where it fires; `gotoAndStop(target)` plays through then freezes at the target
         // (a label in the SUB-clip's own timeline, or a 1-based frame number).
         let driver_id = children.iter()
-            .filter_map(|(id, _, _, _, _, _, _)| sprite_frames.get(id).map(|fr| (*id, fr.len())))
+            .filter_map(|(id, _, _, _, _, _, _, _)| sprite_frames.get(id).map(|fr| (*id, fr.len())))
             .max_by_key(|(_, n)| *n).map(|(id, _)| id);
         let hold = driver_id
             .and_then(|id| sym_names.get(&id))
@@ -3724,4 +3832,143 @@ mod hazard_classifier_tests {
         assert_eq!(hz.len(), 1, "adjacent same-kind hazards merge");
         assert!(hz[0].1.w >= 210.0, "merged box spans both: {}", hz[0].1.w);
     }
+}
+
+// ── the source's TIMELINE, ported as transforms ─────────────────────────────
+
+/// Port a plane as its source TIMELINE rather than as a picture per frame.
+///
+/// Flash draws a backdrop as objects on depths: each object shows one shape at a time and is moved,
+/// turned, scaled and faded by the timeline. Rasterising the composite every frame throws all of
+/// that away and pays for it twice -- clocktown's day/night backdrop came out as hundreds of copies
+/// of the same town, and its clock, its sky fades and its white flash came out as hard cuts, because
+/// a raster cannot carry a tween.
+///
+/// So: one image per distinct SHAPE, and a keyframe per change carrying the transform and the alpha
+/// the source authored. That is the same thing the character path does with a limb, and it is what
+/// the engine's own keyframes are for. The measurement on clocktown's camera background: 16 objects,
+/// 97 distinct shapes, 7131 keyframes -- against 623 copies of a 739x437 town.
+fn timeline_tracks(
+    sampled: &[(Vec<Instance>, Option<StageArt>)],
+    member: &dyn Fn(&Instance) -> bool,
+    ox: f64, oy: f64, scale: f64,
+    shape_defs: &BTreeMap<u16, &swf::Shape>,
+    bitmaps: &BTreeMap<u16, (u32, u32, Vec<u8>)>,
+) -> Vec<BgLayer> {
+    // A Flash OBJECT is a placement chain plus a depth: that pair is what persists across frames
+    // while its shape and transform change.
+    type Key = (u64, u16);
+    let mut name_of: BTreeMap<Key, String> = BTreeMap::new();
+    // Draw ORDER, not order of appearance. Within one frame the walk lists instances back to
+    // front, so an object's mean position in that list is where it belongs in the stack. Ordering
+    // by first appearance instead puts anything that shows up late in the timeline (clocktown's
+    // storm sky arrives on the third day) in FRONT of everything, which reads as the backdrop
+    // being replaced by a flat colour.
+    let mut rank: BTreeMap<Key, (f64, usize)> = BTreeMap::new();
+    for (insts, _) in sampled.iter() {
+        let members: Vec<&Instance> = insts.iter().filter(|i| member(i)).collect();
+        if members.is_empty() { continue; }
+        let last = (members.len().max(2) - 1) as f64;
+        for (pos, i) in members.iter().enumerate() {
+            let k = (i.inst_path, i.leaf_depth);
+            name_of.entry(k).or_insert_with(|| i.sym_name.clone());
+            let e = rank.entry(k).or_insert((0.0, 0));
+            e.0 += pos as f64 / last;
+            e.1 += 1;
+        }
+    }
+    let mut order: Vec<Key> = rank.keys().copied().collect();
+    order.sort_by(|a, b| {
+        let mean = |k: &Key| rank[k].0 / rank[k].1.max(1) as f64;
+        mean(a).partial_cmp(&mean(b)).unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+
+    let mut out: Vec<BgLayer> = Vec::new();
+    for key in order {
+        // this object's instance in each frame (None where the timeline does not show it)
+        let per_frame: Vec<Option<&Instance>> = sampled.iter()
+            .map(|(insts, _)| insts.iter().find(|i| member(i) && (i.inst_path, i.leaf_depth) == key))
+            .collect();
+        let shown: Vec<&Instance> = per_frame.iter().flatten().copied().collect();
+        if shown.is_empty() { continue; }
+
+        // one cel per distinct shape, taken from the frame where it sits squarest (the rasteriser
+        // fits a shape to its axis-aligned box, so that frame's pixels are the least distorted)
+        let shapes: std::collections::BTreeSet<u16> = shown.iter().map(|i| i.shape_id).collect();
+        let squareness = |i: &Instance| {
+            let r = crate::fm_placement::normalise_degrees(i.place.rotation);
+            (r % 90.0).min(90.0 - (r % 90.0))
+        };
+        // per shape: its raster, the rotation that raster already carries, the placement it was
+        // rasterised under, and that placement's bounding box (what the raster is a crop of)
+        let mut cel: BTreeMap<u16, (StageArt, f64, crate::fm_placement::WorldPlacement, (f64, f64, f64, f64))> = BTreeMap::new();
+        for sid in shapes {
+            let Some(best) = shown.iter().copied().filter(|i| i.shape_id == sid)
+                .min_by(|a, b| squareness(a).partial_cmp(&squareness(b)).unwrap_or(std::cmp::Ordering::Equal))
+            else { continue };
+            let Some(art) = composite_layer(&[best], shape_defs, bitmaps, ox, oy, None) else { continue };
+            cel.insert(sid, (art, crate::fm_placement::normalise_degrees(best.place.rotation), best.place,
+                             (best.aabb.left(), best.aabb.top(), best.aabb.w, best.aabb.h)));
+        }
+        if cel.is_empty() { continue; }
+
+        let anchor = shown[0];
+        let frames: Vec<StageArt> = per_frame.into_iter().map(|slot| match slot.and_then(|i| cel.get(&i.shape_id).map(|c| (i, c))) {
+            Some((i, (art, base_rot, base_place, base_aabb))) => {
+                let p = crate::fm_placement::image_placement(&i.place, (0.0, 0.0), (1.0, 1.0));
+                // Where this frame puts the CEL's own centre. The cel is a crop of the shape as it
+                // was placed in one frame, so the point to follow is the part of the SHAPE that
+                // crop's centre was -- carried through this frame's matrix. Using the frame's own
+                // bounding-box centre instead only works when a piece turns about the middle of its
+                // box, and clocktown's clock rings turn about the clock, not about themselves: they
+                // scattered.
+                let (cx, cy) = base_place
+                    .unapply(base_aabb.0 + base_aabb.2 / 2.0, base_aabb.1 + base_aabb.3 / 2.0)
+                    .map(|(sx_, sy_)| i.place.apply(sx_, sy_))
+                    .unwrap_or((i.aabb.left() + i.aabb.w / 2.0, i.aabb.top() + i.aabb.h / 2.0));
+                let cx = (cx - ox) * scale;
+                let cy = (cy - oy) * scale;
+                StageArt {
+                    png: art.png.clone(),
+                    x: cx - art.w as f64 * scale / 2.0,
+                    y: cy - art.h as f64 * scale / 2.0,
+                    w: art.w, h: art.h, hold: 1,
+                    rotation: crate::fm_placement::normalise_degrees(p.rotation - base_rot),
+                    scale_x: 1.0, scale_y: 1.0,
+                    alpha: i.alpha,
+                }
+            }
+            // not shown this frame: the object is still there, just invisible
+            None => StageArt {
+                png: blank_png(),
+                x: (anchor.aabb.left() - ox) * scale,
+                y: (anchor.aabb.top() - oy) * scale,
+                w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 0.0,
+            },
+        }).collect();
+        // consecutive frames that are the same picture in the same place are ONE keyframe held
+        // for that long, which is what turns a 3720-frame timeline into its handful of changes
+        let mut collapsed: Vec<StageArt> = Vec::new();
+        for f in frames {
+            match collapsed.last_mut() {
+                Some(prev) if prev.png == f.png && prev.x == f.x && prev.y == f.y
+                    && prev.rotation == f.rotation && prev.scale_x == f.scale_x
+                    && prev.scale_y == f.scale_y && prev.alpha == f.alpha => prev.hold += 1,
+                _ => collapsed.push(f),
+            }
+        }
+        // the source's fades, into the pixels (the engine will not honour them any other way)
+        let track_name = name_of.get(&key).cloned().unwrap_or_default();
+        let fades = collapsed.iter().any(|f| f.alpha < 1.0);
+        bake_frame_alpha(&mut collapsed, &track_name);
+
+        // NOT padded to a shared canvas: these are layers INSIDE one background animation, and
+        // only the background itself is sized by the engine. Padding here would move each frame's
+        // origin (to keep its content centred) and pull the objects out of alignment with each
+        // other.
+        let name = format!("{}_{}_{}", name_of.get(&key).cloned().unwrap_or_default(), key.0, key.1);
+        out.push(BgLayer { name, frames: collapsed, segments: Vec::new(), pan: None, fades, authored_alpha: 1.0 });
+    }
+    out
 }
