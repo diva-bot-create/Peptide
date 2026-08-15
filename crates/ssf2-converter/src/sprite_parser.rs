@@ -403,6 +403,24 @@ pub fn parse_sprite_boxes(
 /// can share a symbol (and across a multi-char .ssf the symbol names collide), and
 /// SSF2 routes by timeline placement, not by symbol. (Mirrors what dump_proj_states
 /// observes and how extract_xframe_transforms already reads the same timeline.)
+
+/// Sub-MC CLASS NAME -> the SSF2 animation it belongs to, read off the main timeline.
+///
+/// The timeline is the authority on what a clip is: the xframe label that PLACES a sprite names
+/// it. Guessing from the class name instead only works for labels the mapping file lists, so a
+/// variant it does not list resolves to nothing -- and a sub-MC that cannot be named has its
+/// frame scripts dropped, which is an animation that plays with none of its behaviour.
+pub fn class_to_ssf2_anim(
+    swf: &swf::Swf<'_>,
+    sym_names: &BTreeMap<u16, String>,
+    char_lower: &str,
+) -> BTreeMap<String, String> {
+    build_xframe_sprite_map(swf, sym_names, char_lower)
+        .into_iter()
+        .filter_map(|(id, ssf2)| sym_names.get(&id).map(|name| (name.clone(), ssf2)))
+        .collect()
+}
+
 pub(crate) fn build_xframe_sprite_map(
     swf: &swf::Swf<'_>,
     sym_names: &BTreeMap<u16, String>,

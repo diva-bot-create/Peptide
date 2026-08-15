@@ -323,6 +323,20 @@ dimensions below are the rest.
   tethered to the camera (worst per-particle error 0) and spanning the view, the hazards switch
   wired, and both caution-sign hazards spawned.
 
+- **a clip the mapping file does not name kept none of its scripts** (fixed). two passes named the
+  same sub-MC differently: the sprite side reads the MAIN TIMELINE (which xframe label placed this
+  clip), the script side guessed from the class name against `label_to_ssf2`. a variant the table
+  does not list -- `DownSpecialAir` next to `DownSpecial` -- resolved to nothing on the script
+  side, and a sub-MC that cannot be named is SKIPPED, so every frame script it had was dropped.
+
+  sandbag's aerial down special had 0 of its 18 scripts while the grounded one had all 18: no
+  input poll, no momentum, no floor listeners. it now runs them all, and driving it while airborne
+  travels 2255 units on a held direction where it used to do nothing, with no script errors.
+
+  the fix is to ask the timeline first and fall back to the label heuristic, so the two passes
+  agree by construction rather than by both being taught the same names. what remains unnamed is
+  what should be: ChargeSpark, CollisonBox, groundRef_mc, itemPlaceholder_mc.
+
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
   chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the

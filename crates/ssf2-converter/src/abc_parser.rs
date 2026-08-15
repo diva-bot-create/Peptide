@@ -721,6 +721,17 @@ fn extract_xframe_name(bytecode: &[u8], abc: &AbcFile) -> Option<String> {
 /// ext methods, ext vars + inits) comes from the per-character `<X>Ext`
 /// class plus the main character MovieClip and per-character sub-MCs.
 pub fn extract_character(abc: &AbcFile, char_name: &str) -> Result<ExtractedCharacter> {
+    extract_character_with_timeline(abc, char_name, &BTreeMap::new())
+}
+
+/// As `extract_character`, but with the main timeline's own answer for what each sub-MC class is
+/// (see `sprite_parser::class_to_ssf2_anim`). Without it a clip whose label the mapping file does
+/// not list cannot be named, and its frame scripts are dropped.
+pub fn extract_character_with_timeline(
+    abc: &AbcFile,
+    char_name: &str,
+    class_anim: &BTreeMap<String, String>,
+) -> Result<ExtractedCharacter> {
     let mut attacks: BTreeMap<String, AttackData> = BTreeMap::new();
     let mut projectiles: BTreeMap<String, ProjectileData> = BTreeMap::new();
     let mut stats: Option<CharStats> = None;
@@ -1070,9 +1081,12 @@ pub fn extract_character(abc: &AbcFile, char_name: &str) -> Result<ExtractedChar
 
             // Map sub-MC class name → SSF2 animation name using the same mapping
             // as sprite_parser (e.g. "JabCombo" → "a", "NAir" → "a_air")
-            let ssf2_anim = crate::sprite_parser::extract_ssf2_anim_name(
-                &class.name, &char_lower, &xframe_fm_map
-            );
+            // The timeline first: it says which animation placed this clip. The label heuristic
+            // is the fallback, for a clip the timeline walk did not reach.
+            let ssf2_anim = class_anim.get(&class.name).cloned()
+                .or_else(|| crate::sprite_parser::extract_ssf2_anim_name(
+                    &class.name, &char_lower, &xframe_fm_map
+                ));
             let Some(anim_name) = ssf2_anim else {
                 log::debug!("Sub-MC '{}': no animation name mapping, skipping", class.name);
                 continue;

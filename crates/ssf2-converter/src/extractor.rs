@@ -129,7 +129,7 @@ impl Default for CharacterStats {
 
 // ─── Main extraction logic ───────────────────────────────────────────────────
 
-pub fn extract(swf: &SwfFile, char_name: &str) -> Result<CharacterData> {
+pub fn extract(swf: &SwfFile, char_name: &str, class_anim: &BTreeMap<String, String>) -> Result<CharacterData> {
     log::info!("Extracting character data for '{}'", char_name);
 
     let mut all_attacks: BTreeMap<String, Vec<Hitbox>> = BTreeMap::new();
@@ -157,7 +157,7 @@ pub fn extract(swf: &SwfFile, char_name: &str) -> Result<CharacterData> {
 
         match abc_parser::parse(abc_data) {
             Ok(abc) => {
-                let extracted = abc_parser::extract_character(&abc, char_name)?;
+                let extracted = abc_parser::extract_character_with_timeline(&abc, char_name, class_anim)?;
                 if derived_from.is_none() { derived_from = extracted.derived_from.clone(); }
                 if attack_sounds.is_empty() { attack_sounds = extracted.attack_sounds.clone(); }
                 if voice_sounds.is_empty()  { voice_sounds  = extracted.voice_sounds.clone(); }

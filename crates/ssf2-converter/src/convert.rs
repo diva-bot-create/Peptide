@@ -558,7 +558,10 @@ fn process_character(
     crate::api_mappings::reset_conversion_log();
 
     // Extract character data (ABC: attacks, stats, frame scripts, xframe map)
-    let mut char_data = extractor::extract(swf, char_name)?;
+    // What the main timeline says each sub-MC is, so a clip whose label is not in the mapping
+    // file still gets named -- and keeps its frame scripts.
+    let class_anim = sprite_parser::class_to_ssf2_anim(parsed_swf, &swf.symbols, &char_name.to_lowercase());
+    let mut char_data = extractor::extract(swf, char_name, &class_anim)?;
     log::info!("Extracted: {} attacks, {} animations, {} ssf2→fm mappings",
         char_data.attacks.len(), char_data.animations.len(), char_data.ssf2_to_fm_anim.len());
 
