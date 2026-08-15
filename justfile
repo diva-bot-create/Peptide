@@ -36,8 +36,33 @@ convert CHAR:
 smoke:
     ./tools/rebuild-sandbag.sh
 
-# regression sweep: convert EVERY corpus stage, fail on any error (run after stage-converter changes)
+# regression sweep after stage-converter changes: a fixed SAMPLE, chosen for coverage.
+#
+# Not the whole corpus. Converting all 110 takes hours and writes tens of gigabytes -- one stage
+# alone emits 687MB -- so nobody runs it, and a gate nobody runs is not a gate. These ten cover
+# the paths a stage change can break: plain geometry, hazards declared in initialize and in
+# update, weather, moving platforms, backdrop elements, and boundary/parallax handling. Every one
+# is small, so the whole sweep is quick enough to run before every PR.
+#
+# Use `sweep-stages-all` for the full corpus when a change touches shared art or geometry
+# rendering and you want the exhaustive answer.
+sample_stages := "battlefield battlefield2 bombfactory butterbuilding bowserscastle crateria crystalsmash flatzoneplus fourside huecomundo"
+
 sweep-stages:
+    #!/usr/bin/env bash
+    set -u
+    fails=0; total=0
+    for name in {{sample_stages}}; do
+        total=$((total+1))
+        if ! ./build/release/peptide ssf2 stage "{{ssfs}}/stages/$name.ssf" --out build/sweep >/dev/null 2>&1; then
+            echo "FAIL: $name"; fails=$((fails+1))
+        fi
+    done
+    echo "$((total-fails))/$total sample stages converted clean"
+    exit $fails
+
+# the exhaustive version: every corpus stage. slow, and writes a LOT — see sweep-stages.
+sweep-stages-all:
     #!/usr/bin/env bash
     set -u
     fails=0; total=0

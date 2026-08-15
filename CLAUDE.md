@@ -39,7 +39,8 @@ FrayTools to publish. see [`README.md`](README.md) for the pitch.
   and log a conversion warning. template names like the "thwomp" faller are PATTERN names
   selected by detected data (motion, declared engine calls), not by content id. prove a fix
   didn't regress other content before merging: `cargo test` (the character goldens) +
-  `just sweep-stages` (converts the whole stage corpus).
+  `just sweep-stages` (converts a fixed ten-stage sample chosen for coverage; `just
+  sweep-stages-all` is the whole corpus, which takes hours and writes tens of gigabytes).
 - **ONE command vocabulary, TWO engines.** a host-facing feature must behave the same on
   Fraymakers and SSF2 via the `DebugTarget` seam, never an `if engine == ...` branch in feature
   logic. (enforced by `crates/ssf2-converter/tests/conventions.rs`.)

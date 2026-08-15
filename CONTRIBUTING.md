@@ -49,8 +49,13 @@ a few questions, in order:
 4. **did you change the stage converter** (`stage_parser.rs` / `stage_emit.rs` / `stage_abc.rs`)?
    the fix must be universal (pattern detected structurally or from source data, with an
    exact-semantics fallback + conversion-log warning), never keyed to one stage or hazard by
-   name. then prove the corpus still converts: `just sweep-stages` (110 stages, fails on any
-   error). spot-check one OTHER stage's output if the change touches shared rendering.
+   name. then prove stages still convert: `just sweep-stages` (fails on any error). that is a
+   fixed TEN-stage sample, not the corpus: converting all 110 takes hours and writes tens of
+   gigabytes (one stage emits 687MB on its own), so the exhaustive `just sweep-stages-all` is
+   for when a change touches shared art or geometry rendering and you want the full answer. the
+   sample covers plain geometry, hazards declared in both initialize and update, weather, moving
+   platforms, backdrop elements, and boundary/parallax handling. spot-check one OTHER stage's
+   output if the change touches shared rendering.
 
 5. **did you add a host-facing debug command or feature?**
    it has to work **identically on both engines** (Fraymakers + SSF2). define it once
