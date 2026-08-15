@@ -26,12 +26,10 @@ fn lookup_api(name: &str) -> Option<ApiEntry> {
         "setY"              => api!("self.setY"),
         "getXSpeed"         => api!("self.getXSpeed()"),
         "getYSpeed"         => api!("self.getYSpeed()"),
-        // SSF2 setXSpeed/setYSpeed are FACING-RELATIVE (positive X = forward in
-        // the character's facing direction). Fraymakers' setXSpeed/setYSpeed have
-        // the SAME semantics, so keep the names 1:1 — do NOT map to the world-space
-        // setX/YVelocity (that drops the facing orientation and makes forward
-        // momentum push the wrong way when facing left). Mirrors the getXSpeed/
-        // getYSpeed handling above. The SSF2 second boolean arg is dropped below.
+        // SSF2's setXSpeed is WORLD-space; Fraymakers' is FACING-RELATIVE. The names map 1:1
+        // but the ARGUMENT does not: the call site wraps it in flipX so the direction survives
+        // (see the rewrite below, and the measurement behind it). setYSpeed has no facing.
+        // The SSF2 second boolean arg is dropped below.
         "setXSpeed"         => api!("self.setXSpeed"),
         "setYSpeed"         => api!("self.setYSpeed"),
         "getNetXSpeed"      => api!("self.getNetXVelocity()"),
@@ -133,6 +131,15 @@ fn lookup_api(name: &str) -> Option<ApiEntry> {
 /// The value of an expression that is just a number, including a negated one. Used to tell an
 /// authored constant (which is in SSF2 units and needs converting) from a computed value (which
 /// has already come back from the engine in its own units).
+
+/// Whether an argument came back OUT of the engine, and is therefore already in Fraymakers units.
+/// Those must not be rescaled: `decel(getXSpeed(), …)` would shrink a little more each frame.
+fn reads_engine_speed(expr: &str) -> bool {
+    ["getXSpeed", "getYSpeed", "getNetXVelocity", "getNetYVelocity", "currentVelocity"]
+        .iter()
+        .any(|needle| expr.contains(needle))
+}
+
 fn literal_value(e: &Expr) -> Option<f64> {
     match e {
         Expr::Num(n) => Some(*n),
@@ -221,29 +228,41 @@ impl Expr {
                         }
                     }
                 }
-                // SSF2 setXSpeed/setYSpeed map 1:1 onto Fraymakers' facing-relative
-                // setXSpeed/setYSpeed (see the lookup table above). Both engines treat a
-                // positive X speed as "forward in the facing direction", so NO flipX wrap is
-                // needed — the FM method already applies the orientation. We only drop SSF2's
-                // optional second boolean flag, which FM's single-arg signature doesn't accept.
+                // SSF2's setXSpeed is WORLD-space and Fraymakers' is FACING-RELATIVE, so the
+                // two are only the same while facing right. Measured in both engines rather than
+                // assumed: facing LEFT, SSF2's setXSpeed(15) moves the character RIGHT (+147),
+                // and Fraymakers' moves it LEFT (-305). `flipX` converts world to facing-relative
+                // -- setXSpeed(flipX(15)) facing left moves RIGHT, matching SSF2 -- so the wrap
+                // is what makes a move go the way it does in the original. Without it every
+                // converted move with sideways momentum reverses when the character faces left.
+                //
+                // setYSpeed needs no wrap: there is no facing on the vertical axis.
                 match method.as_str() {
                     "setXSpeed" | "setYSpeed" => {
                         rendered.truncate(1);
-                        // ...and RESCALE the value, because a speed written into a move is a
-                        // per-frame distance and neither the frame nor the distance means the
-                        // same thing on the other side: SSF2 steps 30 times a second in a world
-                        // the conversion makes `size_multiplier` bigger. Passing the number
-                        // through unchanged leaves the move covering the right ground per frame
-                        // but twice as many frames, so it travels about half as far again as it
-                        // should. Measured on a side special: 2.0x the source distance where
-                        // 1.3x was correct.
+                        // RESCALE the value: a speed written into a move is a per-frame distance,
+                        // and neither the frame nor the distance means the same thing on the other
+                        // side -- SSF2 steps 30 times a second in a world the conversion makes
+                        // `size_multiplier` bigger.
                         //
-                        // Only a LITERAL is rescaled. Anything computed has already been through
-                        // the engine -- `decel(getXSpeed(), ...)` reads a speed back in FM units
-                        // -- and scaling that would shrink it again every frame it is applied.
+                        // A value the ENGINE handed back is already in Fraymakers units, so
+                        // scaling it would shrink it again on every frame it is applied
+                        // (`decel(getXSpeed(), …)` reads a speed back). Everything else is a
+                        // number the source author wrote, whether it arrived as a literal or
+                        // through a variable holding one -- sandbag's aerial down special dashes
+                        // at `leftSpeed`/`rightSpeed`, set to -15 and 15 in its constructor, and
+                        // scaling only literals left that move running at the raw SSF2 speed.
+                        let k = crate::mappings::character_stats().scaling.velocity_scale();
                         if let Some(v) = args.first().and_then(literal_value) {
-                            let scaled = v * crate::mappings::character_stats().scaling.velocity_scale();
-                            rendered[0] = fmt_num(scaled);
+                            rendered[0] = fmt_num(v * k);
+                        } else if !reads_engine_speed(&rendered[0]) {
+                            rendered[0] = format!("{} * {}", rendered[0], fmt_num(k));
+                        }
+                        // Zero needs no orientation: a stop is a stop whichever way you face,
+                        // and wrapping it only makes the emitted script harder to read.
+                        let is_zero = args.first().and_then(literal_value).is_some_and(|v| v == 0.0);
+                        if method == "setXSpeed" && !is_zero {
+                            rendered[0] = format!("self.flipX({})", rendered[0]);
                         }
                     }
                     _ => {}

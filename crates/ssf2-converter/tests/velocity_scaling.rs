@@ -6,6 +6,11 @@
 //! through leaves the move covering the right ground per frame across twice as many frames, so it
 //! travels half again as far as it should. Measured live on a side special before this was fixed:
 //! 2.0x the source distance where 1.3x is correct.
+//!
+//! The DIRECTION has to be converted too. SSF2's setXSpeed is world-space and Fraymakers' is
+//! facing-relative -- measured in both engines: facing LEFT, SSF2's setXSpeed(15) moves the
+//! character right and Fraymakers' moves it left -- so the argument is wrapped in `flipX`, which
+//! turns a world-space number into the facing-relative one Fraymakers wants.
 
 use ssf2_converter::mappings::character_stats;
 
@@ -15,9 +20,19 @@ fn scale() -> f64 { character_stats().scaling.velocity_scale() }
 fn an_authored_speed_is_converted_to_fraymakers_units() {
     let out = ssf2_converter::decompiler::render_call_for_test("setXSpeed", &["17"]);
     let want = 17.0 * scale();
-    let got: f64 = out.trim_start_matches("self.setXSpeed(").trim_end_matches(')')
+    let got: f64 = out.trim_start_matches("self.setXSpeed(self.flipX(").trim_end_matches("))")
         .parse().expect("emits a number");
     assert!((got - want).abs() < 0.001, "setXSpeed(17) should emit {want}, got {out}");
+    assert!(out.contains("self.flipX("), "and must keep world-space direction: {out}");
+}
+
+#[test]
+fn a_source_speed_held_in_a_variable_is_converted_too() {
+    // sandbag's aerial down special dashes at `leftSpeed`/`rightSpeed`, set to -15 and 15 in its
+    // constructor. Scaling only literals left that move running at the raw SSF2 speed.
+    let out = ssf2_converter::decompiler::render_call_for_test("setXSpeed", &["leftSpeed.get()"]);
+    assert!(out.contains("leftSpeed.get()") && out.contains('*'),
+            "a speed reached through a variable is still an authored speed: {out}");
 }
 
 #[test]
@@ -32,5 +47,5 @@ fn a_computed_speed_is_left_alone() {
 #[test]
 fn zero_stays_zero() {
     let out = ssf2_converter::decompiler::render_call_for_test("setXSpeed", &["0"]);
-    assert_eq!(out, "self.setXSpeed(0)", "a stop is a stop in either engine");
+    assert_eq!(out, "self.setXSpeed(0)", "a stop is a stop in either engine, and needs no flip");
 }

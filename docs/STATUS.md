@@ -337,6 +337,26 @@ dimensions below are the rest.
   agree by construction rather than by both being taught the same names. what remains unnamed is
   what should be: ChargeSpark, CollisonBox, groundRef_mc, itemPlaceholder_mc.
 
+- **sideways momentum reversed when facing left** (fixed). SSF2's `setXSpeed` is WORLD-space and
+  fraymakers' is FACING-RELATIVE, so copying the call across is only right while facing right.
+  measured in both engines rather than argued about: facing LEFT, SSF2's `setXSpeed(15)` moves the
+  character RIGHT (+147) and fraymakers' moves it LEFT (-305); `setXSpeed(flipX(15))` facing left
+  moves RIGHT, matching. so the argument is wrapped in `flipX`, which is what turns a world-space
+  number into the facing-relative one fraymakers wants. a literal zero is left bare -- a stop needs
+  no direction. `setYSpeed` needs no wrap; there is no facing on the vertical axis.
+
+  `setXVelocity` is NOT the world-space alternative: measured airborne, it moves the character not
+  at all.
+
+- **a speed reached through a variable was not converted** (fixed). only literal arguments were
+  rescaled, so a move that dashes at a constant its constructor assigned (sandbag's aerial down
+  special: `leftSpeed = -15`, `rightSpeed = 15`) ran at the raw SSF2 number -- about 15 per frame
+  at 60fps where 9.75 is the conversion. an argument is now scaled unless it came back OUT of the
+  engine (`decel(getXSpeed(), …)` is already in fraymakers units and would shrink each frame).
+
+  verified live on that move: from BOTH facings, holding right dashes right (+385, +386) and
+  holding left gives -8.7 velocity, where before it ran at the raw speed and reversed facing left.
+
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
   chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the
