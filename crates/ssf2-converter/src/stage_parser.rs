@@ -457,6 +457,10 @@ struct Instance {
     /// grouping splits them into independent elements that each loop on their OWN period (a
     /// merged capture cuts every child whose cycle doesn't divide the parent's).
     inst_path: u64,
+    /// This leaf's OWN placement depth inside its owning clip. Sibling shapes in one clip share
+    /// `inst_path` (they belong to the same clip), so this is what tells them apart -- the static
+    /// backdrop plate from the clock hands animating over it.
+    leaf_depth: u16,
     /// Sprite definition id of the clip that named this leaf (the one supplying [`Self::sym_name`]).
     /// The element's own timeline lives there, so it's what carries the frame LABELS: a clip whose
     /// labels split it into segments is a state machine, not a loop, and must not be played end to
@@ -1671,6 +1675,7 @@ fn walk_frame(
                 hazard: None,  // hazards come from the geometry walk, not the art-frame walk
                 inst_anchor,
                 inst_path,
+                leaf_depth: *pdepth,
                 blend: pblend.or(blend),
                 inst_clip,
                 alpha: alpha * palpha,
@@ -2294,17 +2299,68 @@ fn render_art_layers(
         // each at its own position, instead of one merged union-bounds image (which both desyncs
         // their independent loops and wastes a giant mostly-empty texture). a single-instance symbol
         // is one group, same as before.
-        let akey = |i: &Instance| (i.sym_name.clone(), i.inst_anchor.0.round() as i64, i.inst_anchor.1.round() as i64, i.inst_path);
-        let mut order: Vec<(String, i64, i64, u64)> = Vec::new();
-        let mut seen: std::collections::BTreeSet<(String, i64, i64, u64)> = std::collections::BTreeSet::new();
+        // A clip's own shapes are split further, by the DEPTH each sits on, but ONLY where that
+        // pays: a depth whose content changes over time becomes its own element, and every static
+        // depth stays merged into one composite. Flash draws a backdrop as many shapes on many
+        // depths, so splitting them all would turn one bitmap into dozens of entities; merging
+        // them all is what made clocktown emit its whole 739x436 town once per frame, 623 times,
+        // because a clock hand two hundred pixels away kept changing. Splitting only what moves
+        // keeps a large bitmap large -- as it is in the source -- and gives the moving parts their
+        // own small ones.
+        //
+        // A blend is the exception: a hard-light mask is baked by compositing it OVER the art
+        // underneath, so those depths have to stay in one group or the effect is lost.
+        let group_blended: std::collections::BTreeSet<(String, i64, i64, u64)> = sampled.iter()
+            .flat_map(|(insts, _)| insts.iter())
+            .filter(|i| member(i) && i.blend.is_some())
+            .map(|i| (i.sym_name.clone(), i.inst_anchor.0.round() as i64, i.inst_anchor.1.round() as i64, i.inst_path))
+            .collect();
+        // Which (clip, depth) pairs change across the sample: a different shape on that depth, or
+        // the same shape moved. Read off the placements, so nothing is rasterised to find out.
+        let mut depth_seen: std::collections::BTreeMap<(String, i64, i64, u64, u16), std::collections::BTreeSet<(u16, i64, i64)>> = Default::default();
+        for (insts, _) in sampled.iter() {
+            for i in insts.iter().filter(|i| member(i)) {
+                depth_seen
+                    .entry((i.sym_name.clone(), i.inst_anchor.0.round() as i64, i.inst_anchor.1.round() as i64, i.inst_path, i.leaf_depth))
+                    .or_default()
+                    .insert((i.shape_id, i.aabb.x.round() as i64, i.aabb.y.round() as i64));
+            }
+        }
+        // Splitting only pays where there is a STILL PLATE to save: a group that is part static
+        // and part moving re-rasterises the whole thing every frame because of the moving part,
+        // which is how clocktown emitted its 739x436 town 623 times over a clock hand. A group
+        // where everything moves has no plate to preserve, and splitting it just trades one
+        // shared canvas for several union-of-path canvases that are mostly empty -- measured on
+        // bowserscastle's bubbles, which doubled the stage's art that way. So: split only a group
+        // that has both.
+        let mut group_static: std::collections::BTreeMap<(String, i64, i64, u64), (bool, bool)> = Default::default();
+        for ((sn, ax, ay, ap, _), shapes) in depth_seen.iter() {
+            let e = group_static.entry((sn.clone(), *ax, *ay, *ap)).or_insert((false, false));
+            if shapes.len() > 1 { e.1 = true; } else { e.0 = true; }
+        }
+        let depth_animates = |i: &Instance| -> bool {
+            let gk = (i.sym_name.clone(), i.inst_anchor.0.round() as i64, i.inst_anchor.1.round() as i64, i.inst_path);
+            if group_blended.contains(&gk) { return false; }
+            // nothing still to protect, or nothing moving to separate -> leave the group whole
+            if !group_static.get(&gk).is_some_and(|(has_still, has_moving)| *has_still && *has_moving) {
+                return false;
+            }
+            depth_seen.get(&(gk.0, gk.1, gk.2, gk.3, i.leaf_depth)).is_some_and(|v| v.len() > 1)
+        };
+        // key: the placement, plus the depth when that depth animates (0 = the merged still part)
+        let akey = |i: &Instance| (i.sym_name.clone(), i.inst_anchor.0.round() as i64, i.inst_anchor.1.round() as i64, i.inst_path,
+                                   if depth_animates(i) { Some(i.leaf_depth) } else { None });
+        let mut order: Vec<(String, i64, i64, u64, Option<u16>)> = Vec::new();
+        let mut seen: std::collections::BTreeSet<(String, i64, i64, u64, Option<u16>)> = std::collections::BTreeSet::new();
         for i in base_insts.iter().filter(|i| member(i)) {
             let k = akey(i);
             if seen.insert(k.clone()) { order.push(k); }
         }
-        order.iter().filter_map(|(sname, ax, ay, apath)| {
+        order.iter().filter_map(|(sname, ax, ay, apath, adepth)| {
             let matches = |i: &Instance| member(i) && &i.sym_name == sname
                 && i.inst_anchor.0.round() as i64 == *ax && i.inst_anchor.1.round() as i64 == *ay
-                && i.inst_path == *apath;
+                && i.inst_path == *apath
+                && (if depth_animates(i) { Some(i.leaf_depth) } else { None }) == *adepth;
             // fixed canvas = the union of THIS placement's bounds across ALL frames, so the layer
             // stays put while its content animates (no wiggle as the flame bbox flickers).
             let all: Vec<&Instance> = sampled.iter()
@@ -3348,7 +3404,7 @@ fn walk<'a>(
                 x_sign: world.x_sign(), flip: world.flips(),
                 moving: here_moving,
                 hazard: here_hazard,
-                inst_anchor: (0.0, 0.0), inst_path: 0, blend: None, inst_clip: None, alpha: 1.0, // geometry walk feeds collision/hazards, not art grouping
+                inst_anchor: (0.0, 0.0), inst_path: 0, leaf_depth: 0, blend: None, inst_clip: None, alpha: 1.0, // geometry walk feeds collision/hazards, not art grouping
             });
         }
         if let Some(child) = sprites.get(&id) {
@@ -3404,7 +3460,7 @@ mod hazard_classifier_tests {
         let insts = vec![
             Instance { shape_id: 1, inst_name: None, sym_name: "x".into(), plane: None,
                 aabb: Rect { x: 0.0, y: 0.0, w: 100.0, h: 20.0 }, cx: 50.0, cy: 10.0, x_sign: 1.0, flip: (false, false),
-                moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, blend: None, inst_clip: None, alpha: 1.0 },
+                moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, leaf_depth: 0, blend: None, inst_clip: None, alpha: 1.0 },
             Instance { shape_id: 2, inst_name: None, sym_name: "x".into(), plane: None,
                 aabb: Rect { x: 110.0, y: 0.0, w: 100.0, h: 20.0 }, cx: 160.0, cy: 10.0, x_sign: 1.0, flip: (false, false),
                 moving: false, hazard: Some(HazardKind::Lava), inst_anchor: (0.0, 0.0), inst_path: 0, blend: None, inst_clip: None, alpha: 1.0 },

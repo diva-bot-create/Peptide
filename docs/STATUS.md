@@ -357,6 +357,29 @@ dimensions below are the rest.
   verified live on that move: from BOTH facings, holding right dashes right (+385, +386) and
   holding left gives -8.7 velocity, where before it ran at the raw speed and reversed facing left.
 
+- **a still backdrop is no longer re-drawn because something moves over it** (fixed). SSF2 draws a
+  backdrop as many shapes on many depths inside ONE clip, and the art walk flattened the whole clip
+  to a bitmap per frame. clocktown's town backdrop is 739x436 with a clock hand turning two hundred
+  pixels away, so it emitted that whole picture 623 times: 3379 sprites, 263MB, and FrayTools would
+  not publish it at any timeout.
+
+  a clip's shapes now split by the DEPTH each sits on, but only where it pays: a depth whose content
+  changes becomes its own element, every static depth stays merged into one composite, and a clip
+  that is entirely static or entirely moving is left whole. that last part matters -- splitting a
+  group where everything moves trades one shared canvas for several union-of-path canvases that are
+  mostly empty, which DOUBLED bowserscastle's art when the rule was unconditional. a blended group
+  is never split either: a hard-light mask is baked by compositing it over the art beneath it.
+
+  clocktown: 263MB -> 81MB, 3379 -> 1550 sprites, its town plate 664 frames -> 10. it exports (an
+  18MB .fra, ~110s) and renders with no script errors. bowserscastle: 8.8MB/739 -> 8.7MB/732, i.e.
+  untouched.
+
+  what is left is rotation. the rings of the clock face are ONE shape the source turns, and the art
+  path bakes a raster per angle instead of emitting the bitmap once and rotating it -- ~67MB of
+  clocktown's remaining 81MB, in five elements whose every frame is unique. the emitter can express
+  a per-frame rotation (character art already uses it); the stage art path fits each shape into its
+  axis-aligned bounds instead, so this needs that path to carry a transform rather than bake one.
+
 - **the hazards switch is ported, not decided** (fixed). both engines let a match turn hazards off.
   in SSF2 the engine does not apply that to a stage: the stage ASKS (`SSF2API.isHazardsOn()`) and
   chooses what to skip, and 47 stages in the corpus ask without agreeing on what it means. so the
