@@ -427,6 +427,10 @@ pub struct StageArt {
     pub rotation: f64,
     pub scale_x: f64,
     pub scale_y: f64,
+    /// Where the art TURNS about, in image pixels from its top-left. A shape rotates about its own
+    /// registration point, which is not the corner of the raster it was cropped to -- and a piece
+    /// turned about the wrong point swings out of place instead of spinning where it sits.
+    pub pivot: (f64, f64),
     /// The opacity the SOURCE gives this frame. SSF2 fades a backdrop between its day and night
     /// skies, and flashes the screen white, by animating alpha -- so a port that carries only
     /// pixels loses the transition and shows a hard cut.
@@ -436,7 +440,7 @@ pub struct StageArt {
 impl Default for StageArt {
     fn default() -> Self {
         StageArt { png: Vec::new(), x: 0.0, y: 0.0, w: 0, h: 0, hold: 1,
-                   rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 1.0 }
+                   rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 1.0, pivot: (0.0, 0.0) }
     }
 }
 
@@ -1143,7 +1147,7 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
                 .write_image(&rgba, w_px, h_px, image::ExtendedColorType::Rgba8).ok()?;
         }
         Some(Weather {
-            art: StageArt { png, x: 0.0, y: 0.0, w: w_px, h: h_px, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 },
+            art: StageArt { png, x: 0.0, y: 0.0, w: w_px, h: h_px, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 , pivot: (0.0, 0.0) },
             count: w.count,
             width: w.width * scale,
             height: w.height * scale,
@@ -1833,68 +1837,6 @@ fn walk_frame(
 /// mask is greyscale, which is what decides whether HardLight can be reproduced by ALPHA LAYERS
 /// instead of baked: the black/white decomposition needs one alpha per pixel, so it is exact for a
 /// greyscale mask and cannot express a mask whose channels disagree.
-/// Multiply each frame's pixels by the alpha the source gives it, and reset the frame to opaque.
-///
-/// The engine draws a camera background's sprite at the LAYER's alpha, overwriting whatever a
-/// keyframe asks for (measured: a layer emitted at alpha 0 throughout still drew at full strength).
-/// Alpha is how SSF2 fades and flashes, so for a background it has to go into the pixels.
-///
-/// The number of levels is chosen per object against a size budget, because that is what decides
-/// whether this is cheap: a flash sheet is a flat colour that costs a couple of KB a level, and a
-/// detailed picture is a hundred times that. A fade sheet gets a smooth ramp; a big picture gets a
-/// coarse one rather than hundreds of megabytes.
-fn bake_frame_alpha(frames: &mut [StageArt], name: &str) {
-    use std::collections::{HashMap, HashSet};
-    /// About how much one object's faded copies may add up to.
-    const BUDGET_BYTES: usize = 2_000_000;
-    const MAX_STEPS: f64 = 64.0;
-
-    let faded: Vec<&StageArt> = frames.iter().filter(|f| f.alpha < 1.0).collect();
-    if faded.is_empty() { return; }
-    // the cost is one copy per (picture, level): an object with many cels AND a fade multiplies
-    let cels: HashSet<&[u8]> = faded.iter().map(|f| f.png.as_slice()).collect();
-    let bytes = faded.iter().map(|f| f.png.len()).max().unwrap_or(0).max(1);
-    let steps = (BUDGET_BYTES / (bytes * cels.len().max(1))).min(MAX_STEPS as usize);
-    if steps < 2 {
-        // Not affordable: this object keeps the source's pictures but loses its fade. Say so --
-        // a backdrop that cuts where the source dissolves is a visible difference, and a silent
-        // one is worse than a stated one.
-        log::warn!("camera background '{name}': its fade is not carried ({} pictures at {}KB each \
-                    would cost more than the budget); it cuts where the source dissolves",
-                   cels.len(), bytes / 1024);
-        for f in frames.iter_mut() { f.alpha = 1.0; }
-        return;
-    }
-    let quant = steps as f64;
-    let mut done: HashMap<(u64, u8), Vec<u8>> = HashMap::new();
-    for f in frames.iter_mut() {
-        let q = ((f.alpha.clamp(0.0, 1.0) * quant).round() / quant).clamp(0.0, 1.0);
-        if q >= 1.0 { f.alpha = 1.0; continue; }
-        let key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            f.png.hash(&mut h);
-            (h.finish(), (q * quant) as u8)
-        };
-        if let Some(png) = done.get(&key) { f.png = png.clone(); f.alpha = 1.0; continue; }
-        let Ok(img) = image::load_from_memory(&f.png) else { f.alpha = 1.0; continue };
-        let mut rgba = img.to_rgba8();
-        for px in rgba.pixels_mut() { px.0[3] = (px.0[3] as f64 * q).round() as u8; }
-        let mut png = Vec::new();
-        {
-            use image::ImageEncoder;
-            if image::codecs::png::PngEncoder::new(&mut png)
-                .write_image(rgba.as_raw(), rgba.width(), rgba.height(), image::ExtendedColorType::Rgba8).is_err() {
-                f.alpha = 1.0;
-                continue;
-            }
-        }
-        done.insert(key, png.clone());
-        f.png = png;
-        f.alpha = 1.0;
-    }
-}
-
 /// Pad every frame of an element to one canvas size, keeping each frame's content CENTRED.
 ///
 /// A frame drawn as its own crop carries its position in `x`/`y`; growing the canvas around the
@@ -2001,7 +1943,7 @@ fn fit_blend_overlay(mask: &StageArt, base: &StageArt) -> Option<StageArt> {
     use image::ImageEncoder;
     image::codecs::png::PngEncoder::new(&mut png)
         .write_image(out.as_raw(), out.width(), out.height(), image::ExtendedColorType::Rgba8).ok()?;
-    Some(StageArt { png, x: mask.x, y: mask.y, w: mask.w, h: mask.h, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 })
+    Some(StageArt { png, x: mask.x, y: mask.y, w: mask.w, h: mask.h, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 , pivot: (0.0, 0.0) })
 }
 
 /// Paint a shape's bitmap FILL into a `tw` x `th` tile by mapping through the fill's own matrix,
@@ -2569,7 +2511,7 @@ fn render_art_layers(
             // both broke the animated test (collapsing the element to one static frame) and
             // compressed the quiet stretches out of the loop.
             let blank = || bounds.map(|(l, t, _, _)| StageArt {
-                png: blank_png(), x: (l - ox) * scale, y: (t - oy) * scale, w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 });
+                png: blank_png(), x: (l - ox) * scale, y: (t - oy) * scale, w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 , pivot: (0.0, 0.0) });
             let per_frame: Vec<StageArt> = sampled.iter().filter_map(|(insts, _)| {
                 let grp: Vec<&Instance> = insts.iter().filter(|i| matches(i)).collect();
                 composite_grp(grp, bounds).or_else(blank)
@@ -3041,7 +2983,7 @@ fn engine_added_bg_layers(
         let im = image::RgbaImage::from_raw(*bw, *bh, rgba.clone())?;
         let mut png = Vec::new();
         image::DynamicImage::ImageRgba8(im).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
-        Some(StageArt { png, x: x_fm, y: y_fm, w: *bw, h: *bh, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 })
+        Some(StageArt { png, x: x_fm, y: y_fm, w: *bw, h: *bh, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 , pivot: (0.0, 0.0) })
     };
     let mut bg_layers: Vec<BgLayer> = Vec::new();
     let mut fg_arts: Vec<StageArt> = Vec::new();
@@ -3198,13 +3140,13 @@ fn single_shape_frames(
                 w: art.w, h: art.h, hold: 1,
                 // relative to the frame the art came from, which already carries that much turn
                 rotation: crate::fm_placement::normalise_degrees(p.rotation - base_rot),
-                scale_x: 1.0, scale_y: 1.0, alpha: 1.0 }
+                scale_x: 1.0, scale_y: 1.0, alpha: 1.0 , pivot: (0.0, 0.0) }
         }
         None => StageArt {
             png: blank_png(),
             x: (anchor.aabb.left() - ox) * scale,
             y: (anchor.aabb.top() - oy) * scale,
-            w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 1.0 },
+            w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 1.0 , pivot: (0.0, 0.0) },
     }).collect())
 }
 
@@ -3351,7 +3293,7 @@ fn composite_layer(
         image::codecs::png::PngEncoder::new(&mut png)
             .write_image(canvas.as_raw(), cw, ch, image::ExtendedColorType::Rgba8).ok()?;
     }
-    Some(StageArt { png, x: min_x - ox, y: min_y - oy, w: cw, h: ch, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 })
+    Some(StageArt { png, x: min_x - ox, y: min_y - oy, w: cw, h: ch, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0 , alpha: 1.0 , pivot: (0.0, 0.0) })
 }
 
 /// Extract a clip's labelled sub-animations as rasterized frame sequences. Each frame label in the
@@ -3916,27 +3858,29 @@ fn timeline_tracks(
         let anchor = shown[0];
         let frames: Vec<StageArt> = per_frame.into_iter().map(|slot| match slot.and_then(|i| cel.get(&i.shape_id).map(|c| (i, c))) {
             Some((i, (art, base_rot, base_place, base_aabb))) => {
-                let p = crate::fm_placement::image_placement(&i.place, (0.0, 0.0), (1.0, 1.0));
-                // Where this frame puts the CEL's own centre. The cel is a crop of the shape as it
-                // was placed in one frame, so the point to follow is the part of the SHAPE that
-                // crop's centre was -- carried through this frame's matrix. Using the frame's own
-                // bounding-box centre instead only works when a piece turns about the middle of its
-                // box, and clocktown's clock rings turn about the clock, not about themselves: they
-                // scattered.
-                let (cx, cy) = base_place
-                    .unapply(base_aabb.0 + base_aabb.2 / 2.0, base_aabb.1 + base_aabb.3 / 2.0)
+                // Re-place the cel by the DELTA between the frame it was rasterised in and this
+                // one. The cel is the shape as `base_place` drew it, cropped to that frame's box,
+                // so the transform to apply is `place ∘ base_place⁻¹`: turn it by the difference,
+                // scale it by the ratio, and send its corner where that transform sends it. Its
+                // corner is what FrayTools turns an IMAGE about with a zero pivot, which is the
+                // same thing the character path does with a limb.
+                //
+                // Following bounding-box centres instead only holds when a piece turns about the
+                // middle of its own box; the clock's rings turn about the clock, and came apart.
+                let corner = base_place.unapply(base_aabb.0, base_aabb.1)
                     .map(|(sx_, sy_)| i.place.apply(sx_, sy_))
-                    .unwrap_or((i.aabb.left() + i.aabb.w / 2.0, i.aabb.top() + i.aabb.h / 2.0));
-                let cx = (cx - ox) * scale;
-                let cy = (cy - oy) * scale;
+                    .unwrap_or((i.aabb.left(), i.aabb.top()));
+                let base_scale = (base_place.sx.abs().max(1e-6), base_place.sy.abs().max(1e-6));
                 StageArt {
                     png: art.png.clone(),
-                    x: cx - art.w as f64 * scale / 2.0,
-                    y: cy - art.h as f64 * scale / 2.0,
+                    x: (corner.0 - ox) * scale,
+                    y: (corner.1 - oy) * scale,
                     w: art.w, h: art.h, hold: 1,
-                    rotation: crate::fm_placement::normalise_degrees(p.rotation - base_rot),
-                    scale_x: 1.0, scale_y: 1.0,
+                    rotation: crate::fm_placement::normalise_degrees(i.place.rotation - base_rot),
+                    scale_x: i.place.sx.abs() / base_scale.0,
+                    scale_y: i.place.sy.abs() / base_scale.1,
                     alpha: i.alpha,
+                    pivot: (0.0, 0.0),
                 }
             }
             // not shown this frame: the object is still there, just invisible
@@ -3944,8 +3888,7 @@ fn timeline_tracks(
                 png: blank_png(),
                 x: (anchor.aabb.left() - ox) * scale,
                 y: (anchor.aabb.top() - oy) * scale,
-                w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 0.0,
-            },
+                w: 1, h: 1, hold: 1, rotation: 0.0, scale_x: 1.0, scale_y: 1.0, alpha: 0.0, pivot: (0.0, 0.0) },
         }).collect();
         // consecutive frames that are the same picture in the same place are ONE keyframe held
         // for that long, which is what turns a 3720-frame timeline into its handful of changes
@@ -3958,10 +3901,10 @@ fn timeline_tracks(
                 _ => collapsed.push(f),
             }
         }
-        // the source's fades, into the pixels (the engine will not honour them any other way)
-        let track_name = name_of.get(&key).cloned().unwrap_or_default();
+        // the fade stays on the KEYFRAME (`alpha`), which is how the source expresses it and what
+        // keeps a crossfade smooth; baking it into the pictures costs one copy per level and turns
+        // a dissolve between two skies into hundreds of megabytes.
         let fades = collapsed.iter().any(|f| f.alpha < 1.0);
-        bake_frame_alpha(&mut collapsed, &track_name);
 
         // NOT padded to a shared canvas: these are layers INSIDE one background animation, and
         // only the background itself is sized by the engine. Padding here would move each frame's
