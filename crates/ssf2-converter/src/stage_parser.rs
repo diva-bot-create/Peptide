@@ -227,6 +227,8 @@ pub struct Weather {
     /// The area particles are scattered over and wrap within, in FM units.
     pub width: f64,
     pub height: f64,
+    /// How the source's own weather class moves one particle per frame.
+    pub motion: Option<crate::abc_parser::WeatherMotion>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -372,6 +374,10 @@ pub struct ParallaxLayer {
 pub struct BgLayer {
     pub name: String,
     pub frames: Vec<StageArt>,
+    /// Set when this element came out of a CAMERA BACKGROUND: the fraction of the camera's
+    /// movement it scrolls by. An animated one cannot be a flattened parallax plate (that is what
+    /// froze clocktown's clock), so it stays an element and carries its layer's pan instead.
+    pub pan: Option<(f64, f64)>,
     /// The element's label-delimited segments, when its clip's timeline is a state machine rather
     /// than one loop. Empty for an ordinary looping element, which is the common case. When this is
     /// populated the emitter must NOT play `frames` end to end: only the reachable segments are ever
@@ -512,6 +518,7 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
     let id = meta.as_ref().and_then(|m| m.id.clone()).unwrap_or_else(|| {
         path.file_stem().and_then(|s| s.to_str()).unwrap_or("stage").to_string()
     });
+    let cam_backgrounds = meta.as_ref().map(|m| m.camera_backgrounds.clone()).unwrap_or_default();
     let ssf2_music = meta.map(|m| m.music).unwrap_or_default();
     // the stage's AS3 plane assignments + spawned actors (authoritative; heuristic is the fallback).
     let abc_model = stage_abc_model(&swf_data);
@@ -687,7 +694,9 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
 
     // the AS3-derived plane map (empty if the stage has no parseable SSF2Stage subclass → the
     // name heuristic in plane_tag takes over).
-    let planes: PlaneMap = abc_model.as_ref().map(|m| m.planes.clone()).unwrap_or_default();
+    let mut planes: PlaneMap = abc_model.as_ref().map(|m| m.planes.clone()).unwrap_or_default();
+    tag_declared_cambg(&mut planes, &cam_backgrounds);
+    let planes = planes;
 
     // Collect every placed shape instance (with world AABB) and find the stageMC origin.
     let mut instances: Vec<Instance> = Vec::new();
@@ -1011,7 +1020,7 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
             .unwrap_or_default()
     } else { Vec::new() };
     let art = if render_art_flag {
-        render_art_layers(&swf.tags, &sprites, &sym_names, &shape_defs, &bitmaps, ox, oy, scale, keep_foreground, &planes, main_floor_y, &art_abcs)
+        render_art_layers(&swf.tags, &sprites, &sym_names, &shape_defs, &bitmaps, ox, oy, scale, keep_foreground, &planes, main_floor_y, &art_abcs, &cam_backgrounds)
     } else {
         StageArtSet::default()
     };
@@ -1119,6 +1128,7 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
             count: w.count,
             width: w.width * scale,
             height: w.height * scale,
+            motion: w.motion,
         })
         })
     });
@@ -1278,6 +1288,24 @@ fn plane_tag(inst_name: Option<&str>, sym: &str, planes: &PlaneMap) -> Option<&'
 //  - SCAFFOLDING: `pN_Start`/`pN_Spawn` beacons, the death/camera `boundary_clip`,
 //    off-screen `warningbounds_*`, the `itemGen_mc`, `shadowMask`/`reflectionMask`, the
 //    `light_source_mc`, the `smashball` spawn. All non-visual.
+
+/// Tag the clips a stage DECLARES as camera backgrounds.
+///
+/// SSF2 stages do not mark their parallax on the timeline: the package metadata names the clip by
+/// linkage (`camera.backgrounds[].linkage_id`) and gives its pan rate, and the engine scrolls it.
+/// Reading only the timeline finds a `_cambg` instance name on the handful of stages that use one
+/// and nothing at all on the rest, so clocktown's whole town, clock and moon converted as a fixed
+/// backdrop. The declaration is the source of truth, so take it.
+fn tag_declared_cambg(planes: &mut PlaneMap, backgrounds: &[crate::abc_parser::CameraBackground]) {
+    use crate::stage_abc::StagePlane;
+    for bg in backgrounds {
+        // A declared background that pans at ZERO is a FIXED backdrop -- which is what most
+        // stages declare, and what the backdrop plane already does with it. Only a background
+        // that actually moves with the camera is a parallax layer.
+        if bg.linkage_id.is_empty() || (bg.x_pan == 0.0 && bg.y_pan == 0.0 && !bg.auto_pan) { continue; }
+        planes.insert(bg.linkage_id.clone(), StagePlane::CameraBg);
+    }
+}
 
 /// SSF2 collision-geometry linkage (invisible in SSF2; becomes FM collision, never art).
 fn is_collision_linkage(label: &str) -> bool {
@@ -1767,6 +1795,36 @@ fn walk_frame(
 /// mask is greyscale, which is what decides whether HardLight can be reproduced by ALPHA LAYERS
 /// instead of baked: the black/white decomposition needs one alpha per pixel, so it is exact for a
 /// greyscale mask and cannot express a mask whose channels disagree.
+/// Pad every frame of an element to one canvas size, keeping each frame's content CENTRED.
+///
+/// A frame drawn as its own crop carries its position in `x`/`y`; growing the canvas around the
+/// content and moving the origin back by half the growth leaves the content exactly where it was,
+/// and leaves a rotation about the image centre unchanged. Frames that already share the size are
+/// untouched.
+fn pad_frames_to_one_canvas(frames: &mut [StageArt], scale: f64) {
+    let (Some(w), Some(h)) = (frames.iter().map(|f| f.w).max(), frames.iter().map(|f| f.h).max()) else { return };
+    if frames.iter().all(|f| f.w == w && f.h == h) { return; }
+    for f in frames.iter_mut() {
+        if f.w == w && f.h == h { continue; }
+        let Ok(img) = image::load_from_memory(&f.png) else { continue };
+        let src = img.to_rgba8();
+        let (dx, dy) = ((w - f.w) / 2, (h - f.h) / 2);
+        let mut canvas = image::RgbaImage::new(w, h);
+        image::imageops::replace(&mut canvas, &src, dx as i64, dy as i64);
+        let mut png = Vec::new();
+        {
+            use image::ImageEncoder;
+            if image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(canvas.as_raw(), w, h, image::ExtendedColorType::Rgba8).is_err() { continue; }
+        }
+        f.png = png;
+        f.x -= dx as f64 * scale;
+        f.y -= dy as f64 * scale;
+        f.w = w;
+        f.h = h;
+    }
+}
+
 fn mask_chroma(mask: &StageArt) -> f64 {
     let Ok(img) = image::load_from_memory(&mask.png).map(|i| i.to_rgba8()) else { return -1.0 };
     let (mut sum, mut n) = (0.0f64, 0u64);
@@ -2123,6 +2181,7 @@ fn render_art_layers(
     planes: &PlaneMap,
     surface_y_fm: Option<f64>,
     abcs: &[crate::abc_parser::AbcFile],
+    cam_backgrounds: &[crate::abc_parser::CameraBackground],
 ) -> StageArtSet {
     // per-sprite + root frame timelines.
     let mut sprite_frames: BTreeMap<u16, Vec<Vec<PlacedChild>>> = BTreeMap::new();
@@ -2270,7 +2329,14 @@ fn render_art_layers(
     // a foreground that substantially overlaps the structure is normally a re-drawn front face
     // (fold it behind fighters to avoid a duplicate platform); `keep_foreground` opts a stage out
     // (its foreground is a real overlay, e.g. bowserscastle's glowing lava sheet) so it stays in front.
-    let is_dup_fg = move |i: &Instance| !keep_foreground && art_kind(i) == ArtKind::Foreground && frac_in_bg(&i.aabb) >= 0.6;
+    // ...and it has to be big enough to BE the structure. Overlap alone folds every small prop
+    // that happens to sit over the stage: clocktown's on-deck rain splashes are inside the union
+    // to the last pixel, and folding them puts them behind the deck, where they cannot be seen.
+    // A re-drawn front face covers a real share of the structure it re-draws; a prop does not.
+    let bg_area = bg_union.map(|(l, t, r, b)| (r - l) * (b - t)).unwrap_or(0.0);
+    let is_dup_fg = move |i: &Instance| !keep_foreground && art_kind(i) == ArtKind::Foreground
+        && frac_in_bg(&i.aabb) >= 0.6
+        && (bg_area <= 0.0 || i.aabb.w * i.aabb.h >= bg_area * 0.25);
     // composite an explicit instance group (back-to-front = walk order), scaled like `composite`.
     let composite_grp = |group: Vec<&Instance>, bounds: Option<(f64, f64, f64, f64)>| -> Option<StageArt> {
         composite_layer(&group, shape_defs, bitmaps, ox, oy, bounds).map(|mut a| { a.x *= scale; a.y *= scale; a })
@@ -2316,7 +2382,13 @@ fn render_art_layers(
     // each distinct `sym_name` becomes one layer in first-appearance (back-to-front) draw order.
     // An element that changes across the sampled frames keeps its own animation loop; a static
     // one collapses to its single base-frame image.
-    let group_bg_layers = |member: &dyn Fn(&Instance) -> bool| -> Vec<BgLayer> {
+    // `one_canvas`: after building, pad every frame of an element to a single canvas size. A
+    // CAMERA BACKGROUND needs it -- the engine sizes a background layer once
+    // (`originalBGWidth`/`Height`) and draws every frame at that size, so frames that are each
+    // their own crop come out stretched and shifted against one another. Padding (rather than
+    // re-rasterising onto union bounds) keeps the one-cel-plus-rotation form the rings use, which
+    // is the difference between a 12MB stage and an 87MB one.
+    let group_bg_layers = |member: &dyn Fn(&Instance) -> bool, one_canvas: bool| -> Vec<BgLayer> {
         // one layer per distinct PLACEMENT (sym_name + instance anchor), not per symbol: repeated
         // placements of one symbol (16 torch-ember emitters at 16 wall positions) become 16 objects
         // each at its own position, instead of one merged union-bounds image (which both desyncs
@@ -2370,7 +2442,7 @@ fn render_art_layers(
             }
             depth_seen.get(&(gk.0, gk.1, gk.2, gk.3, i.leaf_depth)).is_some_and(|v| v.len() > 1)
         };
-        // key: the placement, plus the depth when that depth animates (0 = the merged still part)
+        // key: the placement, plus the depth when that depth animates (None = the merged still part)
         let akey = |i: &Instance| (i.sym_name.clone(), i.inst_anchor.0.round() as i64, i.inst_anchor.1.round() as i64, i.inst_path,
                                    if depth_animates(i) { Some(i.leaf_depth) } else { None });
         let mut order: Vec<(String, i64, i64, u64, Option<u16>)> = Vec::new();
@@ -2379,7 +2451,7 @@ fn render_art_layers(
             let k = akey(i);
             if seen.insert(k.clone()) { order.push(k); }
         }
-        order.iter().filter_map(|(sname, ax, ay, apath, adepth)| {
+        let mut built: Vec<((String, i64, i64, u64), BgLayer)> = order.iter().filter_map(|(sname, ax, ay, apath, adepth)| {
             let matches = |i: &Instance| member(i) && &i.sym_name == sname
                 && i.inst_anchor.0.round() as i64 == *ax && i.inst_anchor.1.round() as i64 == *ay
                 && i.inst_path == *apath
@@ -2413,7 +2485,7 @@ fn render_art_layers(
                 let mut segments = segments;
                 for s in &mut segments { s.frames = rle(std::mem::take(&mut s.frames)); }
                 let frames = segments.iter().flat_map(|s| s.frames.iter().cloned()).collect();
-                return Some(BgLayer { name: sname.clone(), frames, segments });
+                return Some(((sname.clone(), *ax, *ay, *apath), BgLayer { name: sname.clone(), frames, segments, pan: None }));
             }
             // ONE shape the source moves or turns is emitted as that shape ONCE, placed by a
             // transform each frame -- the same thing the character path does with an arm. Baking
@@ -2426,8 +2498,8 @@ fn render_art_layers(
                 if let Some(fs) = single_shape_frames(&all, &sampled, &matches, ox, oy, scale,
                                                       shape_defs, bitmaps) {
                     let p = loop_period(&fs);
-                    return Some(BgLayer { name: sname.clone(), frames: rle(fs[..p].to_vec()),
-                                          segments: Vec::new() });
+                    return Some(((sname.clone(), *ax, *ay, *apath),
+                                 BgLayer { name: sname.clone(), pan: None, frames: rle(fs[..p].to_vec()), segments: Vec::new() }));
                 }
             }
             let frames = if animated {
@@ -2439,8 +2511,45 @@ fn render_art_layers(
                 let grp: Vec<&Instance> = base_insts.iter().filter(|i| matches(i)).collect();
                 composite_grp(grp, bounds).into_iter().collect()
             };
-            (!frames.is_empty()).then(|| BgLayer { name: sname.clone(), frames, segments: Vec::new() })
-        }).collect()
+            (!frames.is_empty()).then(|| ((sname.clone(), *ax, *ay, *apath),
+                                          BgLayer { name: sname.clone(), frames, segments: Vec::new(), pan: None }))
+        }).collect();
+
+        // Parts of ONE source clip run off ONE timeline. Split into separate elements they each
+        // collapse to their own loop length, and from the first restart they are out of phase with
+        // each other for good -- which is what scattered clocktown's clock, five rings of 11 to 16
+        // frames that should turn together. So every element from a group is padded (by repeating
+        // its own loop) to the group's longest, and they stay in step. Repeats cost nothing: the
+        // emitter writes one image per distinct picture and points the extra frames at it.
+        let mut longest: std::collections::BTreeMap<(String, i64, i64, u64), usize> = Default::default();
+        for (k, l) in built.iter() {
+            let n = l.frames.iter().map(|f| f.hold.max(1) as usize).sum::<usize>();
+            let e = longest.entry(k.clone()).or_insert(0);
+            *e = (*e).max(n);
+        }
+        for (k, l) in built.iter_mut() {
+            if l.frames.len() < 2 || !l.segments.is_empty() { continue; }
+            let want = longest.get(k).copied().unwrap_or(0);
+            let own: usize = l.frames.iter().map(|f| f.hold.max(1) as usize).sum();
+            if own == 0 || own >= want { continue; }
+            let cycle = l.frames.clone();
+            let mut total = own;
+            while total < want {
+                for f in &cycle {
+                    if total >= want { break; }
+                    l.frames.push(f.clone());
+                    total += f.hold.max(1) as usize;
+                }
+            }
+            // a cycle that does not divide the group's length leaves a remainder, and a remainder
+            // is a drift of that many frames every time round. Hold the last frame for it.
+            if total < want {
+                if let Some(last) = l.frames.last_mut() { last.hold += (want - total) as u32; }
+            }
+        }
+        let mut out: Vec<BgLayer> = built.into_iter().map(|(_, l)| l).collect();
+        if one_canvas { for l in out.iter_mut() { pad_frames_to_one_canvas(&mut l.frames, scale); } }
+        out
     };
 
     // foreground = the genuine in-front props (non-overlapping foreground), sampled PER FRAME so
@@ -2495,7 +2604,7 @@ fn render_art_layers(
     // Blended placements are no longer a reason to keep the plane composited: they are baked into
     // the art beneath instead of shipped as a layer (see `bake_hardlight`), so nothing here needs
     // a shared canvas any more and every unblended element can have its own clock.
-    let foreground_elements = group_bg_layers(&fg_member);
+    let foreground_elements = group_bg_layers(&fg_member, false);
     let foreground = if foreground_elements.is_empty() { foreground_composite } else { Vec::new() };
     // when the backdrop carries `_cambg` parallax layers, each backdrop/cambg LAYER (grouped
     // by symbol) becomes its own camera-relative plane with its own auto-derived pan rate (so
@@ -2506,28 +2615,39 @@ fn render_art_layers(
     // of the background structure, still behind fighters).
     let has_parallax = base_insts.iter().any(|i| art_kind(i) == ArtKind::Parallax);
     let (background, parallax): (Vec<BgLayer>, Vec<ParallaxLayer>) = if has_parallax {
-        let mut order: Vec<&str> = Vec::new();
-        let mut groups: BTreeMap<&str, Vec<&Instance>> = BTreeMap::new();
-        for i in base_insts.iter().filter(|i| matches!(art_kind(i), ArtKind::Backdrop | ArtKind::Parallax)) {
-            let key = i.sym_name.as_str();
-            if !groups.contains_key(key) { order.push(key); }
-            groups.entry(key).or_default().push(i);
-        }
-        // SSF2 `_cambg` layers are discrete elements that PAN (the autoPanMultiplier feeds the
-        // pan); BOUNDS is for a tiling/wrapping backdrop, which the corpus has none of. Default
-        // PAN; `PEPTIDE_PARALLAX_BOUNDS` forces BOUNDS to exercise that path.
+        // A camera background is split the same way every other plane is: into ELEMENTS. The
+        // still ones become the camera-background plates the engine scrolls (that is what a
+        // parallax layer is for); the animated ones stay elements and are promoted like any
+        // other animated backdrop object, because flattening one into a plate freezes it --
+        // which is what turned clocktown's clock, its day/night sky and its torches into a
+        // single still picture. They carry the layer's declared pan so they scroll with it.
+        let cam_member = |i: &Instance| matches!(art_kind(i), ArtKind::Backdrop | ArtKind::Parallax);
+        let declared_pan = |name: &str| -> Option<(f64, f64)> {
+            cam_backgrounds.iter()
+                .find(|b| name.starts_with(b.linkage_id.as_str()) || b.linkage_id.starts_with(name))
+                .or_else(|| cam_backgrounds.first())
+                .map(|b| (b.x_pan, b.y_pan))
+        };
         let mode = if std::env::var("PEPTIDE_PARALLAX_BOUNDS").is_ok() { ParallaxMode::Bounds } else { ParallaxMode::Pan };
-        let layers: Vec<ParallaxLayer> = order.iter().filter_map(|key| {
-            composite_layer(&groups[*key], shape_defs, bitmaps, ox, oy, None).map(|mut art| {
-                art.x *= scale; art.y *= scale;
-                let (x_pan, y_pan) = parallax_pan(art.w, art.h);
-                ParallaxLayer { art, mode, x_pan, y_pan }
-            })
-        }).collect();
-        // parallax stages keep the fixed near-background (the cambg layers carry the motion),
-        // split into per-element layers so any animated near-bg object stays on its own loop.
+        let (mut plates, mut moving) = (Vec::new(), Vec::new());
+        for mut l in group_bg_layers(&cam_member, true) {
+            // a pan of zero is a fixed layer: nothing to drive, so it carries no pan at all
+            let pan = declared_pan(&l.name).filter(|(x, y)| *x != 0.0 || *y != 0.0);
+            if l.frames.len() > 1 {
+                l.pan = pan;
+                moving.push(l);
+            } else if let Some(art) = l.frames.first().cloned() {
+                // the source's own pan rate when the package declared one; the size-derived
+                // estimate only when it did not.
+                let (x_pan, y_pan) = pan.unwrap_or_else(|| parallax_pan(art.w, art.h));
+                plates.push(ParallaxLayer { art, mode, x_pan, y_pan });
+            }
+        }
+        // the fixed near-background (the stageMC `background` plane) keeps its own elements
         let near_member = |i: &Instance| art_kind(i) == ArtKind::Background || is_dup_fg(i);
-        (group_bg_layers(&near_member), layers)
+        let mut bg = moving;
+        bg.extend(group_bg_layers(&near_member, false));
+        (bg, plates)
     } else {
         // No parallax: each backdrop/background ELEMENT (lava, torches, embers, podoboos, ...)
         // becomes its own layer on its own loop, in back-to-front draw order, so an animated SSF2
@@ -2535,7 +2655,7 @@ fn render_art_layers(
         // composite timeline. The folded structure-foreground (e.g. bowserscastle's stone walkway)
         // rides along as its own element, drawn after the backdrop it sits on.
         let bg_member = |i: &Instance| matches!(art_kind(i), ArtKind::Backdrop | ArtKind::Background) || is_dup_fg(i);
-        (group_bg_layers(&bg_member), Vec::new())
+        (group_bg_layers(&bg_member, false), Vec::new())
     };
 
     // Emit a multi-frame stage animation only when the samples form a CLEAN animation:
@@ -2845,7 +2965,7 @@ fn engine_added_bg_layers(
             (x_fm, y_fm)
         });
         if let Some(art) = to_art(&bg_id, bg_x, bg_y) {
-            bg_layers.push(BgLayer { name: format!("engineLayer{li}"), frames: vec![art], segments: Vec::new() });
+            bg_layers.push(BgLayer { name: format!("engineLayer{li}"), frames: vec![art], segments: Vec::new(), pan: None });
         }
         // foreground = any same-size sibling whose deck row is clearly CUT OUT (a near parapet that
         // must draw IN FRONT of the fighter), at ITS OWN authored placement, falling back to the

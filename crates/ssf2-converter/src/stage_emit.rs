@@ -76,9 +76,10 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     let stage_refs: Vec<ArtRef> = stage_frames.iter().enumerate()
         .map(|(i, a)| write_layer(&format!("stage{i}"), a))
         .collect::<Result<_>>()?;
-    let parallax_refs: Vec<ParallaxRef> = model.art.parallax.iter().enumerate()
+    let mut parallax_refs: Vec<ParallaxRef> = model.art.parallax.iter().enumerate()
         .map(|(i, layer)| write_layer(&format!("parallax{i}"), &layer.art)
-            .map(|r| ParallaxRef { art: r, mode: layer.mode, x_pan: layer.x_pan, y_pan: layer.y_pan }))
+            .map(|r| ParallaxRef { frames: vec![r], w: layer.art.w, h: layer.art.h,
+                                   mode: layer.mode, x_pan: layer.x_pan, y_pan: layer.y_pan }))
         .collect::<Result<_>>()?;
     // each backdrop ELEMENT is its own layer (the SSF2 movieclip model). a static element is one
     // frame (`bgN`); an animated element is its loop (`bgN_0..M`). draw order = list order.
@@ -95,7 +96,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     for (i, layer) in model.art.background.iter().enumerate() {
         bg_refs.extend(build_element_layers(&elem_ids[i], bg_layer_name(&layer.name, i),
                                             &layer.frames, &layer.segments,
-                                            BgPlane::Background, &mut write_layer)?);
+                                            BgPlane::Background, layer.pan, &mut write_layer)?);
     }
     // UNIVERSAL: promote every ANIMATED backdrop element (the weather embers, jumping podoboos,
     // lava bubbles/splashes, flickering torches, a spectating Bowser, …) to its own looping VFX
@@ -133,7 +134,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     if promote_fg {
         promoted_bg.push(BgLayerRef {
             name: "Foreground Art".to_string(), eid: "fg".to_string(),
-            frames: fg_refs.clone(), plane: BgPlane::Foreground, segments: Vec::new(),
+            frames: fg_refs.clone(), plane: BgPlane::Foreground, segments: Vec::new(), pan: None,
         });
     }
     // PER-ELEMENT foreground: the parser now splits the in-front plane the same way it splits the
@@ -150,7 +151,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
             let eid = &format!("fge_{}", fg_elem_ids[i]);
             promoted_bg.extend(build_element_layers(eid, bg_layer_name(&layer.name, i),
                                                     &layer.frames, &layer.segments,
-                                                    BgPlane::Foreground, &mut write_layer)?);
+                                                    BgPlane::Foreground, layer.pan, &mut write_layer)?);
         }
     }
     // declared platforms become MOVING STRUCTURES (like the official stage-template's moving
@@ -159,6 +160,22 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // itself in its own Script (the sink/rise cycle). emit_platform_structures writes the per-
     // platform Stats + the shared Script + the grey sprite, and returns what the manifest + stage
     // Script need.
+    // An element out of a CAMERA BACKGROUND is not spawned and driven by the stage: it becomes a
+    // camera-background entry of its own, so the ENGINE plays its animation and scrolls it at the
+    // declared pan (`ParallaxMode.PAN`). Doing it from the stage script would re-implement, in
+    // hscript, the parallax the engine already has.
+    let (cam_bg_elems, promoted_bg): (Vec<BgLayerRef>, Vec<BgLayerRef>) =
+        promoted_bg.into_iter().partition(|l| l.pan.is_some());
+    for layer in &cam_bg_elems {
+        // the layer's size is its LARGEST frame, not its first: an element whose first frame is
+        // the blank one (it starts off-screen) would otherwise declare a 1x1 background.
+        let w = layer.frames.iter().map(|f| f.w).max().unwrap_or(1);
+        let h = layer.frames.iter().map(|f| f.h).max().unwrap_or(1);
+        let (x_pan, y_pan) = layer.pan.unwrap_or((0.0, 0.0));
+        parallax_refs.push(ParallaxRef {
+            frames: layer.frames.clone(), w, h, mode: ParallaxMode::Pan, x_pan, y_pan,
+        });
+    }
     let (platform_sprites, structure_contents, structure_spawn_ids) =
         emit_platform_structures(model, &lib, &sprites)?;
     let art = ArtRefs {
@@ -493,6 +510,19 @@ impl<'a> EntityBuilder<'a> {
         let lid = self.make_image(&format!("Parallax {idx}"), image_asset, x, y, 1.0);
         self.parallax_anims.push((format!("parallax{idx}"), lid));
     }
+    /// An ANIMATED camera background: the same per-frame layer an animated stage layer gets, but
+    /// registered as its own `parallax{idx}` animation. It has to live in the STAGE entity like
+    /// the still ones do -- a background entry pointed at a separate entity does not draw.
+    fn add_image_frames_parallax(&mut self, idx: usize, frames: &[(String, f64, f64, usize)]) {
+        let name = format!("Parallax {idx}");
+        // scale 1 on the images: a camera background is scaled by its OWN layer transform
+        // (`scaleMultiplier`), so scaling the images too would apply the stage scale twice.
+        self.add_image_frames_scaled(&name, frames, 1.0, 1.0);
+        // it is a background, not a layer of the stage animation
+        if let Some(lid) = self.anim_layers.pop() {
+            self.parallax_anims.push((format!("parallax{idx}"), lid));
+        }
+    }
     /// Add an animated IMAGE layer to the `stage` animation: one keyframe per frame, each
     /// referencing that frame's image, so the layer plays through them (loops).
     fn add_image_frames(&mut self, name: &str, frames: &[(String, f64, f64, usize)]) {
@@ -504,12 +534,15 @@ impl<'a> EntityBuilder<'a> {
     /// A single frame becomes one static full-length keyframe; a shorter cycle TILES (repeats,
     /// truncating the last repeat) so it keeps playing for the whole loop like an SSF2 movieclip.
     fn add_image_frames_alpha(&mut self, name: &str, frames: &[(String, f64, f64, usize)], alpha: f64) {
+        self.add_image_frames_scaled(name, frames, alpha, self.scale);
+    }
+    fn add_image_frames_scaled(&mut self, name: &str, frames: &[(String, f64, f64, usize)], alpha: f64, sym_scale: f64) {
         let mut syms = Vec::new();
         for (i, (guid, x, y, _)) in frames.iter().enumerate() {
             let sym = self.uid(&format!("sym:{name}:{i}"));
             self.symbols.push(json!({
                 "$id": sym, "type": "IMAGE", "imageAsset": guid, "alpha": alpha,
-                "x": x, "y": y, "scaleX": self.scale, "scaleY": self.scale, "rotation": 0, "pivotX": 0, "pivotY": 0,
+                "x": x, "y": y, "scaleX": sym_scale, "scaleY": sym_scale, "rotation": 0, "pivotX": 0, "pivotY": 0,
                 "pluginMetadata": {}
             }));
             syms.push(sym);
@@ -578,7 +611,24 @@ struct ArtRef { guid: String, x: f64, y: f64, w: u32, h: u32, hold: usize,
     rotation: f64, scale_x: f64, scale_y: f64 }
 
 /// A parallax camera-background layer: the written sprite + its scroll mode + pan rate.
-struct ParallaxRef { art: ArtRef, mode: ParallaxMode, x_pan: f64, y_pan: f64 }
+/// One camera-background entry: the content + animation the engine scrolls, and how.
+///
+/// Both kinds of layer end up here. A still backdrop is an IMAGE layer of the stage entity
+/// (`parallax{i}`); an ANIMATED one is its own element entity, referenced by its content id and
+/// its `active` animation, so the engine plays it AND scrolls it. Driving an animated layer from
+/// the stage script instead would be a second, parallel implementation of what the engine's own
+/// parallax already does.
+struct ParallaxRef {
+    /// The layer's frames: one for a still backdrop, its loop for an animated one. Both live in
+    /// the STAGE entity as a `parallax{i}` animation -- a background entry pointed at a separate
+    /// entity does not draw.
+    frames: Vec<ArtRef>,
+    w: u32,
+    h: u32,
+    mode: ParallaxMode,
+    x_pan: f64,
+    y_pan: f64,
+}
 
 /// One backdrop element as its own layer: a display name + its frame sequence (1 = static).
 struct BgLayerRef {
@@ -587,6 +637,10 @@ struct BgLayerRef {
     /// branches between them instead of looping. Frame counts index into `frames`, which is the
     /// segments concatenated in timeline order. Empty for an ordinary looping element.
     segments: Vec<(String, usize, Option<crate::abc_parser::LabelJump>)>,
+    /// Set when the element came out of a CAMERA BACKGROUND: the fraction of the camera's movement
+    /// it scrolls by. The stage drives it from the live camera each frame, which is how an animated
+    /// camera-background object stays animated AND stays in the parallax.
+    pan: Option<(f64, f64)>,
 }
 
 /// The source plane a promoted element came from. Decides which stage container it's
@@ -863,7 +917,15 @@ fn build_entity(model: &StageModel, art: &ArtRefs) -> Value {
     // each SSF2 camera-background layer -> its own `parallax{i}` animation (each scrolls at its
     // own rate, set in StageStats).
     for (i, p) in art.parallax.iter().enumerate() {
-        b.add_image_parallax(i, &p.art.guid, p.art.x, p.art.y);
+        // The engine anchors a camera background at the CENTRE of the view, so the layer's art is
+        // placed centred on its own origin rather than at the world position it has on the stage.
+        let (cx, cy) = (-(p.w as f64) / 2.0, -(p.h as f64) / 2.0);
+        match p.frames.as_slice() {
+            [] => {}
+            [a] => b.add_image_parallax(i, &a.guid, cx, cy),
+            frames => b.add_image_frames_parallax(i,
+                &frames.iter().map(|a| (a.guid.clone(), cx, cy, a.hold)).collect::<Vec<_>>()),
+        }
     }
 
     let mut animations = vec![json!({
@@ -2654,11 +2716,30 @@ fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
     let hh = (w.height * 0.75).round() as i64;
     let count = w.count.min(WEATHER_MAX_PARTICLES);   // a stage asking for thousands is a stage we misread
     let vs = velocity_scale();
-    // Rise and drift are per-frame speeds, so they convert like every other one.
-    let k_lo = 1.0 * vs;
-    let k_span = (2.0 * vs * 100.0).round() as i64;
-    let wind_lo = -1.5 * vs;
-    let wind_span = (4.2 * vs * 100.0).round() as i64;
+    // The drifts are the SOURCE's, read off the weather class (`abc_parser::weather_motion`):
+    // rain falls fast and straight, embers rise and wander, and which one this stage authored is
+    // not something to pick. Per-frame speeds, so they convert like every other one. A class this
+    // pass could not read falls back to the drift bowserscastle's embers use, and says so.
+    let motion = w.motion.unwrap_or_else(|| {
+        log::warn!("stage weather: could not read the particle motion out of the weather class,                     so the particles drift instead of doing what the source does");
+        crate::abc_parser::WeatherMotion {
+            dy: crate::abc_parser::Drift { base: -1.0, rand: -2.0 },
+            dx: crate::abc_parser::Drift { base: -1.5, rand: 4.2 },
+        }
+    });
+    // `base + rand * U(0,1)` per axis, in FM units per frame. Written as an integer hundredths
+    // draw because that is the randomness hscript offers.
+    let draw = |d: crate::abc_parser::Drift| -> String {
+        let lo = d.base * vs;
+        let span = (d.rand * vs * 100.0).round() as i64;
+        if span == 0 { format!("{lo:.3}") }
+        else if span > 0 { format!("{lo:.3} + Random.getInt(0, {span}) / 100.0") }
+        else { format!("{lo:.3} - Random.getInt(0, {}) / 100.0", -span) }
+    };
+    let k_expr = draw(motion.dy);
+    let wind_expr = draw(motion.dx);
+    // which way the field drifts overall decides which edge a particle returns from
+    let falling = motion.dy.mean() > 0.0;
     // Both the scatter and the COUNT come off the live camera, not off the source numbers.
     // SSF2's field is one SSF2 screenful; Fraymakers shows a good deal more world than that, so
     // reusing the source's area scatters the particles into a band in the middle, and reusing the
@@ -2690,7 +2771,7 @@ fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
          \t\t\t\tvar v = match.createVfx(new VfxStats({{ spriteContent: self.getResource().getContent(\"{eid}\"), animation: \"active\", loop: true, timeout: -1, relativeWith: false }}));\n\
          \t\t\t\tv.setAlpha(0.2 + Random.getInt(0, 60) / 100.0);\n\
          \t\t\t\tself.getBackgroundEffectsContainer().addChild(v.getViewRootContainer());\n\
-         \t\t\t\tm_weather.push({{ v: v, x: (Random.getInt(0, 200) / 100.0 - 1.0) * shw, y: (Random.getInt(0, 200) / 100.0 - 1.0) * shh, k: {k_lo:.3} + Random.getInt(0, {k_span}) / 100.0, wind: {wind_lo:.3} + Random.getInt(0, {wind_span}) / 100.0 }});\n\
+         \t\t\t\tm_weather.push({{ v: v, x: (Random.getInt(0, 200) / 100.0 - 1.0) * shw, y: (Random.getInt(0, 200) / 100.0 - 1.0) * shh, k: {k_expr}, wind: {wind_expr} }});\n\
          \t\t\t}}\n",
         cap = WEATHER_MAX_PARTICLES);
     // Weather is attached to the VIEW, not to the stage: it fills the screen wherever the camera
@@ -2706,6 +2787,15 @@ fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
     //
     // With no camera to ask, the SSF2 numbers are the fallback: a field over one patch of the stage
     // is wrong, but it is the source's own wrongness rather than a field of zero size.
+    // a particle re-enters from the edge it drifts AWAY from, so which edge that is follows the
+    // drift the source authored instead of being fixed to one of them.
+    let wrap = if falling {
+        "\t\t\tif (p.y > hh) { p.y = -hh; p.x = (Random.getInt(0, 200) / 100.0 - 1.0) * hw; }\n\
+         \t\t\tif (p.y < -hh) { p.y = -hh; }\n"
+    } else {
+        "\t\t\tif (p.y < -hh) { p.y = hh; p.x = (Random.getInt(0, 200) / 100.0 - 1.0) * hw; }\n\
+         \t\t\tif (p.y > hh) { p.y = hh; }\n"
+    };
     let per_frame = format!(
         "\t\tvar cam = match.getCamera();\n\
          \t\tvar camX = 0.0;\n\
@@ -2723,11 +2813,10 @@ fn emit_weather(model: &StageModel, lib: &Path) -> Result<(String, String)> {
          \t\t\thh = cam.getViewportHeight() * 0.75;\n\
          \t\t}}\n\
          \t\tfor (p in m_weather) {{\n\
-         \t\t\tp.y -= p.k;\n\
+         \t\t\tp.y += p.k;\n\
          \t\t\tp.x += p.wind;\n\
          \t\t\t// leaving the field puts it back on the far side, so the count never changes\n\
-         \t\t\tif (p.y < -hh) {{ p.y = hh; p.x = (Random.getInt(0, 200) / 100.0 - 1.0) * hw; }}\n\
-         \t\t\tif (p.y > hh) {{ p.y = hh; }}\n\
+{wrap}\
          \t\t\tif (p.x < -hw) {{ p.x = hw; }}\n\
          \t\t\tif (p.x > hw) {{ p.x = -hw; }}\n\
          \t\t\tp.v.setX(camX + p.x);\n\
@@ -2947,6 +3036,7 @@ fn build_element_layers(
     frames: &[crate::stage_parser::StageArt],
     segments: &[crate::stage_parser::BgSegment],
     plane: BgPlane,
+    pan: Option<(f64, f64)>,
     write_layer: &mut impl FnMut(&str, &crate::stage_parser::StageArt) -> Result<ArtRef>,
 ) -> Result<Vec<BgLayerRef>> {
     let segs: Vec<(String, usize, Option<crate::abc_parser::LabelJump>)> =
@@ -2958,13 +3048,13 @@ fn build_element_layers(
             let moving_refs = write_element_frames(eid, &moving, false, write_layer)?;
             return Ok(vec![
                 BgLayerRef { name: format!("{name} (plate)"), eid: plate_id, frames: vec![plate_ref],
-                             plane, segments: Vec::new() },
-                BgLayerRef { name, eid: eid.to_string(), frames: moving_refs, plane, segments: Vec::new() },
+                             plane, segments: Vec::new(), pan },
+                BgLayerRef { name, eid: eid.to_string(), frames: moving_refs, plane, segments: Vec::new(), pan },
             ]);
         }
     }
     let refs = write_element_frames(eid, frames, !segs.is_empty(), write_layer)?;
-    Ok(vec![BgLayerRef { name, eid: eid.to_string(), frames: refs, plane, segments: segs }])
+    Ok(vec![BgLayerRef { name, eid: eid.to_string(), frames: refs, plane, segments: segs, pan }])
 }
 
 /// Split a mostly-static animated element into a still PLATE plus a small moving piece.
@@ -3279,7 +3369,17 @@ fn write_meta(path: &Path, _stage_id: &str, id: &str, language: &str, object_typ
 /// `stage` animation (it carries the surface fighters stand on, so it moves 1:1 with the
 /// world). Each SSF2 camera-background layer is emitted as its own `parallax{i}` animation +
 /// a `camera.backgrounds` entry that pans at the layer's own SSF2-derived `xPanMultiplier`.
-fn stage_stats_hx(id: &str, parallax: &[ParallaxRef], scale: f64) -> String {
+/// What a camera background's `scaleMultiplier` has to be for the layer to frame the way the
+/// source frames it.
+///
+/// A camera background is drawn in SCREEN space, not world space, so the stage's world scale is
+/// the wrong number for it: what matters is the screen it was drawn for. SSF2 draws its backdrops
+/// on a 640x360 screen and Fraymakers' is 1280x720, so the layer belongs at 2x -- and the engine
+/// halves whatever it is given before using it as the transform (measured live: a layer emitted at
+/// the stage scale came out twice the size the source draws it). 2 x 0.5 = 1.
+const CAMERA_BG_SCALE: f64 = 1.0;
+
+fn stage_stats_hx(id: &str, parallax: &[ParallaxRef], _scale: f64) -> String {
     // back-to-front: layer 0 is the farthest (highest depth). ParallaxBG sizes the layer as
     // `originalBGWidth × scaleMultiplier` (native png × the stage scale; the IMAGE symbol stays
     // at scale 1). PAN mode pans the layer at `xPanMultiplier` of the camera offset, matching
@@ -3290,12 +3390,13 @@ fn stage_stats_hx(id: &str, parallax: &[ParallaxRef], scale: f64) -> String {
         // size), for a repeating backdrop.
         let (mode, hscroll, vscroll, loop_w, loop_h) = match p.mode {
             ParallaxMode::Pan => ("PAN", "false", "false", 0, 0),
-            ParallaxMode::Bounds => ("BOUNDS", "true", "true", p.art.w, p.art.h),
+            ParallaxMode::Bounds => ("BOUNDS", "true", "true", p.w, p.h),
         };
+        let anim = format!("parallax{i}");
         format!(
         "\n\t\t\t{{\n\
-\t\t\t\tspriteContent: self.getResource().getContent(\"{id}\"),\n\
-\t\t\t\tanimationId: \"parallax{i}\",\n\
+\t\t\t\tspriteContent: self.getResource().getContent(\"{content}\"),\n\
+\t\t\t\tanimationId: \"{anim}\",\n\
 \t\t\t\tmode: ParallaxMode.{mode},\n\
 \t\t\t\toriginalBGWidth: {w},\n\
 \t\t\t\toriginalBGHeight: {h},\n\
@@ -3305,11 +3406,12 @@ fn stage_stats_hx(id: &str, parallax: &[ParallaxRef], scale: f64) -> String {
 \t\t\t\tloopHeight: {loop_h},\n\
 \t\t\t\txPanMultiplier: {xp},\n\
 \t\t\t\tyPanMultiplier: {yp},\n\
-\t\t\t\tscaleMultiplier: {scale},\n\
+\t\t\t\tscaleMultiplier: {bg_scale},\n\
 \t\t\t\tforeground: false,\n\
 \t\t\t\tdepth: {depth}\n\
 \t\t\t}}",
-        w = p.art.w, h = p.art.h, xp = p.x_pan, yp = p.y_pan, depth = 2000 - (i as i64) * 10)
+        w = p.w, h = p.h, xp = p.x_pan, yp = p.y_pan, depth = 2000 - (i as i64) * 10,
+        content = id, anim = anim, bg_scale = CAMERA_BG_SCALE)
     }).collect();
     let backgrounds = if entries.is_empty() { String::new() } else { format!("{}\n\t\t", entries.join(",")) };
     format!(

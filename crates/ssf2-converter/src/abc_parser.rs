@@ -1424,6 +1424,26 @@ pub struct MainPackageMetadata {
     /// order. For a stage, its intended SSF2 soundtrack; empty for characters / when
     /// no music block is present.
     pub music: Vec<String>,
+    /// `register("camera", { backgrounds: [ … ] })` — the stage's camera-background (parallax)
+    /// layers, in the order the package declares them.
+    pub camera_backgrounds: Vec<CameraBackground>,
+}
+
+/// One declared camera background: a clip the engine scrolls behind the stage at its own rate.
+///
+/// This is a DECLARATION, not a placement: the clip is named by linkage and never appears on the
+/// stage timeline as a parallax-tagged instance, so a converter that looks only at the timeline
+/// (for a `_cambg` instance name, say) sees a stage with no parallax at all and bakes the whole
+/// backdrop flat.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CameraBackground {
+    /// The clip's linkage id (`clocktown_bg`).
+    pub linkage_id: String,
+    /// Per-axis pan rate: the layer moves this fraction of the camera's movement.
+    pub x_pan: f64,
+    pub y_pan: f64,
+    /// Whether the engine derives the pan itself rather than using the declared multipliers.
+    pub auto_pan: bool,
 }
 
 /// Read Main's constructor and pull out `id`, `guid`, and the
@@ -1436,7 +1456,74 @@ pub fn extract_main_package_metadata(abc: &AbcFile) -> Option<MainPackageMetadat
         guid:       scan_register_string_arg(body, abc, "guid"),
         characters: scan_register_characters_array(body, abc),
         music:      scan_register_music_ids(body, abc),
+        camera_backgrounds: scan_register_camera_backgrounds(body, abc),
     })
+}
+
+/// Read the `camera.backgrounds` entries out of Main's constructor.
+///
+/// The block is a literal object per layer: a `linkage_id` string then the pan multipliers, all
+/// pushed in order between the `"backgrounds"` key and the `register` call that consumes it. So
+/// each `linkage_id` opens an entry and the numbers that follow fill it.
+fn scan_register_camera_backgrounds(body: &MethodBody, abc: &AbcFile) -> Vec<CameraBackground> {
+    let key_idx = |k: &str| abc.strings.iter().position(|s| &**s == k);
+    let (Some(bg_key), Some(link_key)) = (key_idx("backgrounds"), key_idx("linkage_id")) else { return Vec::new() };
+    let x_key = key_idx("xPanMultiplier");
+    let y_key = key_idx("yPanMultiplier");
+    let auto_key = key_idx("autoPanMultiplier");
+
+    let bc = &body.bytecode;
+    let (mut i, mut collecting) = (0usize, false);
+    let mut out: Vec<CameraBackground> = Vec::new();
+    let mut field: Option<&str> = None;
+    while i < bc.len() {
+        let op = bc[i];
+        let at = i;
+        i += 1;
+        match op {
+            OP_PUSHSTRING => {
+                let Some(idx) = read_u30_at(bc, &mut i) else { break };
+                let idx = idx as usize;
+                if idx == bg_key { collecting = true; field = None; continue; }
+                if !collecting { continue; }
+                if idx == link_key { field = Some("linkage"); continue; }
+                if Some(idx) == x_key { field = Some("x"); continue; }
+                if Some(idx) == y_key { field = Some("y"); continue; }
+                if Some(idx) == auto_key { field = Some("auto"); continue; }
+                if field == Some("linkage") {
+                    if let Some(s) = abc.strings.get(idx) {
+                        out.push(CameraBackground { linkage_id: s.to_string(), ..Default::default() });
+                    }
+                    field = None;
+                }
+            }
+            OP_PUSHDOUBLE | OP_PUSHINT | OP_PUSHSHORT | OP_PUSHBYTE if collecting => {
+                let v = match op {
+                    OP_PUSHDOUBLE => { let Some(x) = read_u30_at(bc, &mut i) else { break }; abc.doubles.get(x as usize).copied() }
+                    OP_PUSHINT => { let Some(x) = read_u30_at(bc, &mut i) else { break }; abc.ints.get(x as usize).map(|v| *v as f64) }
+                    OP_PUSHSHORT => { let Some(x) = read_u30_at(bc, &mut i) else { break }; Some(x as i32 as f64) }
+                    _ => { let v = bc.get(i).map(|b| *b as i8 as f64); i += 1; v }
+                };
+                if let (Some(v), Some(e)) = (v, out.last_mut()) {
+                    match field { Some("x") => e.x_pan = v, Some("y") => e.y_pan = v, _ => {} }
+                }
+                field = None;
+            }
+            OP_PUSHTRUE | OP_PUSHFALSE if collecting => {
+                if let Some(e) = out.last_mut() {
+                    if field == Some("auto") { e.auto_pan = op == OP_PUSHTRUE; }
+                }
+                field = None;
+            }
+            OP_CALLPROPVOID | OP_CALLPROPERTY => {
+                let Some(mn) = read_u30_at(bc, &mut i) else { break };
+                let _ = read_u30_at(bc, &mut i);
+                if collecting && abc.multinames.get(mn as usize).is_some_and(|m| &*m.name == "register") { break; }
+            }
+            _ => { let mut j = at + 1; skip_opcode_operands(op, bc, &mut j); i = j; }
+        }
+    }
+    out
 }
 
 /// Walk Main's constructor to collect the `register("music", {id:...}, …)` track
@@ -2177,6 +2264,8 @@ pub struct StageWeather {
     /// The area they are scattered over and wrap within, in SSF2 units.
     pub width: f64,
     pub height: f64,
+    /// How the source moves one particle per frame, when its class could be read.
+    pub motion: Option<WeatherMotion>,
 }
 
 /// Find a stage's weather by stepping its own `initialize`.
@@ -2212,11 +2301,15 @@ pub fn extract_stage_weather(abc: &AbcFile, stage_class: &str) -> Option<StageWe
 /// on every stage that has any, without knowing a single class name. Keying on a name containing
 /// "weather" instead finds two of the eight stages in the corpus that call it.
 fn weather_in_body(abc: &AbcFile, bc: &[u8]) -> Option<StageWeather> {
-    // pass 1: field -> (particle art, numbers seen just after its construction)
-    let mut built: Vec<(String, String, Option<String>, Vec<f64>)> = Vec::new();
+    // pass 1: field -> (particle art, the constructor arguments)
+    // Arguments are kept POSITIONALLY: a class or string argument holds its slot as `None` so the
+    // numbers still line up with the constructor's parameters. Collapsing to "the numbers seen"
+    // shifts every one of them by however many non-numeric arguments came first.
+    type CtorArgs = (Vec<Option<f64>>, Vec<Option<String>>);
+    let mut built: Vec<(String, String, Option<String>, CtorArgs)> = Vec::new();
     let (mut i, mut last_lex) = (0usize, None::<String>);
-    let mut recent: Vec<f64> = Vec::new();
-    let mut pending: Option<(String, Option<String>, Vec<f64>)> = None;
+    let mut recent: Vec<(Option<f64>, Option<String>)> = Vec::new();
+    let mut pending: Option<(String, Option<String>, CtorArgs)> = None;
     while i < bc.len() {
         let op = bc[i];
         let at = i;
@@ -2225,6 +2318,11 @@ fn weather_in_body(abc: &AbcFile, bc: &[u8]) -> Option<StageWeather> {
             OP_GETLEX => {
                 let mn = read_u30_at(bc, &mut i)?;
                 last_lex = abc.multinames.get(mn as usize).map(|m| m.name.to_string());
+                recent.push((None, None));
+            }
+            OP_PUSHSTRING => {
+                let idx = read_u30_at(bc, &mut i)?;
+                recent.push((None, abc.strings.get(idx as usize).map(|s| s.to_string())));
             }
             OP_CONSTRUCTPROP => {
                 let mn = read_u30_at(bc, &mut i)?;
@@ -2234,24 +2332,25 @@ fn weather_in_body(abc: &AbcFile, bc: &[u8]) -> Option<StageWeather> {
                 // seen. The particle class is the most recent name; the numbers among the args are
                 // whatever the stage chose to override.
                 let take = recent.len().min(argc);
-                let args: Vec<f64> = recent[recent.len() - take..].to_vec();
+                let tail = &recent[recent.len() - take..];
+                let args = (tail.iter().map(|a| a.0).collect(), tail.iter().map(|a| a.1.clone()).collect());
                 recent.clear();
                 pending = Some((cname, last_lex.clone(), args));
             }
             OP_PUSHDOUBLE => {
                 let idx = read_u30_at(bc, &mut i)?;
-                if let Some(v) = abc.doubles.get(idx as usize) { recent.push(*v); }
+                recent.push((abc.doubles.get(idx as usize).copied(), None));
             }
             OP_PUSHINT => {
                 let idx = read_u30_at(bc, &mut i)?;
-                if let Some(v) = abc.ints.get(idx as usize) { recent.push(*v as f64); }
+                recent.push((abc.ints.get(idx as usize).map(|v| *v as f64), None));
             }
             OP_PUSHSHORT => {
                 let v = read_u30_at(bc, &mut i)? as i32;
-                recent.push(v as f64);
+                recent.push((Some(v as f64), None));
             }
             OP_PUSHBYTE => {
-                recent.push(bc.get(i).map(|b| *b as i8 as f64)?);
+                recent.push((Some(bc.get(i).map(|b| *b as i8 as f64)?), None));
                 i += 1;
             }
             OP_SETPROPERTY | OP_INITPROPERTY => {
@@ -2301,8 +2400,13 @@ fn weather_in_body(abc: &AbcFile, bc: &[u8]) -> Option<StageWeather> {
         None => return None,
     };
     let art = art?;
-    let (width, height, count) = weather_numbers(abc, &cname, &args);
-    Some(StageWeather { art, width, height, count })
+    let (nums, strs) = args;
+    let (width, height, count) = weather_numbers(abc, &cname, &nums);
+    // a class that branches on a string it was handed (`"left"` / `"right"`) has one mover per
+    // direction; the one named for the string it was given is the one that runs.
+    let dir = strs.iter().flatten().next().cloned();
+    let motion = weather_motion(abc, &cname, &nums, dir.as_deref());
+    Some(StageWeather { art, width, height, count, motion })
 }
 
 /// The count and area a weather object is actually built with.
@@ -2311,7 +2415,7 @@ fn weather_in_body(abc: &AbcFile, bc: &[u8]) -> Option<StageWeather> {
 /// says which parameter lands in which field (`getlocal_N` then a store), and its signature carries
 /// the defaults for the ones the stage did not pass. bowserscastle passes only the particle class
 /// and takes everything else from those defaults, so reading the call site alone finds nothing.
-fn weather_numbers(abc: &AbcFile, class_name: &str, args: &[f64]) -> (f64, f64, u32) {
+fn weather_numbers(abc: &AbcFile, class_name: &str, args: &[Option<f64>]) -> (f64, f64, u32) {
     let Some(class) = abc.classes.iter().find(|c| c.name == class_name) else { return (0.0, 0.0, 0) };
     let Some(ctor) = abc.methods.get(class.constructor_idx as usize) else { return (0.0, 0.0, 0) };
     let Some(body) = abc.method_bodies.iter().find(|b| b.method_idx == class.constructor_idx) else { return (0.0, 0.0, 0) };
@@ -2343,7 +2447,7 @@ fn weather_numbers(abc: &AbcFile, class_name: &str, args: &[f64]) -> (f64, f64, 
     let first_optional = pc.saturating_sub(ctor.optionals.len());
     let value_of = |p1: usize| -> Option<f64> {
         let idx = p1.checked_sub(1)?;              // getlocal is 1-based over params
-        if idx < args.len() { return Some(args[idx]); }
+        if let Some(Some(v)) = args.get(idx) { return Some(*v); }
         if idx >= first_optional { return ctor.optionals.get(idx - first_optional).copied().flatten(); }
         None
     };
@@ -2353,8 +2457,10 @@ fn weather_numbers(abc: &AbcFile, class_name: &str, args: &[f64]) -> (f64, f64, 
             .and_then(|(p, _)| value_of(*p))
     };
     let count = find("cnt").or_else(|| find("count")).or_else(|| find("num")).unwrap_or(0.0);
-    let width = find("width").unwrap_or(0.0);
-    let height = find("height").unwrap_or(0.0);
+    // the area a class scatters over is named for the SIZE it is (`m_owidth`) or for the AXIS it
+    // spans (`hArea`/`vArea`), and both spellings are in the corpus.
+    let width = find("width").or_else(|| find("harea")).unwrap_or(0.0);
+    let height = find("height").or_else(|| find("varea")).unwrap_or(0.0);
     (width, height, count.max(0.0) as u32)
 }
 
@@ -3494,3 +3600,225 @@ mod tests {
 
 pub fn read_u30_pub(d: &[u8], i: &mut usize) -> Option<u32> { read_u30_at(d, i) }
 pub fn skip_ops_pub(op: u8, bc: &[u8], i: &mut usize) { skip_opcode_operands(op, bc, i) }
+
+// ── weather motion: what the source's particles actually DO ──────────────────
+
+/// A per-frame quantity a weather class computes, in the one shape those classes use:
+/// a constant plus a random spread (`1 + safeRandom() * 2`, `safeRandom() * fallSpeed`).
+/// `base + rand * U(0,1)`, in SSF2 units per frame; +y is DOWN, +x is RIGHT.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Drift {
+    pub base: f64,
+    pub rand: f64,
+}
+
+impl Drift {
+    fn cst(v: f64) -> Self { Drift { base: v, rand: 0.0 } }
+    fn neg(self) -> Self { Drift { base: -self.base, rand: -self.rand } }
+    fn add(self, o: Self) -> Self { Drift { base: self.base + o.base, rand: self.rand + o.rand } }
+    fn sub(self, o: Self) -> Self { self.add(o.neg()) }
+    /// Only a scale by a CONSTANT is representable; anything else is not this shape.
+    fn mul(self, o: Self) -> Option<Self> {
+        if o.rand == 0.0 { Some(Drift { base: self.base * o.base, rand: self.rand * o.base }) }
+        else if self.rand == 0.0 { Some(Drift { base: o.base * self.base, rand: o.rand * self.base }) }
+        else { None }
+    }
+    pub fn is_zero(&self) -> bool { self.base == 0.0 && self.rand == 0.0 }
+    /// The mean value, which is what decides which way the field drifts overall.
+    pub fn mean(&self) -> f64 { self.base + self.rand / 2.0 }
+}
+
+/// How a weather class moves ONE particle each frame, read out of that class's own code.
+///
+/// Weather is not decoration the converter is free to invent: rain falls fast and straight, embers
+/// rise and wander, and a port that picks one of those for every stage gets the other stages wrong.
+/// Both are the same three statements over a particle (`y += <drift>`, `x += <drift>`, wrap at the
+/// edge), so reading the two drifts off the source covers the pattern rather than one stage of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WeatherMotion {
+    /// Per-frame vertical drift, +down (rain positive, embers negative).
+    pub dy: Drift,
+    /// Per-frame horizontal drift, +right.
+    pub dx: Drift,
+}
+
+/// Multiname kinds whose NAME comes off the stack (`o[i]`), so a read or write through one pops
+/// an extra operand: MultinameL / MultinameLA / RTQnameL / RTQnameLA.
+fn is_runtime_name(kind: u8) -> bool { matches!(kind, 0x11 | 0x12 | 0x1B | 0x1C) }
+
+/// One value in the symbolic walk: a drift, or something this pass cannot read.
+#[derive(Clone, Copy)]
+enum Sym { Val(Drift), Unknown }
+
+impl Sym {
+    fn val(self) -> Option<Drift> { match self { Sym::Val(d) => Some(d), Sym::Unknown => None } }
+}
+
+/// Walk a method body over an abstract stack, resolving `field` reads through `fields` and
+/// `getlocal N` through `params`. Calls `on_store(name, value)` for every `setproperty`.
+///
+/// Deliberately shallow: anything it cannot model pushes `Unknown`, which propagates, so an
+/// unreadable expression yields no answer instead of a wrong one.
+fn walk_drift(
+    abc: &AbcFile,
+    bc: &[u8],
+    fields: &BTreeMap<String, Drift>,
+    params: &BTreeMap<usize, Drift>,
+    mut on_store: impl FnMut(&str, Sym, Sym),
+) {
+    let mut st: Vec<Sym> = Vec::new();
+    let mut i = 0usize;
+    while i < bc.len() {
+        let op = bc[i];
+        let at = i;
+        i += 1;
+        match op {
+            OP_PUSHBYTE => { let v = match bc.get(i) { Some(b) => *b as i8 as f64, None => return }; i += 1; st.push(Sym::Val(Drift::cst(v))); }
+            OP_PUSHSHORT => { let Some(v) = read_u30_at(bc, &mut i) else { return }; st.push(Sym::Val(Drift::cst(v as f64))); }
+            OP_PUSHINT => { let Some(x) = read_u30_at(bc, &mut i) else { return };
+                            st.push(abc.ints.get(x as usize).map(|v| Sym::Val(Drift::cst(*v as f64))).unwrap_or(Sym::Unknown)); }
+            OP_PUSHDOUBLE => { let Some(x) = read_u30_at(bc, &mut i) else { return };
+                               st.push(abc.doubles.get(x as usize).map(|v| Sym::Val(Drift::cst(*v))).unwrap_or(Sym::Unknown)); }
+            OP_GETLOCAL1 => st.push(params.get(&1).map(|d| Sym::Val(*d)).unwrap_or(Sym::Unknown)),
+            OP_GETLOCAL2 => st.push(params.get(&2).map(|d| Sym::Val(*d)).unwrap_or(Sym::Unknown)),
+            OP_GETLOCAL3 => st.push(params.get(&3).map(|d| Sym::Val(*d)).unwrap_or(Sym::Unknown)),
+            OP_GETLOCAL => { let Some(n) = read_u30_at(bc, &mut i) else { return };
+                             st.push(params.get(&(n as usize)).map(|d| Sym::Val(*d)).unwrap_or(Sym::Unknown)); }
+            OP_GETPROPERTY => {
+                let Some(mn) = read_u30_at(bc, &mut i) else { return };
+                let Some(m) = abc.multinames.get(mn as usize) else { return };
+                // a runtime-named read (`o[i]`) takes its name off the stack as well
+                if is_runtime_name(m.kind) { st.pop(); }
+                let name = m.name.to_string();
+                st.pop();                                    // the object being read from
+                st.push(fields.get(&name).map(|d| Sym::Val(*d)).unwrap_or(Sym::Unknown));
+            }
+            OP_CALLPROPERTY => {
+                let Some(mn) = read_u30_at(bc, &mut i) else { return };
+                let Some(argc) = read_u30_at(bc, &mut i) else { return };
+                let name = abc.multinames.get(mn as usize).map(|m| m.name.to_string()).unwrap_or_default();
+                for _ in 0..argc { st.pop(); }
+                st.pop();                                    // the receiver
+                // the engine's uniform random in [0,1): the whole reason a drift carries a spread
+                let is_rand = name.eq_ignore_ascii_case("safeRandom") || name.eq_ignore_ascii_case("random");
+                st.push(if is_rand && argc == 0 { Sym::Val(Drift { base: 0.0, rand: 1.0 }) } else { Sym::Unknown });
+            }
+            OP_ADD | OP_SUBTRACT | OP_MULTIPLY => {
+                let b = st.pop().unwrap_or(Sym::Unknown);
+                let a = st.pop().unwrap_or(Sym::Unknown);
+                let r = match (a.val(), b.val()) {
+                    (Some(x), Some(y)) => match op {
+                        OP_ADD => Some(x.add(y)),
+                        OP_SUBTRACT => Some(x.sub(y)),
+                        _ => x.mul(y),
+                    },
+                    _ => None,
+                };
+                st.push(r.map(Sym::Val).unwrap_or(Sym::Unknown));
+            }
+            OP_NEGATE => { let a = st.pop().unwrap_or(Sym::Unknown); st.push(a.val().map(|d| Sym::Val(d.neg())).unwrap_or(Sym::Unknown)); }
+            OP_COERCE_A | OP_COERCE | OP_NOP => { if op == OP_COERCE { let _ = read_u30_at(bc, &mut i); } }
+            OP_DUP => { let t = st.last().copied().unwrap_or(Sym::Unknown); st.push(t); }
+            OP_SETPROPERTY | OP_INITPROPERTY => {
+                let Some(mn) = read_u30_at(bc, &mut i) else { return };
+                let Some(m) = abc.multinames.get(mn as usize) else { return };
+                let v = st.pop().unwrap_or(Sym::Unknown);
+                if is_runtime_name(m.kind) { st.pop(); }
+                let obj = st.pop().unwrap_or(Sym::Unknown);
+                on_store(m.name.as_ref(), v, obj);
+            }
+            // value-producing ops this walk does not READ but does have to keep the stack straight
+            // for: they leave one unreadable value behind, and dropping the whole stack instead
+            // loses the readable operands already pushed under them (an ember's `1 + random() * 2`
+            // is exactly that shape).
+            OP_GETLEX | OP_FINDPROP | OP_FINDPROPSTRICT => { let _ = read_u30_at(bc, &mut i); st.push(Sym::Unknown); }
+            OP_PUSHNULL | OP_PUSHTRUE | OP_PUSHFALSE | OP_PUSHNAN | OP_GETLOCAL0 => st.push(Sym::Unknown),
+            OP_CALLPROPVOID => {
+                let Some(_) = read_u30_at(bc, &mut i) else { return };
+                let Some(argc) = read_u30_at(bc, &mut i) else { return };
+                for _ in 0..argc { st.pop(); }
+                st.pop();
+            }
+            OP_CONSTRUCTPROP => {
+                let Some(_) = read_u30_at(bc, &mut i) else { return };
+                let Some(argc) = read_u30_at(bc, &mut i) else { return };
+                for _ in 0..argc { st.pop(); }
+                st.pop();
+                st.push(Sym::Unknown);
+            }
+            _ => {
+                // an op this walk does not model: its result is not readable, and neither is
+                // anything computed from it, so drop the stack rather than mis-pair operands.
+                let mut j = at + 1;
+                skip_opcode_operands(op, bc, &mut j);
+                i = j;
+                st.clear();
+            }
+        }
+    }
+}
+
+/// Read a weather class's per-frame particle motion.
+///
+/// Two passes over the class: the constructor says what each per-particle field holds (a literal
+/// spread, or a constructor parameter the stage passed), and the mover method says how those
+/// fields are applied to `x` and `y`.
+pub fn weather_motion(abc: &AbcFile, class_name: &str, args: &[Option<f64>], dir: Option<&str>) -> Option<WeatherMotion> {
+    let class = abc.classes.iter().find(|c| c.name == class_name)?;
+    let ctor = abc.methods.get(class.constructor_idx as usize)?;
+    let cbody = abc.method_bodies.iter().find(|b| b.method_idx == class.constructor_idx)?;
+
+    // constructor parameters, by the number `getlocal` gives them: what the stage passed, else
+    // what the signature declares as the default.
+    let pc = ctor.param_count as usize;
+    let first_optional = pc.saturating_sub(ctor.optionals.len());
+    let mut params: BTreeMap<usize, Drift> = BTreeMap::new();
+    for p in 1..=pc {
+        let idx = p - 1;
+        let v = args.get(idx).copied().flatten()
+            .or_else(|| if idx >= first_optional { ctor.optionals.get(idx - first_optional).copied().flatten() } else { None });
+        if let Some(v) = v { params.insert(p, Drift::cst(v)); }
+    }
+
+    // pass 1: every field the constructor gives a readable value (on `this` or on the particle).
+    let mut fields: BTreeMap<String, Drift> = BTreeMap::new();
+    walk_drift(abc, &cbody.bytecode, &BTreeMap::new(), &params, |name, v, _| {
+        if let Some(d) = v.val() { fields.insert(name.to_string(), d); }
+    });
+
+    // pass 2: the mover. `x`/`y` are written as the current value plus a drift, so the drift is
+    // what the store holds minus the position itself -- which reads directly, because a position
+    // read is Unknown and so only the pure-drift form survives the walk. Instead of subtracting,
+    // match the shape: a store of `<pos> ± <drift>` leaves `Unknown ± drift` on the stack, so the
+    // walk is re-run with the position field resolving to zero.
+    let mut zero_pos = fields.clone();
+    zero_pos.insert("x".into(), Drift::cst(0.0));
+    zero_pos.insert("y".into(), Drift::cst(0.0));
+    let mut motion = WeatherMotion::default();
+    let mut seen = (false, false);
+    let mut order: Vec<_> = class.instance_methods.iter().collect();
+    if let Some(d) = dir.map(|d| d.to_ascii_lowercase()).filter(|d| !d.is_empty()) {
+        // a class that was handed a direction has one mover per direction (`moveLeft`/`moveRight`)
+        // and runs the one named for what it was given. If nothing is named for it, the class does
+        // not branch on the string and every method stays a candidate.
+        let named: Vec<_> = order.iter().copied().filter(|t| t.name.to_ascii_lowercase().contains(&d)).collect();
+        if !named.is_empty() { order = named; }
+    }
+    for t in order {
+        let Some(body) = abc.method_bodies.iter().find(|b| b.method_idx == t.method_idx) else { continue };
+        walk_drift(abc, &body.bytecode, &zero_pos, &BTreeMap::new(), |name, v, _| {
+            let Some(d) = v.val() else { return };
+            // the wrap (`y = -height`, `x = random * hArea`) is a JUMP, not a drift: it only ever
+            // stores a whole position, never the position plus something. Those come out of the
+            // walk with the position reading as zero, so they look like a drift of the full value.
+            // The move is the FIRST store in the mover, before any wrap, so keep the first only.
+            match name {
+                "y" if !seen.1 => { motion.dy = d; seen.1 = true; }
+                "x" if !seen.0 => { motion.dx = d; seen.0 = true; }
+                _ => {}
+            }
+        });
+        if seen.0 && seen.1 { break; }
+    }
+    (seen.0 || seen.1).then_some(motion)
+}

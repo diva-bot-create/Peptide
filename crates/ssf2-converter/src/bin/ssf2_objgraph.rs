@@ -13,6 +13,7 @@
 //!   ssf2_objgraph <swf> uses <ClassName>        -- methods that getlex/constructprop a class
 //!   ssf2_objgraph <swf> slots <Class>           -- list instance + static slots with types & slot ids
 //!   ssf2_objgraph <swf> grepmethod <substr>     -- Class::method whose name contains substr
+//!   ssf2_objgraph <swf> weather <StageClass>    -- the stage's particle weather, as the converter reads it
 
 use ssf2_converter::abc_codec::{self, Abc, Multiname, TraitKindData};
 
@@ -171,6 +172,84 @@ fn main() {
     if args.len() < 3 { eprintln!("usage: ssf2_objgraph <swf> <cmd> [args]"); std::process::exit(1); }
     let abc = load(&args[1]);
     match args[2].as_str() {
+        "placenames" => {
+            // every PlaceObject instance NAME in the file, with the sprite it is placed in
+            let data = std::fs::read(&args[1]).expect("read swf");
+            let inner = ssf2_converter::ssf::decompress(&data).expect("ssf decompress");
+            let buf = swf::decompress_swf(&inner[..]).expect("decompress");
+            let sw = swf::parse_swf(&buf).expect("parse swf");
+            let want = args.get(3).cloned().unwrap_or_default().to_ascii_lowercase();
+            let mut show = |owner: String, tags: &[swf::Tag]| {
+                for t in tags {
+                    if let swf::Tag::PlaceObject(po) = t {
+                        if let Some(n) = &po.name {
+                            let n = n.to_string_lossy(swf::UTF_8).to_string();
+                            if want.is_empty() || n.to_ascii_lowercase().contains(&want) {
+                                println!("{owner}: name={n} depth={}", po.depth);
+                            }
+                        }
+                    }
+                }
+            };
+            show("<root>".into(), &sw.tags);
+            for t in &sw.tags {
+                if let swf::Tag::DefineSprite(sp) = t { show(format!("sprite#{}", sp.id), &sp.tags); }
+            }
+        }
+        "cambg" => {
+            let data = std::fs::read(&args[1]).expect("read swf");
+            let inner = ssf2_converter::ssf::decompress(&data).expect("ssf decompress");
+            let sw = ssf2_converter::swf_parser::parse(&inner).expect("parse");
+            for b in &sw.abc_blocks {
+                let Ok(a) = ssf2_converter::abc_parser::parse(b) else { continue };
+                if let Some(md) = ssf2_converter::abc_parser::extract_main_package_metadata(&a) {
+                    if md.id.is_some() { println!("{:#?}", md.camera_backgrounds); return; }
+                }
+            }
+        }
+        "orphansprites" => {
+            // DefineSprite ids no timeline ever places: engine-instantiated art (a stage resource
+            // the engine adds itself), which the placement walk cannot see.
+            let data = std::fs::read(&args[1]).expect("read swf");
+            let inner = ssf2_converter::ssf::decompress(&data).expect("ssf decompress");
+            let buf = swf::decompress_swf(&inner[..]).expect("decompress");
+            let sw = swf::parse_swf(&buf).expect("parse swf");
+            let mut placed = std::collections::BTreeSet::new();
+            let mut sprites = std::collections::BTreeMap::new();
+            let mut note = |tags: &[swf::Tag]| {
+                for t in tags {
+                    if let swf::Tag::PlaceObject(po) = t {
+                        match po.action {
+                            swf::PlaceObjectAction::Place(c) | swf::PlaceObjectAction::Replace(c) => { placed.insert(c); }
+                            _ => {}
+                        }
+                    }
+                }
+            };
+            note(&sw.tags);
+            for t in &sw.tags {
+                if let swf::Tag::DefineSprite(sp) = t { sprites.insert(sp.id, sp.tags.len()); note(&sp.tags); }
+            }
+            for (id, n) in sprites {
+                if !placed.contains(&id) { println!("orphan sprite id={id} tags={n}"); }
+            }
+        }
+        "weather" => {
+            // what the converter's own weather reader makes of this stage: the particle class, the
+            // count and area, and the per-frame drift stepped out of the weather class.
+            let data = std::fs::read(&args[1]).expect("read swf");
+            let inner = ssf2_converter::ssf::decompress(&data).expect("ssf decompress");
+            let sw = ssf2_converter::swf_parser::parse(&inner).expect("parse");
+            let stage = args.get(3).cloned().unwrap_or_default();
+            for b in &sw.abc_blocks {
+                let Ok(a) = ssf2_converter::abc_parser::parse(b) else { continue };
+                if let Some(w) = ssf2_converter::abc_parser::extract_stage_weather(&a, &stage) {
+                    println!("{w:#?}");
+                    return;
+                }
+            }
+            println!("no weather found for stage class {stage:?}");
+        }
         "scripts" => {
             for (si, s) in abc.scripts.iter().enumerate() {
                 println!("== script #{si} init=method#{} ==", s.init);
