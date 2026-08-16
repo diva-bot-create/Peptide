@@ -544,7 +544,13 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
             Some(m) => {
                 eprintln!("[as3] doc_class={} planes={} actors={}", m.doc_class, m.planes.len(), m.actors.len());
                 for (clip, plane) in &m.planes { eprintln!("  plane {:<10?} <- {clip}", plane); }
-                for a in &m.actors { eprintln!("  actor {} : {} @ (x={:?}, y={:?})", a.class_name, a.base, a.x, a.y); }
+                for a in &m.actors {
+                    eprintln!("  actor {} : {} @ (x={:?}, y={:?})", a.class_name, a.base, a.x, a.y);
+                    eprintln!("      hitboxes={} own_stats={:?} anims={:?} faller={} script={}",
+                        a.attack_hitboxes.len(), a.own_stats, a.anim_labels,
+                        a.faller.is_some(), a.reconstructed_script.is_some());
+                    eprintln!("      behavior={:?}", a.behavior);
+                }
             }
             None => eprintln!("[as3] no SSF2Stage subclass found (heuristic fallback)"),
         }
@@ -878,10 +884,17 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
             // and the log should say which object and what it is rather than leaving the stage
             // quietly short of a thing SSF2 has.
             .or_else(|| {
-                log::warn!(
-                    "stage object '{}' ({}) is declared by the package but not shipped: \
-                     the emission path still selects hazards by name, so it has nowhere to go",
-                    a.class_name, a.base);
+                if a.base == crate::ssf2_objects::ITEM_BASE {
+                    log::warn!(
+                        "stage object '{}' is an {}: deferred, because Fraymakers has no item \
+                         system to port onto and one has to be built before a pickup can ship",
+                        a.class_name, a.base);
+                } else {
+                    log::warn!(
+                        "stage object '{}' ({}) is declared by the package but not shipped: \
+                         the emission path still selects hazards by name, so it has nowhere to go",
+                        a.class_name, a.base);
+                }
                 None
             }))
         .collect()).unwrap_or_default();

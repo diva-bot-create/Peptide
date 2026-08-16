@@ -540,11 +540,36 @@ behavior (a dummy opponent plus post-hit readback), and that's the next focused 
 
 ---
 
-## stage hazard inventory
+## stage game objects
+
+**what an object IS comes from the class graph, not from its name.** SSF2's api layer declares
+the hierarchy, every package carries its own copy, and a stage's objects extend it:
+
+```
+SSF2BaseAPIObject -> SSF2GameObject -> { Item, Enemy, Projectile, Target, Beacon, Character }
+```
+
+so "is this a game object" is ancestry and "what kind" is the base it reaches, both read by
+`ssf2_objects::game_object_classes`. discovery does not depend on finding a spawn call: the
+spawn-site scan only sees an actor when the class reference and the `spawnEnemy` call are close
+enough for the stack sim to carry the tag between them, and it is kept only for the literal spawn
+coordinates it can read there.
+
+**hazard vs decoration is not a distinction the porter makes.** each class's own declarations say
+what it does, and they are read per class: `getAttackStats` hitboxes, `getOwnStats` scalars, the
+`forceAttack` labels naming its art clip, the stepped-out behaviour, the reconstructed script. an
+object with no attack box does not hurt anyone because its code says so. clocktown's TingleBalloon
+is an SSF2Enemy with ZERO hitboxes and a rideable self-platform; its ClockTownFlamingRock is an
+SSF2Enemy with one. porting the code reproduces that without anyone classifying anything.
+
+**SSF2Item is deferred, and not because it is hard to find.** Fraymakers has no item system, so a
+pickup has nothing to port onto: carrying, throwing, effects, respawn all have to be BUILT first.
+that is a project rather than a conversion and wants direct involvement, so an item is reported as
+deferred instead of shipped half-built (`ssf2_objects::ITEM_BASE`). every other base should ship.
 
 full audit of all 110 stages: which have scripted actor/hazard classes, what the converter
-handles, and what's a declared gap. run via `ssf2_objgraph <stage.ssf> scripts` + the
-debug-info pass. corpus conversion: PASS=110 FAIL=0.
+handles, and what's a declared gap. run via `ssf2_objgraph <stage.ssf> scripts` +
+`ssf2_objgraph <stage.ssf> classgraph` + the debug-info pass. corpus conversion: PASS=110 FAIL=0.
 
 **ported** (converter emits a hazard CGO with disasm-sourced stats; none live-verified yet --
 boot `FRAY_STAGE=<id> peptide session --char mario,mario` and watch the out.log hit stream for

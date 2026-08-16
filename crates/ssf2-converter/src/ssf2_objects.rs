@@ -36,6 +36,15 @@ use std::collections::BTreeMap;
 /// The api root every game object descends from.
 const GAME_OBJECT_ROOT: &str = "SSF2GameObject";
 
+/// The api base for pickups.
+///
+/// Held back deliberately, and not because it is hard to FIND -- it is found exactly like every
+/// other base. Fraymakers has no item system at all, so an SSF2Item has nothing to port ONTO: it
+/// needs a whole custom subsystem built first (pickup, carry, throw, effect, respawn), which is a
+/// project of its own rather than a conversion. Until that exists an item is reported as deferred
+/// rather than shipped half-built.
+pub const ITEM_BASE: &str = "SSF2Item";
+
 /// How deep a class chain is followed before giving up (a malformed package could cycle).
 const MAX_DEPTH: usize = 32;
 
@@ -47,6 +56,16 @@ pub struct GameObjectClass {
     /// The api base it reaches under the root, e.g. `SSF2Enemy`. This is the KIND: what the game
     /// treats it as, spawns it as, and collides it as.
     pub base: String,
+}
+
+impl GameObjectClass {
+    /// Whether porting this object is blocked on a subsystem Fraymakers does not have.
+    ///
+    /// See [`ITEM_BASE`]. This is a statement about the TARGET engine, not about the object: the
+    /// class is read as completely as any other, and only the emission has nowhere to go.
+    pub fn needs_unbuilt_subsystem(&self) -> bool {
+        self.base == ITEM_BASE
+    }
 }
 
 /// Strip any namespace so `foo.Thwomp` and `Thwomp` compare equal.
