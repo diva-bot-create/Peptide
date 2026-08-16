@@ -519,8 +519,10 @@ fn render_condition(cond: &Expr) -> String {
 
 /// A chain longer than this is not a chain; the walk stops rather than looping on malformed input.
 const MAX_CHAIN_LINKS: usize = 32;
-/// Below this the existing two-term handling is already correct, and is left to do it.
-const MIN_CHAIN_TERMS: usize = 3;
+/// A chain is at least two terms. (The older pair-shaped handling also claims this case, but gets
+/// the BODY wrong on a plain two-term `&&`: it emits the right condition with an empty body and
+/// leaves the real statements behind an unrecoverable second `if`.)
+const MIN_CHAIN_TERMS: usize = 2;
 
 const OP_NOP: u8         = 0x02;
 const OP_THROW: u8       = 0x03;
@@ -1576,6 +1578,11 @@ impl<'a> StructuredDecoder<'a> {
             // copy is popped, the term evaluated, and it falls into the block that tests it.
             let tb = self.block_at(term_at)?.clone();
             if !matches!(tb.term, Terminator::Fall(n) if n == branch_at) { return None; }
+            // A link BEGINS by discarding the duplicated copy. Without that this matches two
+            // independent `if`s that merely sit next to each other -- sandbag's LEFT/RIGHT pair
+            // became `if (LEFT && null)` with the LEFT body swallowed, `null` being the very
+            // placeholder seeded below for a `pop` that was never there.
+            if self.bc.get(tb.start) != Some(&OP_POP) { return None; }
 
             let mut dec = BlockDecoder::new(self.bc, self.abc);
             dec.activation_slots = self.activation_slots.clone();

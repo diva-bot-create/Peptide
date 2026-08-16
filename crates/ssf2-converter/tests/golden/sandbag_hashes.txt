@@ -1,4 +1,4 @@
-0495f97b4e7808905068e56c3439821cd953797265ca1bdcf2549fa510f51280  ./conversion_log.json
+76248ad6c35d82d9ade93dd024d6edb8ce110ec5a88328ea92974882924f21ae  ./conversion_log.json
 20c4bd5331735f9b4a052ea68cdaaf9dfeaa0936667cfc4a94b65ad45096c7bb  ./conversion_stats.json
 949eb4e5bfada2d57ed81163fb46c449f8f250ce48b34497095868b1b35ec626  ./library/audio/_ssf2_placeholder.wav.meta
 524ba561cf17ecbed2f1f0fdec053c45adab2f6baf0dd1c8879a781ad9045de5  ./library/audio/bowser_swing5.wav.meta
@@ -22,7 +22,7 @@ c074beb86231e76047835f4943dcd65dab14dbe0b4a42c653c802ab7caa1601c  ./library/audi
 794800b16c99bb2473e5417bbe4f02a1f3b77d8f95905bd9bd17bb4b04ac78d2  ./library/costumes.palettes
 6b08fa9fc4f035ea41fa2d1d904b36efdcbdca7de2a90a713477f7919d4d2b94  ./library/costumes.palettes.meta
 1ff83e5ee445950095e9c0aaa401aa49f3cf51e190e5fd224f2a25824193c798  ./library/entities/Menu.entity
-bc21dbd4972514e163a9261085f04bd709bc9c4b32a434d5d43fcf855947cfb7  ./library/entities/Sandbag.entity
+b31b889deb69c338ab3891e798187daf0ac35c291639820e5a32bdbdf6a6bfb6  ./library/entities/Sandbag.entity
 b2f745d3aabf93490f175d1e93ad4877dc7d77d79dae99439184f3156261be66  ./library/entities/sandbag_entrance_track.entity
 ecfc052263d120828e508b511cdcc54ce096314e154f32b764caecd55eb9803e  ./library/entities/sandbag_fs_cutin.entity
 2cf41292dcc6b9ac68633ef3da83c713f37f4fed9ec139457170113a517eab5d  ./library/entities/sandbag_nspec_blue.entity
@@ -52,7 +52,7 @@ d42dbfb2634bc9ccbe55c0768ac4e756b1e8acbef311975ed9b2cab74ff898a3  ./library/scri
 802ff6d02189790162a4d670f4725be84fa29e7257bc5e1d339922a843b4efba  ./library/scripts/Sandbag/CharacterStats.hx.meta
 73a1da112610ef259a37f9086099ad7b64bd68c08335b2f5b947f1d14ef6238c  ./library/scripts/Sandbag/HitboxStats.hx
 8a40dc9a77ab0810c0cdc9dddc4ed593256b3a2ada891bda0a7a23d1eaa8d542  ./library/scripts/Sandbag/HitboxStats.hx.meta
-f2092f1fddcb155d295eca427611db2ba4d916e1af53174567e1717f2a5639c8  ./library/scripts/Sandbag/Script.hx
+4b6bcd638d1bb878946dcd6672404e90c97957347aeb8e39c08e683b393f61f2  ./library/scripts/Sandbag/Script.hx
 94d0ad5cb1c6b15b7fdf0746d5b9c72d3220cbc396da05cbb7c048a29d1d7c0d  ./library/scripts/Sandbag/Script.hx.meta
 32737d64d3356ebd2dfe8b46778f2865b9e020c48f0a26645899d4179284d253  ./library/sprites/bitmap_102.png.meta
 5ab90903c9ffec92c876d8fc49637bd441bc22e5694b2878403950789a8c316c  ./library/sprites/bitmap_119.png.meta
