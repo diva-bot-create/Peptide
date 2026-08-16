@@ -1837,34 +1837,6 @@ fn walk_frame(
 /// mask is greyscale, which is what decides whether HardLight can be reproduced by ALPHA LAYERS
 /// instead of baked: the black/white decomposition needs one alpha per pixel, so it is exact for a
 /// greyscale mask and cannot express a mask whose channels disagree.
-/// Grow a cel symmetrically so that `(rx, ry)` -- the point inside it the source turns it about --
-/// becomes the middle of the raster. Returns the new cel and that point's position in it.
-fn centre_cel_on(art: StageArt, rx: f64, ry: f64) -> (StageArt, (f64, f64)) {
-    let (w, h) = (art.w as f64, art.h as f64);
-    // how much must be added on each side to put (rx, ry) in the middle
-    let (left, right) = ((w - 2.0 * rx).max(0.0), (2.0 * rx - w).max(0.0));
-    let (top, bottom) = ((h - 2.0 * ry).max(0.0), (2.0 * ry - h).max(0.0));
-    let (nw, nh) = (w + left + right, h + top + bottom);
-    // a turning point far outside the art would grow the raster without bound
-    if nw > 4096.0 || nh > 4096.0 || (left + right + top + bottom) < 0.5 {
-        return (art, (rx, ry));
-    }
-    let Ok(img) = image::load_from_memory(&art.png) else { return (art, (rx, ry)) };
-    let src = img.to_rgba8();
-    let mut canvas = image::RgbaImage::new(nw.round() as u32, nh.round() as u32);
-    image::imageops::replace(&mut canvas, &src, left.round() as i64, top.round() as i64);
-    let mut png = Vec::new();
-    {
-        use image::ImageEncoder;
-        if image::codecs::png::PngEncoder::new(&mut png)
-            .write_image(canvas.as_raw(), canvas.width(), canvas.height(), image::ExtendedColorType::Rgba8).is_err() {
-            return (art, (rx, ry));
-        }
-    }
-    let (nw, nh) = (canvas.width(), canvas.height());
-    (StageArt { png, w: nw, h: nh, ..art }, (nw as f64 / 2.0, nh as f64 / 2.0))
-}
-
 /// Pad every frame of an element to one canvas size, keeping each frame's content CENTRED.
 ///
 /// A frame drawn as its own crop carries its position in `x`/`y`; growing the canvas around the
@@ -3872,27 +3844,6 @@ fn timeline_tracks(
 
         // one cel per distinct shape, taken from the frame where it sits squarest (the rasteriser
         // fits a shape to its axis-aligned box, so that frame's pixels are the least distorted)
-        let shapes: std::collections::BTreeSet<u16> = shown.iter().map(|i| i.shape_id).collect();
-        let squareness = |i: &Instance| {
-            let r = crate::fm_placement::normalise_degrees(i.place.rotation);
-            (r % 90.0).min(90.0 - (r % 90.0))
-        };
-        // How big the piece is drawn in a frame. The cel comes from the frame where it is BIGGEST
-        // (and, among those, squarest): every other frame then scales it DOWN, which is both
-        // sharper and safe. Taking the squarest frame alone could land on one where the piece is
-        // small -- clocktown's clock is drawn tiny in part of its cycle -- and then the frames
-        // where it is full size scale up from that, which is where a clock suddenly ten times its
-        // size comes from.
-        let drawn_size = |i: &Instance| (i.place.sx.abs() * i.place.sy.abs()).max(1e-9);
-        // per shape: its raster (centred on the point it turns about), the rotation that raster
-        // already carries, the placement it was rasterised under, and where that turning point
-        // sits inside the raster
-        // Keyed by (shape, angle STEP). A piece the source turns is rasterised at each angle it
-        // is actually drawn at, rounded to a step, and placed by its own box with no rotation of
-        // ours. That is how the source draws it, so it lands where the source lands it -- no
-        // dependence on how the engine anchors a rotated image, which is the thing that took the
-        // clock apart. The angles are shared and deduplicated, so a ring costs a handful of
-        // pictures rather than one per frame.
         let mut cel: BTreeMap<(u16, i32), StageArt> = BTreeMap::new();
         /// Degrees per rasterised step. Fine enough that a turn reads as smooth, coarse enough
         /// that a full revolution is a couple of dozen pictures instead of a few hundred -- and a
