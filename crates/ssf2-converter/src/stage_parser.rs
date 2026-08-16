@@ -871,6 +871,18 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
                 let mut h = detected.iter().find(|(dk, dh)| *dk == k && dh.art.is_some()).map(|(_, dh)| dh.clone())?;
                 apply_enemy_stats(&mut h, a); // adopt the real declared hit params + animation labels
                 Some(h)
+            })
+            // An object the package DECLARES but this path cannot ship is a stated gap, not a
+            // silent one. Everything else about it was read successfully -- its kind, its declared
+            // hit params, its animation labels, its script -- so what is missing is the emission,
+            // and the log should say which object and what it is rather than leaving the stage
+            // quietly short of a thing SSF2 has.
+            .or_else(|| {
+                log::warn!(
+                    "stage object '{}' ({}) is declared by the package but not shipped: \
+                     the emission path still selects hazards by name, so it has nowhere to go",
+                    a.class_name, a.base);
+                None
             }))
         .collect()).unwrap_or_default();
     let hazards: Vec<Hazard> = if !meta_hazards.is_empty() {

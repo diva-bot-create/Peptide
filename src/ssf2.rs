@@ -686,6 +686,11 @@ fn cmd_doctor(_args: &[String]) -> Result<()> {
 /// model without emitting; `--id` overrides the output id (e.g. to avoid clashing
 /// with a built-in FM stage id). This is the SSF2->FM stage converter front end.
 fn cmd_stage(args: &[String]) -> Result<()> {
+    // The converter library logs through the `log` facade and never installs a logger, so without
+    // this every warning the stage path raises is discarded -- including the audit that says a
+    // script asks for content the package does not ship. A conversion that cannot tell you what it
+    // could not do is worth less than one that can. `-v` adds the debug detail; RUST_LOG still wins.
+    crate::convert::init_logger(args.iter().any(|a| a == "-v" || a == "--verbose"));
     let out_dir = flag_str(args, "--out").unwrap_or_else(|| "stages".to_string());
     let id_override = flag_str(args, "--id");
     let info_only = args.iter().any(|a| a == "--info");
