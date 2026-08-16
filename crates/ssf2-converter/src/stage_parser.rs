@@ -3852,11 +3852,12 @@ fn timeline_tracks(
         // stretched into that box rather than a crop of it, and turning that picture back does not
         // reproduce the source.
         //
-        // (The engine's own rule is known, and is not the obstacle: it turns an IMAGE about its
-        // stored x/y, and pivotX/pivotY does not move that centre. Measured with two identical bars
-        // at one stored position, one turned 90 degrees, read off a stage-camera shot -- rotating
-        // the reference about its top-left predicts the observed box exactly, about the pivot does
-        // not. The cheap path needs a rasteriser that can draw a shape UNROTATED at native size.)
+        // (The engine's rule is known -- it turns an IMAGE about its stored x/y, and pivotX/pivotY
+        // does not move that centre, measured with two identical bars at one stored position, one
+        // turned 90 degrees. Drawing the shape unrotated at native size and placing its corner
+        // through each frame's matrix was then tried, and is right at some angles and wrong at
+        // others, so something in that chain is still unmeasured. Keeping the per-angle rasters
+        // until it is: they are correct at every angle, which is worth more than the size.)
         let mut cel: BTreeMap<(u16, i32), StageArt> = BTreeMap::new();
         /// Degrees per rasterised step. Fine enough that a turn reads as smooth, coarse enough
         /// that a full revolution is a couple of dozen pictures instead of a few hundred -- and a
