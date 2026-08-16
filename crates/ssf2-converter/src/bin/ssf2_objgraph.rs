@@ -207,6 +207,36 @@ fn main() {
                 }
             }
         }
+        "timeline" => {
+            // How much of a placement this file actually uses: the fields beyond the matrix are
+            // the ones a converter drops silently, so count them before deciding they do not matter.
+            let data = std::fs::read(&args[1]).expect("read swf");
+            let inner = ssf2_converter::ssf::decompress(&data).expect("ssf decompress");
+            let buf = swf::decompress_swf(&inner[..]).expect("decompress");
+            let sw = swf::parse_swf(&buf).expect("parse swf");
+            let (mut total, mut faded, mut hidden, mut blended, mut ratioed) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            let mut fade_clips: Vec<(u16, usize)> = Vec::new();
+            let mut scan = |id: u16, tags: &[swf::Tag]| {
+                let mut n = 0usize;
+                for frame in ssf2_converter::swf_timeline::frames(tags) {
+                    for p in frame {
+                        total += 1;
+                        if p.alpha < 0.999 { faded += 1; n += 1; }
+                        if !p.visible { hidden += 1; }
+                        if p.blend.is_some() { blended += 1; }
+                        if p.ratio.is_some() { ratioed += 1; }
+                    }
+                }
+                if n > 0 { fade_clips.push((id, n)); }
+            };
+            scan(0, &sw.tags);
+            for t in &sw.tags {
+                if let swf::Tag::DefineSprite(sp) = t { scan(sp.id, &sp.tags); }
+            }
+            println!("placements {total}: faded {faded}, hidden {hidden}, blended {blended}, frame-pinned {ratioed}");
+            fade_clips.sort_by_key(|c| std::cmp::Reverse(c.1));
+            for (id, n) in fade_clips.iter().take(8) { println!("  sprite {id}: {n} faded placements"); }
+        }
         "orphansprites" => {
             // DefineSprite ids no timeline ever places: engine-instantiated art (a stage resource
             // the engine adds itself), which the placement walk cannot see.

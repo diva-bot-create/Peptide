@@ -19,6 +19,7 @@ pub mod ssf;
 pub mod test_fixture;
 pub mod uuid_gen;
 pub mod swf_parser;
+pub mod swf_timeline;
 pub mod abc_parser;
 pub mod decompiler;
 pub mod extractor;

@@ -1640,79 +1640,20 @@ type PlacedChild = (u16, Mat, Option<String>, Option<u16>, u16, Option<swf::Blen
 /// the stage has no parseable SSF2Stage subclass, in which case `plane_tag` falls back to heuristics.
 type PlaneMap = BTreeMap<String, crate::stage_abc::StagePlane>;
 
-/// Build a sprite/root timeline: the placed-child state snapshotted at each `ShowFrame`
-/// (Flash semantics — Place/Replace set a depth, Modify updates its matrix, Remove clears
-/// it). At least one frame.
+/// Build a sprite/root timeline in this walk's tuple form, from the SHARED timeline reader
+/// ([`crate::swf_timeline`]). The reader is what knows Flash's display-list semantics -- including
+/// the parts a placement carries beyond its matrix -- so both content types get them from one
+/// place; this only reshapes the result into the tuple the walk below threads around.
 fn build_frames(tags: &[swf::Tag]) -> Vec<Vec<PlacedChild>> {
-    let mut depth: std::collections::BTreeMap<u16, PlacedChild> = std::collections::BTreeMap::new();
-    let mat_of = |po: &swf::PlaceObject| po.matrix.as_ref().map(|m| Mat {
-        a: m.a.to_f64(), b: m.b.to_f64(), c: m.c.to_f64(), d: m.d.to_f64(),
-        tx: m.tx.get() as f64 / 20.0, ty: m.ty.get() as f64 / 20.0,
-    });
-    let name_of = |po: &swf::PlaceObject| po.name.as_ref().map(|n| n.to_str_lossy(encoding_rs::WINDOWS_1252).to_string());
-    let mut frames: Vec<Vec<PlacedChild>> = Vec::new();
-    for tag in tags {
-        match tag {
-            swf::Tag::PlaceObject(po) => match &po.action {
-                swf::PlaceObjectAction::Place(id) | swf::PlaceObjectAction::Replace(id) => {
-                    if std::env::var("PEPTIDE_STAGE_DEBUG").is_ok()
-                        && (po.clip_depth.is_some() || po.blend_mode.is_some() || po.color_transform.is_some()) {
-                        eprintln!("[place-mod] id={} depth={} clip_depth={:?} blend={:?} cxform={}",
-                            id, po.depth, po.clip_depth, po.blend_mode, po.color_transform.is_some());
-                    }
-                    // Replace (and move-style Place) without a matrix/name/ratio KEEPS the slot's
-                    // existing state and only swaps the character — bowserscastle's bubble pool
-                    // Replace()s 8 depth slots through bubble variants with mat=false; resetting
-                    // to identity stacked all 8 at the clip origin.
-                    let prev = depth.get(&po.depth);
-                    let mat = mat_of(po).or_else(|| prev.map(|e| e.1)).unwrap_or(Mat::id());
-                    let name = name_of(po).or_else(|| prev.and_then(|e| e.2.clone()));
-                    // a `ratio` on a sprite placement = a Graphic symbol pinned to the FRAME the
-                    // ratio selects (Flash's "Single Frame" setting); carried like the matrix.
-                    let pinned = po.ratio.or_else(|| prev.and_then(|e| e.3));
-                    let blend = po.blend_mode.or_else(|| prev.and_then(|e| e.5));
-                    let alpha = po.color_transform
-                        .map(|ct| {
-                            let m = f32::from(ct.a_multiply) as f64;
-                            (m + f32::from(ct.a_add) as f64 / 255.0).clamp(0.0, 1.0)
-                        })
-                        .or_else(|| prev.map(|e| e.6))
-                        .unwrap_or(1.0);
-                    let visible = po.is_visible.or_else(|| prev.map(|e| e.7)).unwrap_or(true);
-                    depth.insert(po.depth, (*id, mat, name, pinned, po.depth, blend, alpha, visible));
-                }
-                swf::PlaceObjectAction::Modify => {
-                    // A Modify carries whatever the timeline is CHANGING this frame -- and a
-                    // Flash alpha tween is exactly that: the same object, modified with a new
-                    // colour transform every frame. Reading only the matrix here dropped every
-                    // fade in the corpus (clocktown crossfades its day and night skies, and
-                    // flashes the screen white, entirely through these).
-                    if let Some(e) = depth.get_mut(&po.depth) {
-                        if let Some(m) = mat_of(po) { e.1 = m; }
-                        if let Some(n) = name_of(po) { e.2 = Some(n); }
-                        if let Some(r) = po.ratio { e.3 = Some(r); }
-                        if let Some(b) = po.blend_mode { e.5 = Some(b); }
-                        if let Some(ct) = po.color_transform {
-                            let m = f32::from(ct.a_multiply) as f64;
-                            e.6 = (m + f32::from(ct.a_add) as f64 / 255.0).clamp(0.0, 1.0);
-                        }
-                        if let Some(v) = po.is_visible { e.7 = v; }
-                    }
-                }
-            },
-            swf::Tag::RemoveObject(r) => { depth.remove(&r.depth); }
-            swf::Tag::ShowFrame => { frames.push(depth.values().cloned().collect()); }
-            _ => {}
-        }
-    }
-    if frames.is_empty() { frames.push(depth.values().cloned().collect()); }
-    frames
+    crate::swf_timeline::frames(tags).into_iter().map(|frame| {
+        frame.into_iter().map(|p| {
+            let m = Mat { a: p.matrix.a, b: p.matrix.b, c: p.matrix.c, d: p.matrix.d,
+                          tx: p.matrix.tx, ty: p.matrix.ty };
+            (p.char_id, m, p.name, p.ratio, p.depth, p.blend, p.alpha, p.visible)
+        }).collect()
+    }).collect()
 }
 
-/// Walk the placement tree at a fixed global frame (every animated sprite shows its
-/// `global_frame % len` frame — Flash advances all clips together), collecting the placed
-/// Collect the world position of every movieclip placement (for the even-desync rank map). Walks
-/// the base layout (frame 0 of each clip) since clip POSITIONS are fixed across frames.
 fn collect_clip_positions(
     children: &[PlacedChild], parent: Mat,
     sprite_frames: &BTreeMap<u16, Vec<Vec<PlacedChild>>>, out: &mut Vec<(i64, i64)>,

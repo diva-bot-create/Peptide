@@ -129,6 +129,10 @@ pub struct FrameImageEntry {
     pub depth: u16,
     pub shape_id: u16,
     pub symbol_name: String,
+    /// The opacity the SOURCE gives this placement (1.0 when it has none). Flash writes a fade,
+    /// a flash or a ghosting trail as an animated alpha on the placement, so a converter that
+    /// carries only the matrix turns every one of them into a hard cut.
+    pub alpha: f64,
     /// Local placement matrix within the sub-sprite (before root MC transform)
     pub local_matrix: ImageLocalMatrix,
     /// World-space position after applying root MC transform (pixels, SSF2 y-down).
@@ -850,46 +854,25 @@ fn build_anim_frame_images(
         let mut unnamed_frames: SpriteFrameTable = BTreeMap::new();
         for (&sid, sprite) in &all_sprites {
             if symbols.contains_key(&sid) { continue; } // skip named ones
-            let mut disp: BTreeMap<u16, (u16, String, ImageLocalMatrix)> = BTreeMap::new();
-            let mut frames: Vec<Vec<(u16, String, ImageLocalMatrix)>> = Vec::new();
-            for stag in &sprite.tags {
-                match stag {
-                    swf::Tag::ShowFrame => {
-                        frames.push(disp.values().map(|(id, sym, mat)| (*id, sym.clone(), *mat)).collect());
+            // The display list comes from the SHARED timeline reader (`swf_timeline`), which is
+            // what knows Flash's semantics -- a depth keeps its placement, a Modify updates only
+            // what it carries, hiding is not removing. This pass then keeps the part it needs: the
+            // symbol behind each placed id, minus the collision boxes, which are not art.
+            let frames: Vec<Vec<(u16, String, ImageLocalMatrix)>> = crate::swf_timeline::frames(&sprite.tags)
+                .into_iter()
+                .map(|frame| frame.into_iter().filter_map(|p| {
+                    let m = ImageLocalMatrix::from_abcd(p.matrix.a, p.matrix.b, p.matrix.c, p.matrix.d,
+                                                        p.matrix.tx, p.matrix.ty);
+                    if let Some(sname) = symbols.get(&p.char_id) {
+                        let lower = sname.to_lowercase();
+                        if lower.contains("collisonbox") || lower.contains("collisionbox") { return None; }
+                        return Some((p.char_id, sname.clone(), m));
                     }
-                    swf::Tag::PlaceObject(po) => {
-                        let local_mat = po.matrix.map(|m| {
-                            let a = m.a.to_f64(); let b = m.b.to_f64();
-                            let c = m.c.to_f64(); let d = m.d.to_f64();
-                            ImageLocalMatrix::from_abcd(a, b, c, d,
-                                m.tx.get() as f64 / 20.0, m.ty.get() as f64 / 20.0)
-                        }).unwrap_or_default();
-                        match &po.action {
-                            swf::PlaceObjectAction::Place(cid) | swf::PlaceObjectAction::Replace(cid) => {
-                                if let Some(sname) = symbols.get(cid) {
-                                    let lower = sname.to_lowercase();
-                                    if !lower.contains("collisonbox") && !lower.contains("collisionbox") {
-                                        disp.insert(po.depth, (*cid, sname.clone(), local_mat));
-                                    }
-                                } else if let Some(&bitmap_id) = shape_to_bitmap.get(cid) {
-                                    if let Some(img) = images.get(&bitmap_id) {
-                                        disp.insert(po.depth, (*cid, img.symbol_name.clone(), local_mat));
-                                    }
-                                }
-                            }
-                            swf::PlaceObjectAction::Modify => {
-                                // A MODIFY with no matrix only re-states the object —
-                                // keep its existing transform instead of resetting it.
-                                if po.matrix.is_some() {
-                                    if let Some(e) = disp.get_mut(&po.depth) { e.2 = local_mat; }
-                                }
-                            }
-                        }
-                    }
-                    swf::Tag::RemoveObject(ro) => { disp.remove(&ro.depth); }
-                    _ => {}
-                }
-            }
+                    let bitmap_id = shape_to_bitmap.get(&p.char_id)?;
+                    let img = images.get(bitmap_id)?;
+                    Some((p.char_id, img.symbol_name.clone(), m))
+                }).collect())
+                .collect();
             if !frames.is_empty() { unnamed_frames.insert(sid, frames); }
         }
 
@@ -1020,11 +1003,22 @@ fn build_anim_frame_images(
             // the ONE frame the ratio selects — Flash's "Single Frame" — never self-animating).
             let mut sub_sprite_placements: BTreeMap<u16, (u16, u16, ImageLocalMatrix, Option<u16>)> = BTreeMap::new();
             let mut frames: BTreeMap<u16, Vec<FrameImageEntry>> = BTreeMap::new();
+            // Per-frame placement state from the shared timeline reader: this loop tracks the ids
+            // and matrices it needs for its own sub-sprite expansion, but the fields BEYOND the
+            // matrix come from the one reader that knows them, rather than being tracked a second
+            // time here and drifting from it.
+            let timeline = crate::swf_timeline::frames(&sprite.tags);
+            let mut frame_idx = 0usize;
 
             for stag in &sprite.tags {
                 match stag {
                     swf::Tag::ShowFrame => {
                         let mut entries: Vec<FrameImageEntry> = Vec::new();
+                        let placed_now = timeline.get(frame_idx);
+                        let alpha_at = |depth: u16| -> f64 {
+                            placed_now.and_then(|f| f.iter().find(|p| p.depth == depth))
+                                .map(|p| p.alpha).unwrap_or(1.0)
+                        };
 
                         // Animation local origin (0,0) in world space = root_xf.apply(0,0)
                         // This is the TRUE rotation center: Flash rotates sub-sprites around (0,0).
@@ -1045,6 +1039,7 @@ fn build_anim_frame_images(
                                 depth,
                                 shape_id: *id,
                                 symbol_name: sym.clone(),
+                                alpha: alpha_at(depth),
                                 local_matrix: *mat,
                                 world_tx,
                                 world_ty,
@@ -1092,6 +1087,8 @@ fn build_anim_frame_images(
                                         depth: effect_depth,
                                         shape_id: *inner_id,
                                         symbol_name: inner_sym.clone(),
+                                        // the sub-sprite's own placement carries the fade
+                                        alpha: alpha_at(depth),
                                         local_matrix: composed,
                                         world_tx,
                                         world_ty,
@@ -1115,6 +1112,8 @@ fn build_anim_frame_images(
                             frames.insert(current_frame, entries);
                         }
                         current_frame += 1;
+                        // the shared reader's frames advance in step with this loop's ShowFrames
+                        frame_idx += 1;
                     }
                     swf::Tag::PlaceObject(po) => {
                         let inst_name = po.name.as_ref()

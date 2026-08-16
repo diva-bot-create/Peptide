@@ -1343,7 +1343,10 @@ pub fn generate_entity(
 
                             symbols.push(json!({
                                 "$id": per_placement_sym_id,
-                                "alpha": 1,
+                                // the opacity the SOURCE gives this placement: Flash animates a
+                                // fade, a flash or a ghosting trail as alpha, and emitting a flat
+                                // 1 turns all of them into hard cuts
+                                "alpha": round2(entry.map(|e| e.alpha).unwrap_or(1.0)),
                                 "imageAsset": meta_guid,
                                 "pivotX": pivot_x,
                                 "pivotY": pivot_y,
