@@ -420,6 +420,19 @@ fn enforce_one_frame_scripts(layers: &mut [Value], keyframes: &mut Vec<Value>, c
     keyframes.extend(new_blanks);
 }
 
+/// Serialize a finished entity, with its redundancy removed first.
+///
+/// Every entity goes out through here so no emitter has to remember to compact -- see
+/// [`crate::entity_compact`] for what "redundancy" means and why removing it is safe.
+fn finish_entity(mut entity: Value) -> String {
+    let st = crate::entity_compact::compact(&mut entity);
+    if st.saved_anything() {
+        log::debug!("compacted entity: symbols {} -> {}, keyframes {} -> {} ({} blanked)",
+            st.symbols_before, st.symbols_after, st.keyframes_before, st.keyframes_after, st.blanked);
+    }
+    serde_json::to_string_pretty(&entity).unwrap_or_else(|_| "{}".to_string())
+}
+
 pub fn generate_entity(
     data: &CharacterData,
     char_id: &str,
@@ -1551,7 +1564,7 @@ pub fn generate_entity(
         "version": 14
     });
 
-    serde_json::to_string_pretty(&entity).unwrap_or_else(|_| "{}".to_string())
+    finish_entity(entity)
 }
 
 /// Generate entity with paletteMap filled in
@@ -1892,7 +1905,7 @@ pub fn generate_menu_entity(
         "version": 14
     });
 
-    serde_json::to_string_pretty(&entity).unwrap_or_else(|_| "{}" .to_string())
+    finish_entity(entity)
 }
 
 // ─── Projectile entity generation ─────────────────────────────────────────────
@@ -2526,7 +2539,7 @@ pub fn generate_projectile_entity(
         "version": 14
     });
 
-    serde_json::to_string_pretty(&entity).unwrap_or_else(|_| "{}".to_string())
+    finish_entity(entity)
 }
 
 /// Compute the list of animation names a `generate_effect_entity` call would

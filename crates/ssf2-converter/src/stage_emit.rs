@@ -280,8 +280,27 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     Ok((dir, fraytools))
 }
 
+/// Write a JSON file, and if it is an entity, write it compacted.
+///
+/// A stage emits entities from a dozen places (the stage itself, each hazard, each backdrop
+/// element, each segment), so the compaction hangs off the write rather than off any one
+/// builder -- see [`crate::entity_compact`]. It only removes redundancy, so what the stage
+/// draws is unchanged.
 fn write_json(path: &Path, v: &Value) -> Result<()> {
-    std::fs::write(path, serde_json::to_string_pretty(v)?).with_context(|| format!("write {}", path.display()))
+    let text = if path.extension().and_then(|e| e.to_str()) == Some("entity") {
+        let mut entity = v.clone();
+        let st = crate::entity_compact::compact(&mut entity);
+        if st.saved_anything() {
+            log::debug!("compacted {}: symbols {} -> {}, keyframes {} -> {} ({} blanked)",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                st.symbols_before, st.symbols_after, st.keyframes_before, st.keyframes_after,
+                st.blanked);
+        }
+        serde_json::to_string_pretty(&entity)?
+    } else {
+        serde_json::to_string_pretty(v)?
+    };
+    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
 }
 
 // ─────────────────────────────── the .entity ────────────────────────────────
