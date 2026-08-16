@@ -21,6 +21,7 @@ pub mod uuid_gen;
 pub mod swf_parser;
 pub mod swf_timeline;
 pub mod entity_compact;
+pub mod ssf2_objects;
 pub mod abc_parser;
 pub mod decompiler;
 pub mod extractor;

@@ -280,6 +280,16 @@ fn main() {
             }
             println!("no weather found for stage class {stage:?}");
         }
+        // class -> superclass for every class in the package. the structural question a stage
+        // port has to answer is which classes are GAME OBJECTS, and the answer is what they
+        // extend, not what they are called.
+        "classgraph" => {
+            for ci in 0..abc.instances.len() {
+                let name = class_local(&abc, ci);
+                let sup = abc.multiname_local(abc.instances[ci].super_name).unwrap_or_default();
+                println!("  {name:<32} extends {sup}");
+            }
+        }
         "scripts" => {
             for (si, s) in abc.scripts.iter().enumerate() {
                 println!("== script #{si} init=method#{} ==", s.init);

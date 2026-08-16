@@ -544,7 +544,7 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
             Some(m) => {
                 eprintln!("[as3] doc_class={} planes={} actors={}", m.doc_class, m.planes.len(), m.actors.len());
                 for (clip, plane) in &m.planes { eprintln!("  plane {:<10?} <- {clip}", plane); }
-                for a in &m.actors { eprintln!("  actor {} @ (x={:?}, y={:?})", a.class_name, a.x, a.y); }
+                for a in &m.actors { eprintln!("  actor {} : {} @ (x={:?}, y={:?})", a.class_name, a.base, a.x, a.y); }
             }
             None => eprintln!("[as3] no SSF2Stage subclass found (heuristic fallback)"),
         }

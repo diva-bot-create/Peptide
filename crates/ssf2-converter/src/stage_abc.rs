@@ -61,6 +61,9 @@ impl StagePlane {
 #[derive(Clone, Debug)]
 pub struct SpawnedActor {
     pub class_name: String,
+    /// The api base this class extends -- `SSF2Enemy`, `SSF2Item`, `SSF2Projectile` and so on.
+    /// This is WHAT THE OBJECT IS, taken from the class graph rather than guessed from its name.
+    pub base: String,
     pub x: Option<f64>,
     pub y: Option<f64>,
     /// The hazard CLASS's own declarations (the "get()" methods the author wrote): each
@@ -119,6 +122,23 @@ pub fn extract_stage(abc: &AbcFile) -> Option<StageAbcModel> {
     if let Some(body) = method_body(abc, class, "update") {
         scan_method(&body.bytecode, abc, &mut v);
     }
+    // Every game object the package DECLARES is an object to port. The spawn-site scan above can
+    // only see an actor when the class reference and the `spawnEnemy` call are close enough for the
+    // stack sim to carry the tag between them, so it finds clocktown's TingleBalloon (three opcodes
+    // apart) and misses its ClockTownFairy (two hundred). The class graph has no such gap: it says
+    // what the package's objects ARE. The scan is kept for what only it knows -- the literal spawn
+    // coordinates at the call site.
+    let declared = crate::ssf2_objects::game_object_classes(&abc.classes);
+    for go in &declared {
+        match v.actors.iter_mut().find(|a| a.class_name == go.class_name) {
+            Some(found) => found.base = go.base.clone(),
+            None => v.actors.push(SpawnedActor {
+                class_name: go.class_name.clone(), base: go.base.clone(), x: None, y: None,
+                attack_hitboxes: Vec::new(), own_stats: Default::default(), anim_labels: Vec::new(),
+                behavior: Default::default(), reconstructed_script: None, faller: None }),
+        }
+    }
+
     // Pull each spawned hazard's OWN declarations from its class's get* methods — the authoritative
     // damage/hit params + size/speeds, parsed straight from the SSF2 source instead of guessed.
     let mut actors = v.actors;
@@ -159,7 +179,7 @@ impl AbcVisitor for StageVisitor {
             if let Some(StackVal::Tag(t)) = args.first() {
                 if let Some(class) = t.strip_prefix("lex:") {
                     let idx = self.actors.len();
-                    self.actors.push(SpawnedActor { class_name: class.to_string(), x: None, y: None,
+                    self.actors.push(SpawnedActor { class_name: class.to_string(), base: String::new(), x: None, y: None,
                         attack_hitboxes: Vec::new(), own_stats: std::collections::BTreeMap::new(), anim_labels: Vec::new(),
                         behavior: crate::abc_parser::EnemyBehavior::default(), reconstructed_script: None, faller: None });
                     return Some(StackVal::Tag(format!("actor:{idx}")));
