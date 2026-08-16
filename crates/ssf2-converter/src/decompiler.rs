@@ -517,6 +517,11 @@ fn render_condition(cond: &Expr) -> String {
 
 // ─── Opcode constants ─────────────────────────────────────────────────────────
 
+/// A chain longer than this is not a chain; the walk stops rather than looping on malformed input.
+const MAX_CHAIN_LINKS: usize = 32;
+/// Below this the existing two-term handling is already correct, and is left to do it.
+const MIN_CHAIN_TERMS: usize = 3;
+
 const OP_NOP: u8         = 0x02;
 const OP_THROW: u8       = 0x03;
 const OP_KILL: u8        = 0x08;
@@ -1418,9 +1423,28 @@ impl<'a> StructuredDecoder<'a> {
                         // (a Branch), this is AS3's short-circuit evaluation:
                         //   outer_cond && inner_cond [|| alt_cond]
                         // Collapse the whole thing into a single if-condition.
-                        let collapse = self.try_collapse_and(
-                            then_start, else_start, raw_cond.clone(), &carry_stack
-                        );
+                        // A uniform chain of any length first; the pair-shaped handling below only
+                        // knows one length and quietly reshapes anything longer.
+                        let collapse = self
+                            .try_collapse_chain(raw_cond.clone(), then_start, else_start, &carry_stack)
+                            .and_then(|(cond, consumer)| {
+                                let cb = self.block_at(consumer)?.clone();
+                                let Terminator::Branch { cond_inv, target, fallthrough } = cb.term
+                                    else { return None };
+                                // iffalse: true -> fallthrough (body); iftrue: true -> target
+                                let (body, after) = if cond_inv { (fallthrough, target) }
+                                                    else { (target, fallthrough) };
+                                // an empty body means this is not the shape it looks like; let the
+                                // ordinary path decode it rather than dropping its statements
+                                (body != after).then(|| {
+                                    self.visited.insert(then_start);
+                                    self.visited.insert(else_start);
+                                    (cond, body, Some(after))
+                                })
+                            })
+                            .or_else(|| self.try_collapse_and(
+                                then_start, else_start, raw_cond.clone(), &carry_stack
+                            ));
 
                         let saved_carry = carry_stack.clone();
                         carry_stack.clear();
@@ -1506,6 +1530,91 @@ impl<'a> StructuredDecoder<'a> {
         }
         *out_carry = carry_stack;
         result
+    }
+
+    /// The instruction immediately BEFORE a block's terminator, as (offset, opcode).
+    ///
+    /// A short-circuit link is recognised by this being a `dup`: the value is kept for the next
+    /// link to test, which is exactly what distinguishes "one term of a chain" from "the condition
+    /// this branch consumes".
+    fn op_before_term(&self, b: &Block) -> Option<(usize, u8)> {
+        let (mut pos, mut prev) = (b.start, None);
+        while pos < b.end {
+            let size = instr_size(self.bc, pos).max(1);
+            if pos + size >= b.end { break; }
+            prev = Some((pos, self.bc[pos]));
+            pos += size;
+        }
+        prev
+    }
+
+    /// Fold a short-circuit chain of ANY length into one condition.
+    ///
+    /// AS3 writes `A && B && C && D` as a chain: evaluate A, `dup` it, `iffalse` to the next link,
+    /// `pop` the spare copy, evaluate B, and so on, with the LAST link's branch being the one that
+    /// actually skips the body. A false anywhere cascades down the chain to that skip. `||` is the
+    /// same shape with `iftrue`.
+    ///
+    /// The chain has no fixed length, and assuming one is how conditions get silently rewritten:
+    /// forced into a three-term `(A && B) || C` mould, clocktown's four-term `&&` came out with the
+    /// wrong operator, one term missing, and the remainder unrecoverable -- so the block guarding
+    /// its falling rocks rendered as `if (false)`. Nothing announced it.
+    ///
+    /// Only a UNIFORM chain is folded here (all `iffalse`, or all `iftrue`). A genuinely mixed
+    /// condition compiles to a different shape and is left to the caller's other handling.
+    ///
+    /// Returns the combined condition and the block whose branch consumes it.
+    fn try_collapse_chain(&mut self, first_cond: Expr, then_start: usize, else_start: usize,
+                          _initial_stack: &[Expr]) -> Option<(Expr, usize)>
+    {
+        let mut terms = vec![first_cond];
+        let mut op: Option<&'static str> = None;
+        let (mut term_at, mut branch_at) = (then_start, else_start);
+
+        for _ in 0..MAX_CHAIN_LINKS {
+            // The next term is computed in the block BETWEEN this branch and the next: the spare
+            // copy is popped, the term evaluated, and it falls into the block that tests it.
+            let tb = self.block_at(term_at)?.clone();
+            if !matches!(tb.term, Terminator::Fall(n) if n == branch_at) { return None; }
+
+            let mut dec = BlockDecoder::new(self.bc, self.abc);
+            dec.activation_slots = self.activation_slots.clone();
+            dec.param_locals = self.param_locals.clone();
+            dec.has_activation = !dec.activation_slots.is_empty();
+            dec.stack = vec![Expr::Null]; // the `pop` of the duplicated copy consumes this
+            let term = dec.decode_range(tb.start, tb.end)
+                .or_else(|| dec.stack.last().cloned())
+                .unwrap_or(Expr::Unknown);
+            if matches!(term, Expr::Unknown) { return None; }
+            terms.push(term);
+
+            let bb = self.block_at(branch_at)?.clone();
+            let Terminator::Branch { cond_inv, target, fallthrough } = bb.term else { return None };
+
+            // `iffalse` short-circuits on false, which is `&&`; `iftrue` is `||`
+            let this_op = if cond_inv { "&&" } else { "||" };
+            match op {
+                None => op = Some(this_op),
+                Some(prev) if prev == this_op => {}
+                Some(_) => return None, // mixed: a different shape, left to other handling
+            }
+
+            match self.op_before_term(&bb) {
+                // A link's branch block is EXACTLY `dup` then the branch: the term itself was
+                // computed in the block that fell into it. A block that does anything else before
+                // the dup is not a link, and treating it as one swallows whatever it was doing.
+                Some((at, OP_DUP)) if at == bb.start => { term_at = fallthrough; branch_at = target; }
+                // consumes it: this branch is the one that skips the body
+                _ => {
+                    if terms.len() < MIN_CHAIN_TERMS { return None; }
+                    let o = op.unwrap_or("&&");
+                    let combined = terms.into_iter()
+                        .reduce(|a, b| Expr::BinOp(o, Box::new(a), Box::new(b)))?;
+                    return Some((combined, branch_at));
+                }
+            }
+        }
+        None
     }
 
     /// Find the merge point after an if/else.
