@@ -175,6 +175,31 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// Whether re-rendering this expression a second time would re-do something.
+    ///
+    /// Reading a local propagates whatever was assigned to it, which reads nicely for a constant
+    /// and is a BUG for a call: the source assigns once and uses the local, and re-rendering the
+    /// call at each use performs it again. clocktown assigns one flaming rock and then sets its x,
+    /// its y, and pushes it -- inlined, that spawns four rocks and positions three of them.
+    ///
+    /// Only side-effect-free shapes may be propagated. A property read is included: it is a read,
+    /// and keeping it inlined preserves the existing (widely relied upon) output for the ordinary
+    /// `_v1 = self.foo; ... _v1 ...` case.
+    fn is_propagatable(&self) -> bool {
+        match self {
+            Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::This
+            | Expr::Local(_) | Expr::GetLex(_) | Expr::Unknown => true,
+            Expr::GetProperty(o, _) => o.is_propagatable(),
+            Expr::UnOp(_, e) => e.is_propagatable(),
+            Expr::BinOp(_, a, b) => a.is_propagatable() && b.is_propagatable(),
+            Expr::Array(v) => v.iter().all(Expr::is_propagatable),
+            Expr::Object(v) => v.iter().all(|(_, e)| e.is_propagatable()),
+            // a call, a constructor, or a closure body: performing it twice is not the same as
+            // performing it once
+            Expr::Call(..) | Expr::New(..) | Expr::Closure(..) => false,
+        }
+    }
+
     fn render(&self) -> String {
         match self {
             Expr::Num(v) => {
@@ -853,7 +878,13 @@ struct BlockDecoder<'a> {
     activation_slots: BTreeMap<u32, String>,
     param_locals: BTreeMap<u32, String>,
     has_activation: bool,
+    /// Next synthetic register for a materialised stack value (see `OP_DUP`). Numbered far above
+    /// any real register so it cannot collide with the method's own locals.
+    next_temp: u32,
 }
+
+/// Where synthetic registers start. AS3 methods do not come close to this many locals.
+const TEMP_REG_BASE: u32 = 9000;
 
 impl<'a> BlockDecoder<'a> {
     fn new(bc: &'a [u8], abc: &'a AbcFile) -> Self {
@@ -861,7 +892,7 @@ impl<'a> BlockDecoder<'a> {
         locals.insert(0, Some(Expr::This));
         Self { bc, abc, stack: Vec::new(), stmts: Vec::new(), locals,
                activation_slots: BTreeMap::new(), param_locals: BTreeMap::new(),
-               has_activation: false }
+               has_activation: false, next_temp: TEMP_REG_BASE }
     }
 
     fn pop(&mut self) -> Expr {
@@ -894,7 +925,12 @@ impl<'a> BlockDecoder<'a> {
         if let Some(name) = self.param_locals.get(&n) {
             return Expr::GetLex(name.clone());
         }
-        self.locals.get(&n).and_then(|v| v.clone()).unwrap_or(Expr::Local(n))
+        // Propagate the assigned value only when doing so cannot repeat an effect; otherwise
+        // read the variable the assignment already wrote (see `Expr::is_propagatable`).
+        match self.locals.get(&n).and_then(|v| v.clone()) {
+            Some(v) if v.is_propagatable() => v,
+            _ => Expr::Local(n),
+        }
     }
 
     fn set_local(&mut self, n: u32, v: Expr) {
@@ -1166,11 +1202,28 @@ impl<'a> BlockDecoder<'a> {
                 }
                 OP_DUP  => {
                     let top = self.stack.last().cloned().unwrap_or(Expr::Unknown);
-                    // Peek ahead: if next op is a branch (iftrue/iffalse),
-                    // the dup is for the "pop the remaining copy in the other branch" pattern.
-                    // We'll push normally; the branch handler pops one copy.
-                    // The other copy stays and will be drained or picked up by next block.
-                    self.stack.push(top);
+                    // `dup` copies a stack SLOT, not the work that produced it. Copying the
+                    // expression is fine while it only reads, and wrong the moment it does
+                    // something: `_v6 = spawn(); _v6.setX(...)` compiles to a call, a dup, a store
+                    // and a use, so duplicating the call expression spawns the thing twice.
+                    // Materialise it once and let both copies refer to that.
+                    // ...but ONLY for the assign-then-use shape, where the very next thing is a
+                    // store. `dup` also serves the "test it, and the other branch pops the spare
+                    // copy" pattern, and there the copies are consumed by branch handling that
+                    // never sees a statement list of ours -- materialising into it drops the
+                    // assignment on the floor and leaves reads of a variable nobody wrote.
+                    let next_is_store = matches!(self.bc.get(pos),
+                        Some(&OP_SETLOCAL) | Some(&0xD4) | Some(&0xD5) | Some(&0xD6) | Some(&0xD7));
+                    if top.is_propagatable() || !next_is_store {
+                        self.stack.push(top);
+                    } else {
+                        let tmp = self.next_temp;
+                        self.next_temp += 1;
+                        self.stmts.push(Stmt::VarDecl(tmp, top));
+                        let last = self.stack.len() - 1;
+                        self.stack[last] = Expr::Local(tmp);
+                        self.stack.push(Expr::Local(tmp));
+                    }
                 }
                 OP_SWAP => { let len = self.stack.len(); if len >= 2 { self.stack.swap(len-1, len-2); } }
 
@@ -2143,6 +2196,31 @@ mod make_if_tests {
         let setup = Stmt::VarDecl(0, Expr::This);
         assert_eq!(render_stmts(std::slice::from_ref(&setup), 0), "", "this=this not dropped");
         assert_eq!(render_local_decls(std::slice::from_ref(&setup), 0, 1), "", "this=this got a decl");
+    }
+
+    /// A call assigned to a local is READ back, not performed again.
+    ///
+    /// clocktown assigns one flaming rock and then sets its x, its y, and pushes it. Propagating
+    /// the call to each of those spawns four rocks.
+    #[test]
+    fn an_effectful_value_is_not_propagated() {
+        let call = Expr::Call(Box::new(Expr::GetLex("match".into())), "spawnEnemy".into(),
+                              vec![Expr::GetLex("Rock".into())]);
+        assert!(!call.is_propagatable(), "a call must not be inlined at each read");
+        let ctor = Expr::New("Point".into(), vec![]);
+        assert!(!ctor.is_propagatable(), "a constructor must not be inlined at each read");
+    }
+
+    /// Values that only READ still propagate, which is what keeps ordinary output readable.
+    #[test]
+    fn pure_values_still_propagate() {
+        assert!(Expr::Num(3.0).is_propagatable());
+        assert!(Expr::GetProperty(Box::new(Expr::This), "m_x".into()).is_propagatable());
+        assert!(Expr::BinOp("+", Box::new(Expr::Num(1.0)), Box::new(Expr::Num(2.0))).is_propagatable());
+        // ...but not once something effectful is nested inside one
+        let impure = Expr::BinOp("+", Box::new(Expr::Num(1.0)),
+            Box::new(Expr::Call(Box::new(Expr::This), "f".into(), vec![])));
+        assert!(!impure.is_propagatable(), "an effect nested in an expression still counts");
     }
 
     #[test]
