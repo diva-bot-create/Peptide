@@ -264,6 +264,11 @@ impl Expr {
                 // setYSpeed needs no wrap: there is no facing on the vertical axis.
                 match method.as_str() {
                     "setXSpeed" | "setYSpeed" => {
+                        // SSF2's second argument says which SPACE the speed is in, and it is the
+                        // whole question for direction: `false` means facing-relative, which is
+                        // what Fraymakers speaks natively. Read it BEFORE dropping it -- FM's call
+                        // takes one argument, so the flag cannot be passed on, only obeyed.
+                        let ssf2_relative = matches!(args.get(1), Some(Expr::Bool(false)));
                         rendered.truncate(1);
                         // RESCALE the value: a speed written into a move is a per-frame distance,
                         // and neither the frame nor the distance means the same thing on the other
@@ -286,15 +291,21 @@ impl Expr {
                         // Zero needs no orientation: a stop is a stop whichever way you face,
                         // and wrapping it only makes the emitted script harder to read.
                         let is_zero = args.first().and_then(literal_value).is_some_and(|v| v == 0.0);
-                        // A speed the ENGINE handed back is ALREADY facing-relative -- that is the
-                        // space Fraymakers reports it in -- so flipping it converts a second time.
-                        // Facing right the flip is identity and nothing shows; facing left it
-                        // negates, and a move that reads its own speed to decay it
-                        // (`setXSpeed(getXSpeed() * 0.6)`) reverses instead, every frame it runs.
-                        // Same exemption the rescale above already makes, for the same reason: the
-                        // value is not in SSF2's world any more, so it needs no conversion out of
-                        // it.
-                        if method == "setXSpeed" && !is_zero && !reads_engine_speed(&rendered[0]) {
+                        // The wrap converts WORLD-space into facing-relative, so it belongs only
+                        // on a value that is in world space. Two kinds are not:
+                        //
+                        //   * a call the source marked relative (`setXSpeed(17, false)`) -- SSF2's
+                        //     own flag saying this speed is already forward-relative. sandbag's
+                        //     dash attack is written that way, and flipping it sent the dash
+                        //     backwards every time he faced left.
+                        //   * a speed the ENGINE handed back, which is reported facing-relative --
+                        //     so a move that decays its own speed (`getXSpeed() * 0.6`) reversed
+                        //     on every frame the script ran.
+                        //
+                        // Facing right the flip is the identity, which is why neither showed up
+                        // until someone turned around.
+                        if method == "setXSpeed" && !is_zero && !ssf2_relative
+                            && !reads_engine_speed(&rendered[0]) {
                             rendered[0] = format!("self.flipX({})", rendered[0]);
                         }
                     }
