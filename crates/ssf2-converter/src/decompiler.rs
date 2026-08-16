@@ -286,7 +286,15 @@ impl Expr {
                         // Zero needs no orientation: a stop is a stop whichever way you face,
                         // and wrapping it only makes the emitted script harder to read.
                         let is_zero = args.first().and_then(literal_value).is_some_and(|v| v == 0.0);
-                        if method == "setXSpeed" && !is_zero {
+                        // A speed the ENGINE handed back is ALREADY facing-relative -- that is the
+                        // space Fraymakers reports it in -- so flipping it converts a second time.
+                        // Facing right the flip is identity and nothing shows; facing left it
+                        // negates, and a move that reads its own speed to decay it
+                        // (`setXSpeed(getXSpeed() * 0.6)`) reverses instead, every frame it runs.
+                        // Same exemption the rescale above already makes, for the same reason: the
+                        // value is not in SSF2's world any more, so it needs no conversion out of
+                        // it.
+                        if method == "setXSpeed" && !is_zero && !reads_engine_speed(&rendered[0]) {
                             rendered[0] = format!("self.flipX({})", rendered[0]);
                         }
                     }
@@ -1550,6 +1558,20 @@ impl<'a> StructuredDecoder<'a> {
         prev
     }
 
+    /// Whether everything between `from` and `to` is a type coercion (so: computes nothing).
+    fn only_coercions_before(&self, from: usize, to: usize) -> bool {
+        let mut pos = from;
+        while pos < to {
+            match self.bc[pos] {
+                OP_COERCE_A | OP_COERCE_B | OP_COERCE_I | OP_COERCE_D | OP_COERCE_S
+                | OP_COERCE_U | OP_COERCE_O | OP_CONVERT_B | OP_CONVERT_O | OP_COERCE => {}
+                _ => return false,
+            }
+            pos += instr_size(self.bc, pos).max(1);
+        }
+        true
+    }
+
     /// Fold a short-circuit chain of ANY length into one condition.
     ///
     /// AS3 writes `A && B && C && D` as a chain: evaluate A, `dup` it, `iffalse` to the next link,
@@ -1607,10 +1629,14 @@ impl<'a> StructuredDecoder<'a> {
             }
 
             match self.op_before_term(&bb) {
-                // A link's branch block is EXACTLY `dup` then the branch: the term itself was
-                // computed in the block that fell into it. A block that does anything else before
-                // the dup is not a link, and treating it as one swallows whatever it was doing.
-                Some((at, OP_DUP)) if at == bb.start => { term_at = fallthrough; branch_at = target; }
+                // A link's branch block holds the `dup`, the branch, and nothing that COMPUTES
+                // anything -- the term itself was worked out in the block that fell into this one.
+                // Type coercions are allowed because they are exactly that: `coerce_a`/`convert_b`
+                // between a term and its test are how AS3 types the value, and refusing them left
+                // clocktown's tingle spawn behind a dead condition. Anything else means the block
+                // is doing work, and treating it as a link swallows that work.
+                Some((at, OP_DUP)) if self.only_coercions_before(bb.start, at) =>
+                    { term_at = fallthrough; branch_at = target; }
                 // consumes it: this branch is the one that skips the body
                 _ => {
                     if terms.len() < MIN_CHAIN_TERMS { return None; }
