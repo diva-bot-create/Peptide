@@ -2956,7 +2956,6 @@ fn bg_element_origin(layer: &BgLayerRef) -> (f64, f64) {
 }
 
 fn bg_element_entity(eid: &str, layer: &BgLayerRef, scale: f64) -> Value {
-    let alpha = layer.plane.alpha();
     // Art is element-LOCAL: the stage offset is hoisted onto the vfx itself (VfxStats x/y)
     // instead of being baked into every symbol. Baking it in meant every element sat at the
     // world origin with its picture drawn far away — so it had no position to read, none to
@@ -2970,7 +2969,10 @@ fn bg_element_entity(eid: &str, layer: &BgLayerRef, scale: f64) -> Value {
         // the frame's own orientation composes with the stage scale: an element emitted as cels
         // plus placements carries its turn here instead of in its pixels
         "scaleX": scale * f.scale_x, "scaleY": scale * f.scale_y, "rotation": f.rotation,
-        "alpha": alpha, "pluginMetadata": {}
+        // the frame's OWN opacity: a tint sheet whose strength follows the time of day, or a
+        // glow that pulses, is animated by alpha in the source, and a fixed value for the whole
+        // plane paints it over the stage at full strength for the whole match
+        "alpha": f.alpha, "pluginMetadata": {}
     })).collect();
     let mut keyframes: Vec<Value> = layer.frames.iter().enumerate().map(|(j, f)| json!({
         "$id": g(&format!("kf{j}")), "symbol": g(&format!("sym{j}")), "length": f.hold.max(1),

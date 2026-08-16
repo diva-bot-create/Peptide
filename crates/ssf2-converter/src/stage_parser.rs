@@ -1837,6 +1837,34 @@ fn walk_frame(
 /// mask is greyscale, which is what decides whether HardLight can be reproduced by ALPHA LAYERS
 /// instead of baked: the black/white decomposition needs one alpha per pixel, so it is exact for a
 /// greyscale mask and cannot express a mask whose channels disagree.
+/// Grow a cel symmetrically so that `(rx, ry)` -- the point inside it the source turns it about --
+/// becomes the middle of the raster. Returns the new cel and that point's position in it.
+fn centre_cel_on(art: StageArt, rx: f64, ry: f64) -> (StageArt, (f64, f64)) {
+    let (w, h) = (art.w as f64, art.h as f64);
+    // how much must be added on each side to put (rx, ry) in the middle
+    let (left, right) = ((w - 2.0 * rx).max(0.0), (2.0 * rx - w).max(0.0));
+    let (top, bottom) = ((h - 2.0 * ry).max(0.0), (2.0 * ry - h).max(0.0));
+    let (nw, nh) = (w + left + right, h + top + bottom);
+    // a turning point far outside the art would grow the raster without bound
+    if nw > 4096.0 || nh > 4096.0 || (left + right + top + bottom) < 0.5 {
+        return (art, (rx, ry));
+    }
+    let Ok(img) = image::load_from_memory(&art.png) else { return (art, (rx, ry)) };
+    let src = img.to_rgba8();
+    let mut canvas = image::RgbaImage::new(nw.round() as u32, nh.round() as u32);
+    image::imageops::replace(&mut canvas, &src, left.round() as i64, top.round() as i64);
+    let mut png = Vec::new();
+    {
+        use image::ImageEncoder;
+        if image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(canvas.as_raw(), canvas.width(), canvas.height(), image::ExtendedColorType::Rgba8).is_err() {
+            return (art, (rx, ry));
+        }
+    }
+    let (nw, nh) = (canvas.width(), canvas.height());
+    (StageArt { png, w: nw, h: nh, ..art }, (nw as f64 / 2.0, nh as f64 / 2.0))
+}
+
 /// Pad every frame of an element to one canvas size, keeping each frame's content CENTRED.
 ///
 /// A frame drawn as its own crop carries its position in `x`/`y`; growing the canvas around the
@@ -2649,7 +2677,14 @@ fn render_art_layers(
     // Blended placements are no longer a reason to keep the plane composited: they are baked into
     // the art beneath instead of shipped as a layer (see `bake_hardlight`), so nothing here needs
     // a shared canvas any more and every unblended element can have its own clock.
-    let foreground_elements = group_bg_layers(&fg_member, false);
+    // The in-front plane is ported as the source's TIMELINE too, for the same reason the camera
+    // background is: its objects are moved and FADED, and an element flattened per frame loses the
+    // fade. Clocktown's ambient-lighting sheet is a screen-sized tint whose opacity follows the
+    // time of day -- drawn at a fixed strength it washes out the whole stage.
+    let foreground_elements = {
+        let tracks = timeline_tracks(&sampled, &fg_member, ox, oy, scale, shape_defs, bitmaps);
+        if tracks.is_empty() { group_bg_layers(&fg_member, false) } else { tracks }
+    };
     let foreground = if foreground_elements.is_empty() { foreground_composite } else { Vec::new() };
     // when the backdrop carries `_cambg` parallax layers, each backdrop/cambg LAYER (grouped
     // by symbol) becomes its own camera-relative plane with its own auto-derived pan rate (so
@@ -3842,45 +3877,60 @@ fn timeline_tracks(
             let r = crate::fm_placement::normalise_degrees(i.place.rotation);
             (r % 90.0).min(90.0 - (r % 90.0))
         };
-        // per shape: its raster, the rotation that raster already carries, the placement it was
-        // rasterised under, and that placement's bounding box (what the raster is a crop of)
-        let mut cel: BTreeMap<u16, (StageArt, f64, crate::fm_placement::WorldPlacement, (f64, f64, f64, f64))> = BTreeMap::new();
+        // How big the piece is drawn in a frame. The cel comes from the frame where it is BIGGEST
+        // (and, among those, squarest): every other frame then scales it DOWN, which is both
+        // sharper and safe. Taking the squarest frame alone could land on one where the piece is
+        // small -- clocktown's clock is drawn tiny in part of its cycle -- and then the frames
+        // where it is full size scale up from that, which is where a clock suddenly ten times its
+        // size comes from.
+        let drawn_size = |i: &Instance| (i.place.sx.abs() * i.place.sy.abs()).max(1e-9);
+        // per shape: its raster (centred on the point it turns about), the rotation that raster
+        // already carries, the placement it was rasterised under, and where that turning point
+        // sits inside the raster
+        let mut cel: BTreeMap<u16, (StageArt, f64, crate::fm_placement::WorldPlacement, (f64, f64))> = BTreeMap::new();
         for sid in shapes {
-            let Some(best) = shown.iter().copied().filter(|i| i.shape_id == sid)
+            let candidates: Vec<&Instance> = shown.iter().copied().filter(|i| i.shape_id == sid).collect();
+            let biggest = candidates.iter().map(|i| drawn_size(i)).fold(0.0_f64, f64::max);
+            let Some(best) = candidates.into_iter()
+                // within a hair of the biggest, prefer the squarest
+                .filter(|i| drawn_size(i) >= biggest * 0.98)
                 .min_by(|a, b| squareness(a).partial_cmp(&squareness(b)).unwrap_or(std::cmp::Ordering::Equal))
             else { continue };
             let Some(art) = composite_layer(&[best], shape_defs, bitmaps, ox, oy, None) else { continue };
-            cel.insert(sid, (art, crate::fm_placement::normalise_degrees(best.place.rotation), best.place,
-                             (best.aabb.left(), best.aabb.top(), best.aabb.w, best.aabb.h)));
+            // Grow the cel symmetrically about the point the source TURNS it about, so that point
+            // is the middle of the raster. Then it does not matter whether the engine turns an
+            // image about its centre or about a pivot offset -- both are the same point -- and a
+            // ring that turns about the clock stays on the clock either way. Measuring that
+            // convention takes a rendered probe; not depending on it takes a few pixels.
+            let (art, reg) = centre_cel_on(art, best.place.tx - best.aabb.left(),
+                                                best.place.ty - best.aabb.top());
+            cel.insert(sid, (art, crate::fm_placement::normalise_degrees(best.place.rotation), best.place, reg));
         }
         if cel.is_empty() { continue; }
 
         let anchor = shown[0];
         let frames: Vec<StageArt> = per_frame.into_iter().map(|slot| match slot.and_then(|i| cel.get(&i.shape_id).map(|c| (i, c))) {
-            Some((i, (art, base_rot, base_place, base_aabb))) => {
-                // Re-place the cel by the DELTA between the frame it was rasterised in and this
-                // one. The cel is the shape as `base_place` drew it, cropped to that frame's box,
-                // so the transform to apply is `place ∘ base_place⁻¹`: turn it by the difference,
-                // scale it by the ratio, and send its corner where that transform sends it. Its
-                // corner is what FrayTools turns an IMAGE about with a zero pivot, which is the
-                // same thing the character path does with a limb.
-                //
-                // Following bounding-box centres instead only holds when a piece turns about the
-                // middle of its own box; the clock's rings turn about the clock, and came apart.
-                let corner = base_place.unapply(base_aabb.0, base_aabb.1)
-                    .map(|(sx_, sy_)| i.place.apply(sx_, sy_))
-                    .unwrap_or((i.aabb.left(), i.aabb.top()));
+            Some((i, (art, base_rot, base_place, reg))) => {
+                // The raster is centred on the point the source turns the piece about, so this
+                // frame just puts that centre where the frame's own placement puts it. Rotation
+                // and scale then apply about the middle of the image, which is the same point.
                 let base_scale = (base_place.sx.abs().max(1e-6), base_place.sy.abs().max(1e-6));
+                // the cel is the piece at its biggest, so every frame scales it DOWN; a ratio above
+                // one means the placement was misread, and drawing it would be the piece suddenly
+                // growing several times its size.
+                let sx_ratio = (i.place.sx.abs() / base_scale.0).min(1.0);
+                let sy_ratio = (i.place.sy.abs() / base_scale.1).min(1.0);
+                let (cw, ch) = (art.w as f64 * sx_ratio * scale, art.h as f64 * sy_ratio * scale);
                 StageArt {
                     png: art.png.clone(),
-                    x: (corner.0 - ox) * scale,
-                    y: (corner.1 - oy) * scale,
+                    x: (i.place.tx - ox) * scale - cw / 2.0,
+                    y: (i.place.ty - oy) * scale - ch / 2.0,
                     w: art.w, h: art.h, hold: 1,
                     rotation: crate::fm_placement::normalise_degrees(i.place.rotation - base_rot),
-                    scale_x: i.place.sx.abs() / base_scale.0,
-                    scale_y: i.place.sy.abs() / base_scale.1,
+                    scale_x: sx_ratio,
+                    scale_y: sy_ratio,
                     alpha: i.alpha,
-                    pivot: (0.0, 0.0),
+                    pivot: *reg,
                 }
             }
             // not shown this frame: the object is still there, just invisible
