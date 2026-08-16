@@ -1013,7 +1013,6 @@
     { "category": "no_equivalent", "name": "setFinalSmashMeterCharge", "note": "Final Smash meter setter — no FM Final Smash" },
     { "category": "no_equivalent", "name": "setLastUsed", "note": "set frames-since-attack-used — no FM analog" },
     { "category": "no_equivalent", "name": "shootOutOpponent", "note": "Kirby inhale spit-out — Kirby mechanic, no FM analog" },
-    { "category": "no_equivalent", "name": "spawnEnemy", "note": "SSF2 Enemy spawn; no FM Enemy type." },
     { "category": "no_equivalent", "name": "toToss", "note": "item-toss state — no FM item system" },
     { "category": "mapped", "name": "updateEnemyStats", "note": "SSF2Enemy.updateEnemyStats(obj) -> FM updateGameObjectStats(obj) (see replacements). object fields carry; SSF2-only flags dropped on touch-up." },
     { "category": "no_equivalent", "name": "updateItemStats", "note": "SSF2Item.updateItemStats(obj); no FM item system. ssf2_only." },

@@ -280,6 +280,22 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     }
     spawns.push_str(&bg_spawns);
     let (weather_spawn, weather_frame) = emit_weather(model, &lib)?;
+    // The stage class's OWN code, alongside the generated script rather than instead of it.
+    //
+    // This is the thing that should eventually BE the stage script: SSF2 puts the cadence there --
+    // when a thwomp drops and onto which column, when the clock turns over, when it rains -- and
+    // the generated script can only spawn everything once and hope. It is written out for reading
+    // and not yet wired, because the reconstruction still loses conditions it cannot recover, and
+    // a stage whose hazards never fire is worse than a stage that spawns them bluntly.
+    //
+    // The spawns in it ARE converted now: SSF2 hands the engine a class, Fraymakers takes content,
+    // and the package ships each of those classes as content, so the call has an exact equivalent.
+    if let Some(src) = model.stage_script.as_ref() {
+        let converted = crate::api_mappings::rewrite_spawn_enemy_calls(
+            src, &|class: &str| format!("{id}{class}"));
+        write_script(&scripts.join(format!("{id}StageSource.hx.txt")), &format!(
+            "// {id}: the SSF2 stage class, decompiled and translated.\n             // Reference, not yet loaded -- see stage_emit for what is still missing.\n\n{converted}"))?;
+    }
     write_script(&scripts.join(format!("{id}Script.hx")),
                  &script_hx(id, animated, &spawns, (&weather_spawn, &weather_frame)))?;
     write_meta(&scripts.join(format!("{id}Script.hx.meta")), id, &format!("{id}Script"), "", Some("STAGE"), None)?;

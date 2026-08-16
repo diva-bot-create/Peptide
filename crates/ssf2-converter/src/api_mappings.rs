@@ -749,6 +749,31 @@ _proj.setX(self.getX() + self.flipX({})); _proj.setY(self.getY() + ({})); _proj;
     .into_owned()
 }
 
+/// `spawnEnemy(SomeClass)` -> `match.createCustomGameObject(getContent("<id>SomeClass"), null)`.
+///
+/// SSF2 spawns a stage's objects by handing the engine a CLASS; Fraymakers spawns one by handing
+/// `match` a piece of CONTENT. Those are the same act with different currency, and the converter
+/// already ships each of those classes as content -- so the call has an exact equivalent and used
+/// to be marked as having none. While it was, every spawn a stage's own code performs was
+/// commented out, which is why a reconstructed stage was inert: it kept its timers, its random
+/// rolls and its coordinates, and dropped the line that makes the thing exist.
+///
+/// `content_id` maps the SSF2 class name to the emitted content id, since only the caller knows
+/// what the package ended up calling it.
+pub fn rewrite_spawn_enemy_calls(code: &str, content_id: &dyn Fn(&str) -> String) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // the whole receiver chain goes with it: `match.`/`self.` before spawnEnemy would
+        // otherwise be left dangling in front of the replacement.
+        regex::Regex::new(r"(?:[A-Za-z_]\w*(?:\([^()]*\))?\.)*spawnEnemy\(\s*([A-Za-z_]\w*)\s*\)")
+            .expect("spawnEnemy regex")
+    });
+    re.replace_all(code, |caps: &regex::Captures| {
+        format!("match.createCustomGameObject(self.getResource().getContent(\"{}\"), null)",
+            content_id(&caps[1]))
+    }).into_owned()
+}
+
 pub fn rewrite_play_sound_calls(code: &str) -> String {
     const NEEDLE: &str = "playSound(";
     let bytes = code.as_bytes();

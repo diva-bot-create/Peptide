@@ -234,6 +234,10 @@ pub struct StageModel {
     /// Content id (from `Main.id`, fallback file stem). The emitter may suffix this
     /// (`<id>ssf2`) so it can't shadow a built-in stage; `display_name` stays clean.
     pub id: String,
+    /// The stage class's own behaviour, decompiled and translated. Carried to the emitter rather
+    /// than used here, because turning a spawn into content needs the FINAL id -- which is only
+    /// settled after parsing (the `ssf2` suffix).
+    pub stage_script: Option<String>,
     /// Human display name for the stage-select screen (override map, else the SSF2 id
     /// title-cased).
     pub display_name: String,
@@ -1188,7 +1192,8 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
                    w.count, w.art.w, w.art.h, w.width, w.height);
     }
 
-    let mut model = StageModel { id, display_name, series, ssf2_music, fm_music, platforms, death_box, camera_box, entrances, respawns, ledges, hazards, sink_columns, platform_behavior, art, warnings, scale, weather, hazard_gate };
+    let stage_script = abc_model.as_ref().and_then(|m| m.reconstructed_script.clone());
+    let mut model = StageModel { id, display_name, series, ssf2_music, fm_music, platforms, death_box, camera_box, entrances, respawns, ledges, hazards, sink_columns, platform_behavior, art, warnings, scale, weather, hazard_gate, stage_script };
     extend_art_to_death_bounds(&mut model);
     Ok(model)
 }
