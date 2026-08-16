@@ -548,7 +548,8 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
                     eprintln!("  actor {} : {} @ (x={:?}, y={:?})", a.class_name, a.base, a.x, a.y);
                     eprintln!("      hitboxes={} own_stats={:?} anims={:?} faller={} script={}",
                         a.attack_hitboxes.len(), a.own_stats, a.anim_labels,
-                        a.faller.is_some(), a.reconstructed_script.is_some());
+                        a.faller.as_ref().map(|f| format!("{f:?}")).unwrap_or("none".into()),
+                        a.reconstructed_script.is_some());
                     eprintln!("      behavior={:?}", a.behavior);
                 }
             }
@@ -878,11 +879,13 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
                 apply_enemy_stats(&mut h, a); // adopt the real declared hit params + animation labels
                 Some(h)
             })
-            // An object the package DECLARES but this path cannot ship is a stated gap, not a
-            // silent one. Everything else about it was read successfully -- its kind, its declared
-            // hit params, its animation labels, its script -- so what is missing is the emission,
-            // and the log should say which object and what it is rather than leaving the stage
-            // quietly short of a thing SSF2 has.
+            // Neither branch above could place it, so build it from what the class DECLARES.
+            // Those two both start from the old keyword taxonomy, which answers "which hazards do
+            // we recognise" rather than "what does this package contain" -- so an object it has no
+            // word for gets nothing, however completely the class was read. This path has no
+            // vocabulary to miss: size, hit params, animations and script all come from the class.
+            .or_else(|| object_from_declarations(a, scale, death_box.as_ref()))
+            // Still nothing: a stated gap, not a silent one.
             .or_else(|| {
                 if a.base == crate::ssf2_objects::ITEM_BASE {
                     log::warn!(
@@ -920,11 +923,13 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
                     .and_then(|(_, dh)| dh.art.clone());
             }
             h
-        }).filter(|h| h.motion != "static" || match &bound {
-            // a MOVING hazard repositions itself at runtime (a Thwomp drops onto random columns; a
-            // HyruleTornado sweeps across; a saw circles), so its frame-0 parked position is not
-            // where it operates and must NOT gate it. Only a statically-placed hazard (lava sheet)
-            // is reachability-checked, so a phantom off-screen static clip still doesn't ship.
+        }).filter(|h| h.reconstructed_script.is_some() || h.motion != "static" || match &bound {
+            // An object that positions ITSELF is never judged on where it was parked: a Thwomp
+            // drops onto random columns, a HyruleTornado sweeps across, a rock falls from off
+            // screen, and none of them operate where the converter left them. The question is
+            // whether the object has code that moves it -- which the class answers -- not which
+            // motion category it was sorted into. Only a genuinely placed object (a lava sheet) is
+            // reachability-checked, so a phantom off-screen clip still does not ship.
             Some(b) => h.x >= b.x - 60.0 && h.x <= b.x + b.w + 60.0
                     && h.y >= b.y - 60.0 && h.y <= b.y + b.h + 60.0,
             None => true,
@@ -1557,6 +1562,46 @@ fn actor_to_hazard(
         x, y, w, h, damage, knockback, angle,
         interval: 0, active: 20, motion: motion.to_string(),
         range: 0.0, period: 120, rehit, kb_growth, label: kind.label().to_string(), art: None, anims: vec![], attack_boxes: vec![], hitbox_dirs: vec![], anim_labels: vec![], faller: None, behavior: crate::abc_parser::EnemyBehavior::default(), reconstructed_script: None, class_name: None, max_y_speed: None,
+    };
+    apply_enemy_stats(&mut hz, actor);
+    Some(hz)
+}
+
+/// Build a stage object out of what its class DECLARES, with no taxonomy in the way.
+///
+/// The older path asks "is this one of the hazards we have a word for", which is the wrong
+/// question twice over: it cannot see an object nobody named, and the word it matches carries a
+/// bundle of assumed stats that the class has already stated for itself. Here the class is the
+/// only source -- `getOwnStats` gives the body, `getAttackStats` gives the hit (or gives nothing,
+/// and then the object simply does not hurt anyone, which is how SSF2 says harmless), the
+/// `forceAttack` labels name the art, and the reconstructed script is the behaviour.
+///
+/// Position is deliberately NOT invented. An object whose class sets no literal coordinates is
+/// placed by its own code at runtime, so it is parked above the death boundary until that code
+/// runs -- out of the match rather than at the world origin, where a hitbox would sit on top of
+/// the spawn points.
+fn object_from_declarations(
+    actor: &crate::stage_abc::SpawnedActor, scale: f64, death_box: Option<&Rect>,
+) -> Option<Hazard> {
+    if actor.base == crate::ssf2_objects::ITEM_BASE { return None; }
+    // a body it declares no size for is not something this can place
+    let (w, h) = (
+        actor.own_stats.get("width").copied().unwrap_or(0.0) * scale,
+        actor.own_stats.get("height").copied().unwrap_or(0.0) * scale,
+    );
+    if !(w > 0.0 && h > 0.0) { return None; }
+    // parked above the death boundary: its script moves it when it enters
+    let park_y = death_box.map(|b| b.y - h * 2.0).unwrap_or(-h * 4.0);
+    let mut hz = Hazard {
+        x: 0.0, y: park_y, w, h,
+        // no declared hit is not a missing value; it is the class saying this object is harmless
+        damage: 0.0, knockback: 0.0, angle: 0.0,
+        interval: 0, active: 20, motion: "static".to_string(),
+        range: 0.0, period: 120, rehit: 30, kb_growth: 0.0,
+        label: actor.class_name.clone(),
+        art: None, anims: vec![], attack_boxes: vec![], hitbox_dirs: vec![], anim_labels: vec![],
+        faller: None, behavior: crate::abc_parser::EnemyBehavior::default(),
+        reconstructed_script: None, class_name: None, max_y_speed: None,
     };
     apply_enemy_stats(&mut hz, actor);
     Some(hz)
