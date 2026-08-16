@@ -886,75 +886,57 @@ fn build_anim_frame_images(
                 // this block handles the remaining non-anim effect/trail sprites.
                 if anim_by_sprite.contains_key(&sprite.id) { continue; }
 
-                let mut disp: BTreeMap<u16, (u16, String, ImageLocalMatrix)> = BTreeMap::new();
-                // depth → (unnamed_sprite_id, place_parent_mat, frame_started, graphic_frame)
-                // graphic_frame = the placement's ratio (a Graphic-symbol placement: it shows the
-                // ONE frame the ratio selects — Flash's "Single Frame" — and never self-animates).
-                let mut unnamed_placements: BTreeMap<u16, (u16, ImageLocalMatrix, u16, Option<u16>)> = BTreeMap::new();
-                let mut cur_frame: u16 = 0;
+                // Placements from the SHARED timeline reader; this pass only decides what each
+                // one MEANS here (direct art, a bitmap-backed shape, or an unnamed sub-sprite to
+                // expand), which is the content-specific half.
+                let timeline = crate::swf_timeline::frames(&sprite.tags);
+                // depth → (char_id, the frame it first appeared on). An unnamed sub-sprite plays
+                // from where it was placed, so its inner frame is (now - then) unless a ratio pins
+                // it to one (Flash's "Single Frame").
+                let mut placed_on: BTreeMap<u16, (u16, u16)> = BTreeMap::new();
                 let mut effect_frames: Vec<Vec<(u16, String, ImageLocalMatrix)>> = Vec::new();
 
-                for stag in &sprite.tags {
-                    match stag {
-                        swf::Tag::ShowFrame => {
-                            let mut snap: Vec<(u16, String, ImageLocalMatrix)> = disp.values()
-                                .map(|(id, sym, mat)| (*id, sym.clone(), *mat)).collect();
-                            // Expand unnamed sub-sprites: pick their frame at (cur_frame - place_frame)
-                            for (&_depth, (unnamed_id, parent_mat, place_frame, pinned)) in &unnamed_placements {
-                                if let Some(uframes) = unnamed_frames.get(unnamed_id) {
-                                    // a graphic-pinned placement shows the ratio-selected frame, always.
-                                    let uf_idx = match pinned {
-                                        Some(r) => (*r as usize).min(uframes.len().saturating_sub(1)),
-                                        None => (cur_frame.saturating_sub(*place_frame) as usize)
-                                            .min(uframes.len().saturating_sub(1)),
-                                    };
-                                    for (inner_id, inner_sym, inner_mat) in &uframes[uf_idx] {
-                                        let composed = parent_mat.compose(inner_mat);
-                                        snap.push((*inner_id, inner_sym.clone(), composed));
-                                    }
-                                }
-                            }
-                            effect_frames.push(snap);
-                            cur_frame += 1;
+                for (fi, frame) in timeline.iter().enumerate() {
+                    let cur_frame = fi as u16;
+                    for p in frame {
+                        match placed_on.get(&p.depth) {
+                            Some((cid, _)) if *cid == p.char_id => {}
+                            _ => { placed_on.insert(p.depth, (p.char_id, cur_frame)); }
                         }
-                        swf::Tag::PlaceObject(po) => {
-                            let local_mat = po.matrix.map(|m| {
-                                let a = m.a.to_f64(); let b = m.b.to_f64();
-                                let c = m.c.to_f64(); let d = m.d.to_f64();
-                                ImageLocalMatrix::from_abcd(a, b, c, d,
-                                    m.tx.get() as f64 / 20.0, m.ty.get() as f64 / 20.0)
-                            }).unwrap_or_default();
-                            match &po.action {
-                                swf::PlaceObjectAction::Place(cid) | swf::PlaceObjectAction::Replace(cid) => {
-                                    if let Some(sname) = symbols.get(cid) {
-                                        let lower = sname.to_lowercase();
-                                        if !lower.contains("collisonbox") && !lower.contains("collisionbox") {
-                                            disp.insert(po.depth, (*cid, sname.clone(), local_mat));
-                                        }
-                                    } else if let Some(&bitmap_id) = shape_to_bitmap.get(cid) {
-                                        if let Some(img) = images.get(&bitmap_id) {
-                                            disp.insert(po.depth, (*cid, img.symbol_name.clone(), local_mat));
-                                        }
-                                    } else if unnamed_frames.contains_key(cid) {
-                                        unnamed_placements.insert(po.depth, (*cid, local_mat, cur_frame, po.ratio));
-                                    }
-                                }
-                                swf::PlaceObjectAction::Modify => {
-                                    // A MODIFY with no matrix only re-states the object —
-                                    // keep its existing transform.
-                                    if po.matrix.is_some() {
-                                        if let Some(e) = disp.get_mut(&po.depth) { e.2 = local_mat; }
-                                        if let Some(e) = unnamed_placements.get_mut(&po.depth) { e.1 = local_mat; }
-                                    }
-                                }
-                            }
-                        }
-                        swf::Tag::RemoveObject(ro) => {
-                            disp.remove(&ro.depth);
-                            unnamed_placements.remove(&ro.depth);
-                        }
-                        _ => {}
                     }
+                    placed_on.retain(|d, _| frame.iter().any(|p| p.depth == *d));
+
+                    let local_of = |p: &crate::swf_timeline::Placed| ImageLocalMatrix::from_abcd(
+                        p.matrix.a, p.matrix.b, p.matrix.c, p.matrix.d, p.matrix.tx, p.matrix.ty);
+                    // direct art first, then the sub-sprite expansions -- the order the layers are
+                    // stacked in, which downstream depends on
+                    let mut snap: Vec<(u16, String, ImageLocalMatrix)> = Vec::new();
+                    for p in frame.iter().filter(|p| p.visible) {
+                        if let Some(sname) = symbols.get(&p.char_id) {
+                            let lower = sname.to_lowercase();
+                            if lower.contains("collisonbox") || lower.contains("collisionbox") { continue; }
+                            snap.push((p.char_id, sname.clone(), local_of(p)));
+                        } else if let Some(bid) = shape_to_bitmap.get(&p.char_id) {
+                            if let Some(img) = images.get(bid) {
+                                snap.push((p.char_id, img.symbol_name.clone(), local_of(p)));
+                            }
+                        }
+                    }
+                    for p in frame.iter().filter(|p| p.visible) {
+                        if symbols.contains_key(&p.char_id) || shape_to_bitmap.contains_key(&p.char_id) { continue; }
+                        let Some(uframes) = unnamed_frames.get(&p.char_id) else { continue };
+                        if uframes.is_empty() { continue; }
+                        let started = placed_on.get(&p.depth).map(|(_, f)| *f).unwrap_or(cur_frame);
+                        let uf_idx = match p.ratio {
+                            Some(r) => (r as usize).min(uframes.len() - 1),
+                            None => (cur_frame.saturating_sub(started) as usize).min(uframes.len() - 1),
+                        };
+                        let parent = local_of(p);
+                        for (inner_id, inner_sym, inner_mat) in &uframes[uf_idx] {
+                            snap.push((*inner_id, inner_sym.clone(), parent.compose(inner_mat)));
+                        }
+                    }
+                    effect_frames.push(snap);
                 }
                 if !effect_frames.is_empty() {
                     log::debug!("image_extractor: effect sprite id={} '{}' has {} frames",
