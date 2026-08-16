@@ -543,6 +543,10 @@ pub fn parse_stage_opts(path: &Path, render_art_flag: bool) -> Result<StageModel
         match &abc_model {
             Some(m) => {
                 eprintln!("[as3] doc_class={} planes={} actors={}", m.doc_class, m.planes.len(), m.actors.len());
+                if let Ok(path) = std::env::var("PEPTIDE_DUMP_STAGE_SCRIPT") {
+                    let _ = std::fs::write(&path, m.reconstructed_script.clone().unwrap_or_default());
+                    eprintln!("[as3] stage script -> {path}");
+                }
                 for (clip, plane) in &m.planes { eprintln!("  plane {:<10?} <- {clip}", plane); }
                 for a in &m.actors {
                     eprintln!("  actor {} : {} @ (x={:?}, y={:?})", a.class_name, a.base, a.x, a.y);

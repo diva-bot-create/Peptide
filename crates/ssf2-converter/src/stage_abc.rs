@@ -97,6 +97,14 @@ pub struct StageAbcModel {
     pub actors: Vec<SpawnedActor>,
     /// the document class extending `SSF2Stage` (= the stage id).
     pub doc_class: String,
+    /// The stage class's OWN behaviour, decompiled and translated.
+    ///
+    /// A stage is not a passive backdrop: its class decides when a thwomp drops and onto which
+    /// column, when the clock advances, when it rains. That code is the stage, and reading it is
+    /// the only way a port can be faithful about WHEN things happen -- the alternative is the
+    /// converter re-implementing each stage's cadence from constants it stepped out, which is a
+    /// guess dressed as data.
+    pub reconstructed_script: Option<String>,
 }
 
 /// the document class is the one extending `SSF2Stage`. (mirror of the character path's
@@ -150,7 +158,8 @@ pub fn extract_stage(abc: &AbcFile) -> Option<StageAbcModel> {
         a.reconstructed_script = crate::abc_parser::reconstruct_enemy_script(abc, &a.class_name);
         a.faller = crate::abc_parser::extract_faller_cycle(abc, &a.class_name);
     }
-    Some(StageAbcModel { planes: v.planes, actors, doc_class: class.name.clone() })
+    let reconstructed_script = crate::abc_parser::reconstruct_class_script(abc, &class.name);
+    Some(StageAbcModel { planes: v.planes, actors, doc_class: class.name.clone(), reconstructed_script })
 }
 
 /// stack-sim visitor: tags plane-accessor results + getlex class names so the chained

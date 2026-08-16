@@ -2841,19 +2841,37 @@ pub(crate) fn extract_force_attack_labels(abc: &AbcFile, class_name: &str) -> Ve
 /// and projectile ports use — the real state machine, not a hand-written template. The output still
 /// needs a field-state pass (`self.m_x` → `self.makeInt(...)`) + a FrameTimer helper before it RUNS;
 /// returned for the gated reconstruction path to iterate on. Empty if the class has no such methods.
-pub(crate) fn reconstruct_enemy_script(abc: &AbcFile, class_name: &str) -> Option<String> {
+/// Methods that are DATA rather than behaviour: read elsewhere as declarations (the body size, the
+/// hit params) and so not part of the reconstructed code.
+const DECLARATION_GETTERS: &[&str] = &["getOwnStats", "getAttackStats"];
+
+/// Reconstruct a class's behaviour: every method it defines, decompiled and translated.
+///
+/// Every method, deliberately. A fixed list of lifecycle names ("initialize", "update", ...) drops
+/// whatever the class factored out into a helper, and classes do that constantly -- clocktown's
+/// stage class keeps its clock in `updateTime` and its weather in `runRain`, bowserscastle's has
+/// `bowserLaugh`, and a list would take the `update` that CALLS them and leave the bodies behind.
+/// What a class does is all of what it defines.
+pub(crate) fn reconstruct_class_script(abc: &AbcFile, class_name: &str) -> Option<String> {
     let class = abc.classes.iter().find(|c| c.name == class_name)?;
     let mut out = String::new();
-    for m in ["initialize", "update", "runAI", "move", "releaseEnemy"] {
-        if let Some(t) = class.instance_methods.iter().find(|t| &*t.name == m) {
-            if let Some(body) = abc.method_bodies.iter().find(|b| b.method_idx == t.method_idx) {
-                let raw = crate::decompiler::decompile_method(body, abc, m, &[]);
-                out.push_str(&crate::api_mappings::translate_ssf2_to_fm(&raw));
-                out.push('\n');
-            }
+    // trait kind 1 is Method; the same list also carries the class's SLOTS (its fields), which
+    // have no body to decompile and come out as noise if fed to the decompiler.
+    const TRAIT_METHOD: u8 = 1;
+    for t in &class.instance_methods {
+        if t.kind != TRAIT_METHOD { continue; }
+        if DECLARATION_GETTERS.contains(&&*t.name) { continue; }
+        if let Some(body) = abc.method_bodies.iter().find(|b| b.method_idx == t.method_idx) {
+            let raw = crate::decompiler::decompile_method(body, abc, &t.name, &[]);
+            out.push_str(&crate::api_mappings::translate_ssf2_to_fm(&raw));
+            out.push('\n');
         }
     }
     (!out.trim().is_empty()).then_some(out)
+}
+
+pub(crate) fn reconstruct_enemy_script(abc: &AbcFile, class_name: &str) -> Option<String> {
+    reconstruct_class_script(abc, class_name)
 }
 
 /// The getAttackStats hitbox maps a HAZARD class declares (damage/direction/power/kbConstant + any
