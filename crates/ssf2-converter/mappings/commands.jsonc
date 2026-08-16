@@ -993,7 +993,6 @@
     { "category": "no_equivalent", "name": "getLedges", "note": "SSF2Stage ledge MovieClip list; FM ledges are part of Structure system, no list API." },
     { "category": "no_equivalent", "name": "getMCByLinkageName", "note": "AS3 SWF linkage lookup; FM is not Flash." },
     { "category": "no_equivalent", "name": "getNearestPath", "note": "A*-style nearest path via SSF2Beacons; no FM navigation graph. Manual port. confidence: high" },
-    { "category": "no_equivalent", "name": "getQualitySettings", "note": "SSF2 per-quality settings object; FM has no quality-settings query." },
     { "category": "no_equivalent", "name": "getStandby", "note": "training stand-by state — no FM training-mode standby" },
     { "category": "no_equivalent", "name": "importCPUControls", "note": "hard-coded CPU input array — no FM analog" },
     { "category": "no_equivalent", "name": "inLowerLeftWarningBounds", "note": "offscreen warning-bounds query; FM OffscreenIndicator has no in/out bounds query (already noted for the Upper variant). Manual port. confidence: high" },

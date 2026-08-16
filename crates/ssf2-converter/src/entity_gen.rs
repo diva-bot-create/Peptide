@@ -270,10 +270,14 @@ fn append_missing_template_animations(
 /// two FM frames). FrayTools timelines are laid out purely by sequential keyframe length, so
 /// doubling each keyframe doubles every layer span + keyframe start in lockstep. Shared by the
 /// stage emitter so stage/hazard animations get the SAME timing treatment as characters.
+/// SSF2 runs at 30fps and Fraymakers at 60, so every ported timeline is twice as long. Anything
+/// comparing against a frame NUMBER from the source has to travel the same distance.
+pub const FRAME_RATIO: u64 = 2;
+
 pub(crate) fn double_keyframe_lengths(keyframes: &mut [Value]) {
     for kf in keyframes {
         if let Some(len) = kf.get("length").and_then(Value::as_u64) {
-            kf["length"] = json!(len * 2);
+            kf["length"] = json!(len * FRAME_RATIO);
         }
     }
 }

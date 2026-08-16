@@ -181,6 +181,14 @@ fn strip_one_tab(line: &str) -> &str {
 pub fn translate_ssf2_to_fm(code: &str) -> String {
     let mut result = remove_readiness_guards(code);
 
+    // A backdrop's timeline position becomes the stage's own. This runs FIRST, before the pass
+    // that comments out calls with no equivalent: `currentFrame` genuinely has none in general,
+    // and the whole statement is struck out when it survives to that point -- so a condition that
+    // decides the time of day, or whether the moon has fallen, silently stops existing. Rewriting
+    // it here means there is no `currentFrame` left for that pass to find.
+    result = rewrite_backdrop_frame_reads(&result);
+    result = rewrite_quality_settings(&result);
+
     // 30→60fps frame doubling on SSF2-named frame fields (hitStun, hitLag,
     // refreshRate, etc.). Runs BEFORE call_splits and the rename pass so
     // SSF2 field names still match `frame_params` entries. Previously this
@@ -772,6 +780,44 @@ pub fn rewrite_spawn_enemy_calls(code: &str, content_id: &dyn Fn(&str) -> String
         format!("match.createCustomGameObject(self.getResource().getContent(\"{}\"), null)",
             content_id(&caps[1]))
     }).into_owned()
+}
+
+/// The quality settings a stage asks about, answered at full quality.
+///
+/// SSF2's are the PLAYER's -- `stage_effects` is disabled/simple/enabled, `ambient_lighting`
+/// likewise, `weather` is on or off -- and a stage asks, then skips what it chooses to. Fraymakers
+/// has no such scale (its graphics settings are independent toggles), and the port is of the stage
+/// at FULL quality, which is the state its art and timings were converted from. So the query
+/// answers that, rather than having no answer: left unmapped, every statement asking it was struck
+/// out, and clocktown's rain went with it.
+pub fn rewrite_quality_settings(code: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?:[A-Za-z_]\w*(?:\([^()]*\))?\.)*getQualitySettings\(\)")
+            .expect("quality settings regex")
+    });
+    re.replace_all(code,
+        "{ weather: true, stage_effects: \"enabled\", ambient_lighting: \"enabled\" }").into_owned()
+}
+
+/// A backdrop's timeline position, read the way Fraymakers offers it.
+///
+/// SSF2 asks a camera background's clip where it is (`getCameraBackgrounds()[0].mc.currentFrame`)
+/// and branches on the number -- clocktown decides the time of day, whether the moon has fallen and
+/// whether rocks should be falling entirely from where that timeline has got to. Fraymakers puts
+/// the same timeline on the stage itself, so the stage's own frame is the same clock.
+///
+/// Returned in SSF2 frame units. The port runs at twice the rate, so the raw frame is twice the
+/// source's; dividing keeps every frame NUMBER the source compares against meaningful, instead of
+/// rewriting each of those literals and hoping none were missed.
+pub fn rewrite_backdrop_frame_reads(code: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"[A-Za-z_][\w.()\[\]]*getCameraBackgrounds\(\)\[\d+\][\w.]*\.currentFrame")
+            .expect("backdrop frame regex")
+    });
+    re.replace_all(code, format!("Std.int(self.getCurrentFrame() / {})",
+        crate::entity_gen::FRAME_RATIO).as_str()).into_owned()
 }
 
 pub fn rewrite_play_sound_calls(code: &str) -> String {
