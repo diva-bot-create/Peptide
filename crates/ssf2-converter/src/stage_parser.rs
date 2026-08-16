@@ -3842,8 +3842,21 @@ fn timeline_tracks(
         let shown: Vec<&Instance> = per_frame.iter().flatten().copied().collect();
         if shown.is_empty() { continue; }
 
-        // one cel per distinct shape, taken from the frame where it sits squarest (the rasteriser
-        // fits a shape to its axis-aligned box, so that frame's pixels are the least distorted)
+        // Keyed by (shape, angle STEP). A piece the source TURNS is rasterised at each angle it is
+        // actually drawn at, rounded to a step, and placed by its own box with no rotation of ours.
+        // That is how the source draws it, so it lands where the source lands it. The angles are
+        // shared and deduplicated, so a turning ring costs a handful of pictures, not one a frame.
+        //
+        // Why not one picture plus a rotation keyframe, which would be far smaller: the rasteriser
+        // fits a shape to its AXIS-ALIGNED box, so the picture of a rotated placement is the shape
+        // stretched into that box rather than a crop of it, and turning that picture back does not
+        // reproduce the source.
+        //
+        // (The engine's own rule is known, and is not the obstacle: it turns an IMAGE about its
+        // stored x/y, and pivotX/pivotY does not move that centre. Measured with two identical bars
+        // at one stored position, one turned 90 degrees, read off a stage-camera shot -- rotating
+        // the reference about its top-left predicts the observed box exactly, about the pivot does
+        // not. The cheap path needs a rasteriser that can draw a shape UNROTATED at native size.)
         let mut cel: BTreeMap<(u16, i32), StageArt> = BTreeMap::new();
         /// Degrees per rasterised step. Fine enough that a turn reads as smooth, coarse enough
         /// that a full revolution is a couple of dozen pictures instead of a few hundred -- and a
