@@ -43,13 +43,7 @@ impl Mat {
     /// This placement in the form the emitter draws from -- the SAME conversion the character art
     /// path uses, so a shape on a backdrop is placed like a shape on a character.
     fn placement(&self) -> crate::fm_placement::WorldPlacement {
-        crate::fm_placement::WorldPlacement {
-            tx: self.tx, ty: self.ty,
-            sx: (self.a * self.a + self.b * self.b).sqrt() * if self.a < 0.0 { -1.0 } else { 1.0 },
-            sy: (self.c * self.c + self.d * self.d).sqrt() * if self.d < 0.0 { -1.0 } else { 1.0 },
-            rotation: self.b.atan2(self.a).to_degrees(),
-            a: self.a, b: self.b, c: self.c, d: self.d,
-        }
+        crate::fm_placement::WorldPlacement::from_affine(self.a, self.b, self.c, self.d, self.tx, self.ty)
     }
     /// `(flip_x, flip_y)` for an AXIS-ALIGNED placement (a mirrored decorative element). A
     /// negative scale on an axis means the art is drawn reversed there; the raster path composites
@@ -3783,22 +3777,17 @@ fn timeline_tracks(
         let shown: Vec<&Instance> = per_frame.iter().flatten().copied().collect();
         if shown.is_empty() { continue; }
 
-        // Keyed by (shape, angle STEP). A piece the source TURNS is rasterised at each angle it is
-        // actually drawn at, rounded to a step, and placed by its own box with no rotation of ours.
-        // That is how the source draws it, so it lands where the source lands it. The angles are
-        // shared and deduplicated, so a turning ring costs a handful of pictures, not one a frame.
+        // Keyed by (shape, angle STEP). A piece is rasterised at each angle it is actually drawn
+        // at, rounded to a step, and placed by its own box with no rotation of ours. That is how
+        // the source draws it, so it lands where the source lands it. The angles are shared and
+        // deduplicated, so a turning ring would cost a handful of pictures, not one a frame.
         //
-        // Why not one picture plus a rotation keyframe, which would be far smaller: the rasteriser
-        // fits a shape to its AXIS-ALIGNED box, so the picture of a rotated placement is the shape
-        // stretched into that box rather than a crop of it, and turning that picture back does not
-        // reproduce the source.
-        //
-        // (The engine's rule is known -- it turns an IMAGE about its stored x/y, and pivotX/pivotY
-        // does not move that centre, measured with two identical bars at one stored position, one
-        // turned 90 degrees. Drawing the shape unrotated at native size and placing its corner
-        // through each frame's matrix was then tried, and is right at some angles and wrong at
-        // others, so something in that chain is still unmeasured. Keeping the per-angle rasters
-        // until it is: they are correct at every angle, which is worth more than the size.)
+        // Emitting one picture and giving Fraymakers the frame's rotation instead would be
+        // smaller, and both halves of that are known and tested (`fm_placement`: the engine turns
+        // an IMAGE about its stored x/y, and the decomposition round-trips). It is not built,
+        // because it would never run: measured across the corpus, no stage object CHANGES angle.
+        // Pieces sit at a fixed angle, so this bake already emits one cel each and there is
+        // nothing to save.
         let mut cel: BTreeMap<(u16, i32), StageArt> = BTreeMap::new();
         /// Degrees per rasterised step. Fine enough that a turn reads as smooth, coarse enough
         /// that a full revolution is a couple of dozen pictures instead of a few hundred -- and a

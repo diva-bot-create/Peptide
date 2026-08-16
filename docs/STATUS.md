@@ -313,12 +313,18 @@ dimensions below are the rest.
   | element writer | an image used on more than one frame is written once and referenced again |
   | element writer | a large still picture with one small moving part emits a plate plus a crop of the part that moves; it samples first and declines when the element changes across most of its canvas |
   | `entity_compact` | identical symbols share one entry, invisible placements hold nothing, runs of identical keyframes fold into one |
+  | `write_layer` | one file per distinct picture; a repeat is another reference, not another copy |
 
-  clocktown lands at 37MB source / 10MB published and plays clean. the remaining weight is the
-  clock's per-angle cels: FM turns an IMAGE about its stored `(x,y)` and the rasteriser fits a shape
-  to its axis-aligned box, so a turning piece is pre-drawn at one cel per 10 degrees rather than
-  rotated at runtime. a rasteriser that could draw a shape UNROTATED at native size would let the
-  emitter use the anchor rule directly and take that to roughly 15MB.
+  clocktown lands at 29MB source / 10MB published and plays clean.
+
+  what is left is the art itself: 376 distinct pictures, which is what the source draws.
+
+  the per-angle bake is NOT part of that, contrary to the obvious guess. giving Fraymakers one
+  picture plus a rotation would be smaller in principle, and both halves are known and tested
+  (`fm_placement`: the engine turns an IMAGE about its stored x/y, and the decomposition
+  round-trips at every angle). it is not built because it would never run: measured per object
+  across the sample and beyond, no stage object CHANGES angle. pieces sit at a fixed angle, so the
+  bake already emits one cel each. measure before optimising.
 
 - **crateria converts and runs clean.** 2.4MB, 27 sprites, no script errors: 50 weather particles
   tethered to the camera (worst per-particle error 0) and spanning the view, the hazards switch

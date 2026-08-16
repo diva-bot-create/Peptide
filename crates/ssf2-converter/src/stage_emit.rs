@@ -55,12 +55,26 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // stage layer. Each layer is a PNG + `.meta`; the `.png` is gitignored (regenerated).
     let sprites = lib.join("sprites").join("Stage");
     std::fs::create_dir_all(&sprites).context("mkdir sprites/Stage")?;
+    // The same picture is written ONCE, however many times the stage draws it. A source timeline
+    // reuses art constantly -- a decoration that reappears each cycle, a backdrop shared between
+    // two times of day, a splash every instance of the weather plays -- and each of those reaches
+    // here as its own layer with its own suffix. Keyed by the encoded bytes, so it is exactly the
+    // pictures that ARE the same, and the repeats become extra references to one image asset
+    // rather than extra copies of it.
+    let mut png_seen: std::collections::BTreeMap<Vec<u8>, String> = Default::default();
     let mut write_layer = |suffix: &str, art: &StageArt| -> Result<ArtRef> {
-        let guid = det_uuid(&format!("stage::{id}::{suffix}"));
-        std::fs::write(sprites.join(format!("{id}_{suffix}.png")), &art.png)?;
-        write_json(&sprites.join(format!("{id}_{suffix}.png.meta")), &json!({
-            "export": false, "guid": guid, "id": "", "pluginMetadata": {}, "plugins": [], "tags": [], "version": 2
-        }))?;
+        let guid = match png_seen.get(&art.png) {
+            Some(g) => g.clone(),
+            None => {
+                let guid = det_uuid(&format!("stage::{id}::{suffix}"));
+                std::fs::write(sprites.join(format!("{id}_{suffix}.png")), &art.png)?;
+                write_json(&sprites.join(format!("{id}_{suffix}.png.meta")), &json!({
+                    "export": false, "guid": guid, "id": "", "pluginMetadata": {}, "plugins": [], "tags": [], "version": 2
+                }))?;
+                png_seen.insert(art.png.clone(), guid.clone());
+                guid
+            }
+        };
         Ok(ArtRef { guid, x: art.x, y: art.y, w: art.w, h: art.h, hold: art.hold.max(1) as usize,
                     rotation: art.rotation, scale_x: art.scale_x, scale_y: art.scale_y, alpha: art.alpha,
                     pivot: art.pivot })
