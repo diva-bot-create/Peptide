@@ -3887,52 +3887,51 @@ fn timeline_tracks(
         // per shape: its raster (centred on the point it turns about), the rotation that raster
         // already carries, the placement it was rasterised under, and where that turning point
         // sits inside the raster
-        let mut cel: BTreeMap<u16, (StageArt, f64, crate::fm_placement::WorldPlacement, (f64, f64))> = BTreeMap::new();
-        for sid in shapes {
-            let candidates: Vec<&Instance> = shown.iter().copied().filter(|i| i.shape_id == sid).collect();
-            let biggest = candidates.iter().map(|i| drawn_size(i)).fold(0.0_f64, f64::max);
-            let Some(best) = candidates.into_iter()
-                // within a hair of the biggest, prefer the squarest
-                .filter(|i| drawn_size(i) >= biggest * 0.98)
-                .min_by(|a, b| squareness(a).partial_cmp(&squareness(b)).unwrap_or(std::cmp::Ordering::Equal))
-            else { continue };
-            let Some(art) = composite_layer(&[best], shape_defs, bitmaps, ox, oy, None) else { continue };
-            // Grow the cel symmetrically about the point the source TURNS it about, so that point
-            // is the middle of the raster. Then it does not matter whether the engine turns an
-            // image about its centre or about a pivot offset -- both are the same point -- and a
-            // ring that turns about the clock stays on the clock either way. Measuring that
-            // convention takes a rendered probe; not depending on it takes a few pixels.
-            let (art, reg) = centre_cel_on(art, best.place.tx - best.aabb.left(),
-                                                best.place.ty - best.aabb.top());
-            cel.insert(sid, (art, crate::fm_placement::normalise_degrees(best.place.rotation), best.place, reg));
+        // Keyed by (shape, angle STEP). A piece the source turns is rasterised at each angle it
+        // is actually drawn at, rounded to a step, and placed by its own box with no rotation of
+        // ours. That is how the source draws it, so it lands where the source lands it -- no
+        // dependence on how the engine anchors a rotated image, which is the thing that took the
+        // clock apart. The angles are shared and deduplicated, so a ring costs a handful of
+        // pictures rather than one per frame.
+        let mut cel: BTreeMap<(u16, i32), StageArt> = BTreeMap::new();
+        /// Degrees per rasterised step. Fine enough that a turn reads as smooth, coarse enough
+        /// that a full revolution is a couple of dozen pictures instead of a few hundred -- and a
+        /// piece drawn in several variants over a day/night cycle pays that per variant, so the
+        /// step is what keeps a turning clock from being most of the package.
+        const ANGLE_STEP: f64 = 10.0;
+        let step_of = |i: &Instance| -> i32 {
+            (crate::fm_placement::normalise_degrees(i.place.rotation) / ANGLE_STEP).round() as i32
+        };
+        // one raster per (shape, angle) actually shown, taken from the frame where the piece is
+        // drawn BIGGEST at that angle (every other frame then scales down, which is sharper)
+        let mut want: BTreeMap<(u16, i32), &Instance> = BTreeMap::new();
+        for i in shown.iter().copied() {
+            let key = (i.shape_id, step_of(i));
+            let better = want.get(&key).map(|b| {
+                (i.place.sx.abs() * i.place.sy.abs()) > (b.place.sx.abs() * b.place.sy.abs())
+            }).unwrap_or(true);
+            if better { want.insert(key, i); }
+        }
+        for (key, best) in want {
+            if let Some(art) = composite_layer(&[best], shape_defs, bitmaps, ox, oy, None) {
+                cel.insert(key, art);
+            }
         }
         if cel.is_empty() { continue; }
 
         let anchor = shown[0];
-        let frames: Vec<StageArt> = per_frame.into_iter().map(|slot| match slot.and_then(|i| cel.get(&i.shape_id).map(|c| (i, c))) {
-            Some((i, (art, base_rot, base_place, reg))) => {
-                // The raster is centred on the point the source turns the piece about, so this
-                // frame just puts that centre where the frame's own placement puts it. Rotation
-                // and scale then apply about the middle of the image, which is the same point.
-                let base_scale = (base_place.sx.abs().max(1e-6), base_place.sy.abs().max(1e-6));
-                // the cel is the piece at its biggest, so every frame scales it DOWN; a ratio above
-                // one means the placement was misread, and drawing it would be the piece suddenly
-                // growing several times its size.
-                let sx_ratio = (i.place.sx.abs() / base_scale.0).min(1.0);
-                let sy_ratio = (i.place.sy.abs() / base_scale.1).min(1.0);
-                let (cw, ch) = (art.w as f64 * sx_ratio * scale, art.h as f64 * sy_ratio * scale);
-                StageArt {
-                    png: art.png.clone(),
-                    x: (i.place.tx - ox) * scale - cw / 2.0,
-                    y: (i.place.ty - oy) * scale - ch / 2.0,
-                    w: art.w, h: art.h, hold: 1,
-                    rotation: crate::fm_placement::normalise_degrees(i.place.rotation - base_rot),
-                    scale_x: sx_ratio,
-                    scale_y: sy_ratio,
-                    alpha: i.alpha,
-                    pivot: *reg,
-                }
-            }
+        let frames: Vec<StageArt> = per_frame.into_iter().map(|slot| match slot.and_then(|i| cel.get(&(i.shape_id, step_of(i))).map(|c| (i, c))) {
+            Some((i, art)) => StageArt {
+                png: art.png.clone(),
+                // by its own box: the raster IS the piece as this frame draws it
+                x: (i.aabb.left() - ox) * scale,
+                y: (i.aabb.top() - oy) * scale,
+                w: art.w, h: art.h, hold: 1,
+                rotation: 0.0,
+                scale_x: 1.0, scale_y: 1.0,
+                alpha: i.alpha,
+                pivot: (0.0, 0.0),
+            },
             // not shown this frame: the object is still there, just invisible
             None => StageArt {
                 png: blank_png(),
