@@ -303,21 +303,22 @@ dimensions below are the rest.
   via `endType: LOOP`, and the label the call named was sliced off with the entry, so it threw once
   per cycle and looped nothing.
 
-- **backdrop elements no longer emit the same picture hundreds of times** (fixed). SSF2 authors a
-  small looping element and the stage timeline it sits on runs far longer, so the art walk sees the
-  cycle over and over and every repeat was rasterised. clocktown arrived as 3379 sprites / 263MB --
-  1363 frames of bottom fire drawn from 8 distinct images, 621 frames of fire light drawn from 2 --
-  and FrayTools could not publish it at all, at any timeout.
+- **package size.** SSF2 authors a small looping element and the stage timeline it sits on runs far
+  longer, so a naive port rasterises every repeat and writes a symbol per placement per frame. four
+  lossless reductions keep that in hand:
 
-  two lossless reductions, both in the element writer: a sequence that is one cycle repeated emits
-  ONE cycle (the element loops anyway, and the tail does not have to be a whole cycle), and an
-  image used on more than one frame is written once and referenced again. clocktown: 3379 -> 726
-  sprites, 263MB -> 164MB. bowserscastle is unchanged bar 8 files.
+  | where | reduction |
+  |---|---|
+  | element writer | a sequence that is one cycle repeated emits ONE cycle (the element loops anyway) |
+  | element writer | an image used on more than one frame is written once and referenced again |
+  | element writer | a large still picture with one small moving part emits a plate plus a crop of the part that moves; it samples first and declines when the element changes across most of its canvas |
+  | `entity_compact` | identical symbols share one entry, invisible placements hold nothing, runs of identical keyframes fold into one |
 
-  a third reduction is in place but rarely applies: an element that is a large still picture with
-  one small moving part is emitted as a plate plus a crop of the part that moves. it samples before
-  committing, and declines when the element changes across most of its canvas -- which is what
-  clocktown's remaining 623-frame town backdrop does, so that stage is still too heavy to publish.
+  clocktown lands at 37MB source / 10MB published and plays clean. the remaining weight is the
+  clock's per-angle cels: FM turns an IMAGE about its stored `(x,y)` and the rasteriser fits a shape
+  to its axis-aligned box, so a turning piece is pre-drawn at one cel per 10 degrees rather than
+  rotated at runtime. a rasteriser that could draw a shape UNROTATED at native size would let the
+  emitter use the anchor rule directly and take that to roughly 15MB.
 
 - **crateria converts and runs clean.** 2.4MB, 27 sprites, no script errors: 50 weather particles
   tethered to the camera (worst per-particle error 0) and spanning the view, the hazards switch

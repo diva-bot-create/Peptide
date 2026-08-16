@@ -121,6 +121,8 @@ peptide/  (repo root — Cargo workspace; the `peptide` binary is the product)
 │   │   ├── convert.rs         run_conversion(ConvertOptions) — the in-process entry point
 │   │   ├── ssf.rs             .ssf → raw SWF decompression
 │   │   ├── swf_parser.rs      SWF tag parsing (thin wrapper over the Ruffle `swf` crate)
+│   │   ├── swf_timeline.rs    display list frame by frame — the ONE reader, shared by the
+│   │   │                      character and stage paths (matrix, ratio, blend, alpha, visibility)
 │   │   ├── abc_parser.rs      AVM2/ABC bytecode parser + semantic extractors (~2650 LOC)
 │   │   ├── decompiler.rs      ABC bytecode → Haxe-ish source (~2050 LOC)
 │   │   ├── extractor.rs       Bridges abc_parser output into CharacterData
@@ -133,6 +135,8 @@ peptide/  (repo root — Cargo workspace; the `peptide` binary is the product)
 │   │   ├── api_mappings.rs     Decompiled-Haxe rewriter pipeline (JSONC-driven, ~2530 LOC)
 │   │   ├── mappings.rs         JSONC loader + OnceLock-cached accessors for mappings/*.jsonc
 │   │   ├── entity_gen.rs       Fraymakers .entity JSON builder (~2300 LOC)
+│   │   ├── entity_compact.rs   post-pass on every finished entity: share identical symbols,
+│   │   │                       empty out invisible ones, fold runs of identical keyframes
 │   │   ├── haxe_gen.rs         Top-level output orchestrator — writes the whole package
 │   │   ├── fraytools_project.rs  Emits the `<name>.fraytools` project file
 │   │   ├── fraytools_transform.rs  Shared FrayTools transform/coordinate helpers
