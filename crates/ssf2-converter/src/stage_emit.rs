@@ -251,7 +251,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // every animated backdrop element becomes its own looping VFX the stage spawns + reparents
     // into a background container. VFX carry no manifest entry (resolved by id via getContent),
     // so this only returns spawn lines.
-    let (bg_spawns, bg_entries) = emit_bg_elements(model, &promoted_bg, &lib)?;
+    let (bg_spawns, bg_entries, clip_handles) = emit_bg_elements(model, &promoted_bg, &lib)?;
 
     write_json(&lib.join("manifest.json"), &build_manifest(model, &[hazard_entries.clone(), bg_entries.clone()].concat(), &structure_contents))?;
     write_meta(&lib.join("manifest.json.meta"), id, "manifest", "json", None, None)?;
@@ -304,7 +304,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     let ported = model.stage_script.as_ref().map(|src| {
         let converted = crate::api_mappings::rewrite_spawn_enemy_calls(
             src, &|class: &str| format!("{id}{class}"));
-        stage_runnable(&converted)
+        stage_runnable(&converted, &clip_handles)
     }).unwrap_or_default();
     if !ported.trim().is_empty() {
         write_script(&scripts.join(format!("{id}StageSource.hx.txt")), &format!(
@@ -312,7 +312,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     }
 
     write_script(&scripts.join(format!("{id}Script.hx")),
-                 &script_hx(id, animated, &spawns, (&weather_spawn, &weather_frame), ""))?;
+                 &script_hx(id, animated, &spawns, (&weather_spawn, &weather_frame), "", &clip_handles))?;
     write_meta(&scripts.join(format!("{id}Script.hx.meta")), id, &format!("{id}Script"), "", Some("STAGE"), None)?;
     write_script(&scripts.join(format!("{id}StageStats.hx")), &stage_stats_hx(id, &art.parallax, model.scale))?;
     write_meta(&scripts.join(format!("{id}StageStats.hx.meta")), id, &format!("{id}StageStats"), "hscript", None, None)?;
@@ -1927,7 +1927,7 @@ struct ReconWrap {
 /// What still has to go is the api layer SSF2 supplies and Fraymakers does not: the weather object
 /// (this package emits weather from the stage's own declared particles instead) and the quality
 /// query (already answered at full quality). Timers do have an equivalent, and it is the engine's.
-fn stage_runnable(raw: &str) -> String {
+fn stage_runnable(raw: &str, clip_handles: &[String]) -> String {
     static FIELD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let field = FIELD.get_or_init(|| regex::Regex::new(r"self\.(m_[A-Za-z0-9_]+)").unwrap());
     static TIMER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -1945,6 +1945,22 @@ fn stage_runnable(raw: &str) -> String {
     for c in timer.captures_iter(raw) {
         timers.insert(c[1].to_string(), c[2].trim().to_string());
     }
+
+    // The display tree is gone -- its clips were converted into objects -- so a reach through it
+    // becomes the object that took that clip's place. This is why the emission is grouped by clip:
+    // `getBackground().clocktown_rainsplash_bg` only has something to resolve to if the clip is
+    // one object rather than the thirteen it used to be.
+    let mut raw = raw.to_string();
+    for h in clip_handles {
+        for accessor in ["self.getBackground()", "self.getForeground()",
+                         "match.getStage().getBackground()", "match.getStage().getForeground()"] {
+            raw = raw.replace(&format!("{accessor}.{h}"), h);
+        }
+        // a camera background is reached through its own clip
+        raw = regex::Regex::new(&format!(r"[A-Za-z_][\w.()\[\]]*getCameraBackgrounds\(\)\[\d+\]\.mc\.{}", regex::escape(h)))
+            .map(|re| re.replace_all(&raw, h.as_str()).into_owned()).unwrap_or(raw);
+    }
+    let raw = raw.as_str();
 
     let mut out = String::new();
     out.push_str("// the stage class's own state. a stage script keeps its module scope between\n                  // frames, so these are plain vars.\n");
@@ -3507,8 +3523,16 @@ fn element_cycle_len(frames: &[crate::stage_parser::StageArt]) -> usize {
         .unwrap_or(n)
 }
 
+/// A clip name usable as an hscript variable, or `None` when the source name is not one.
+fn clip_handle(clip: &str) -> Option<String> {
+    let ok = !clip.is_empty()
+        && clip.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && clip.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    ok.then(|| clip.to_string())
+}
+
 fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
-    -> Result<(String, Vec<Value>)> {
+    -> Result<(String, Vec<Value>, Vec<String>)> {
     let mut spawns = String::new();
     let mut entries: Vec<Value> = Vec::new();
     // One object per CLIP: the parts the parser and the plate split separated are layers of it.
@@ -3520,8 +3544,13 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
             None => groups.push((layer.clip.clone(), vec![layer])),
         }
     }
-    for (i, (_, parts)) in groups.iter().enumerate() {
+    // The handle each clip is reachable by: the name its plane knows it by, which is the name the
+    // stage class uses (`getBackground().clocktown_rainsplash_bg`). Kept in a module-scope var so
+    // the ported class has something to talk to.
+    let mut handles: Vec<String> = Vec::new();
+    for (i, (clip, parts)) in groups.iter().enumerate() {
         let layer = parts[0];
+        let handle = clip_handle(clip);
         let eid = format!("{}_{}", model.id, layer.eid);
         // an element whose clip branches between labels can't be a VFX: a VFX holds one animation
         // and carries no script, so there is nothing to switch and nothing to switch it.
@@ -3545,14 +3574,19 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
         let set_alpha = if a < 1.0 {
             format!("\t\t\tif (_bg{i} != null) {{ _bg{i}.getViewRootContainer().alpha = {a:.3}; }}\n")
         } else { String::new() };
+        // bind it to the name its plane knows it by, so the ported class has an object to reach
+        let bind = match &handle {
+            Some(h) => { handles.push(h.clone()); format!("\t\t\t{h} = _bg{i};\n") }
+            None => String::new(),
+        };
         spawns.push_str(&format!(
             "\t\t\tvar _bg{i} = match.createVfx(new VfxStats({{ spriteContent: self.getResource().getContent(\"{eid}\"), \
              animation: \"active\", x: {ox}, y: {oy}, loop: true, timeout: -1, relativeWith: false, resizeWith: false }}));\n\
              \t\t\tif (_bg{i} != null) {{ self.{container}().addChild(_bg{i}.getViewRootContainer()); }}\n\
-{set_alpha}",
+{set_alpha}{bind}",
             container = layer.plane.container()));
     }
-    Ok((spawns, entries))
+    Ok((spawns, entries, handles))
 }
 
 /// One segmented backdrop element: a CUSTOM_GAME_OBJECT (entity + state-machine Script + stats),
@@ -3770,7 +3804,7 @@ fn stage_stats_hx(id: &str, parallax: &[ParallaxRef], _scale: f64) -> String {
 /// play (the SSF2 animated clips loop). The parallax background is camera-scrolled by
 /// StageStats, so no manual scroll is needed.
 fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str),
-             ported: &str) -> String {
+             ported: &str, clip_handles: &[String]) -> String {
     let init = if animated { "\t// animated stage clips play + loop on the timeline" } else { "\tself.pause();" };
     // hazards spawn DEFERRED in update() once the match is live (one-shot via a flag). owner is
     // NULL: a stage hazard belongs to no fighter, so it damages everyone (a null hitbox owner
@@ -3813,7 +3847,14 @@ fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str
                   \t\t}}\n\
                   \t}}\n{w_frame}"))
     };
-    let haz_var = format!("{w_var}{haz_var}");
+    // One var per clip, named the way the stage's display tree names it. The stage class reaches
+    // its objects through the tree (`getBackground().clocktown_rainsplash_bg`), and after the port
+    // there is no tree -- so the name it used is bound to the object that took that clip's place.
+    let clip_vars = if clip_handles.is_empty() { String::new() } else {
+        format!("// the stage's own clips, under the names its class knows them by\n{}\n",
+            clip_handles.iter().map(|h| format!("var {h} = null;")).collect::<Vec<_>>().join("\n"))
+    };
+    let haz_var = format!("{clip_vars}{w_var}{haz_var}");
     // The stage's OWN code runs after the setup, every frame, exactly as SSF2 runs it. Without
     // this the stage is furniture: everything it decides -- when a thwomp drops, when the clock
     // turns over, when it rains -- lives in that update and simply never happened.
@@ -3915,7 +3956,7 @@ mod hazard_tests {
         // a null hitbox owner is neutral and passes the engine's team-hit validation (hits
         // everyone), and createCustomGameObject accepts a null owner.
         let spawn = "\t\t\tvar _hz0 = match.createCustomGameObject(self.getResource().getContent(\"demohazard0\"), owner);\n";
-        let s = script_hx("demo", false, spawn, ("", ""), "");
+        let s = script_hx("demo", false, spawn, ("", ""), "", &[]);
         assert!(s.contains("var owner = null;"), "hazard owner should be null: {s}");
         assert!(s.contains("createCustomGameObject"), "no spawn call: {s}");
     }
