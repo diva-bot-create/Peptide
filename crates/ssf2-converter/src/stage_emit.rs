@@ -3096,6 +3096,17 @@ fn bg_element_origin(layer: &BgLayerRef) -> (f64, f64) {
     if x.is_finite() && y.is_finite() { (x, y) } else { (0.0, 0.0) }
 }
 
+/// Where a whole clip sits: the topmost-leftmost of its parts.
+///
+/// The entity places each part as an offset FROM this, and the spawn puts the object HERE, so the
+/// two have to agree -- taking the first part's origin in one and the shared one in the other puts
+/// a clip's moving half somewhere its plate is not.
+fn bg_clip_origin(parts: &[&BgLayerRef]) -> (f64, f64) {
+    let (ox, oy) = parts.iter().map(|l| bg_element_origin(l))
+        .fold((f64::MAX, f64::MAX), |(ax, ay), (bx, by)| (ax.min(bx), ay.min(by)));
+    if ox == f64::MAX { (0.0, 0.0) } else { (ox, oy) }
+}
+
 /// One CLIP as one entity, its parts as layers.
 ///
 /// A stage's display tree is named clips, and a clip is one object however many shapes are inside
@@ -3108,11 +3119,7 @@ fn bg_element_origin(layer: &BgLayerRef) -> (f64, f64) {
 /// The origin is shared across the parts, since they are one object and have to stay in register.
 fn bg_element_entity_multi(eid: &str, parts: &[&BgLayerRef], scale: f64) -> Value {
     let g = |s: &str| det_uuid(&format!("bgelem::{eid}::{s}"));
-    // one origin for the whole clip: each part keeps its offset FROM it, so the plate and the
-    // parts moving over it line up the way the source drew them
-    let (ox, oy) = parts.iter().map(|l| bg_element_origin(l))
-        .fold((f64::MAX, f64::MAX), |(ax, ay), (bx, by)| (ax.min(bx), ay.min(by)));
-    let (ox, oy) = if ox == f64::MAX { (0.0, 0.0) } else { (ox, oy) };
+    let (ox, oy) = bg_clip_origin(parts);
 
     let (mut symbols, mut keyframes, mut layers, mut layer_ids) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -3528,7 +3535,7 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
         // absolute), then reparent its sprite into the background container so it draws in front
         // of the static background art and behind the fighters. no owner / no VfxLayer: the
         // container reparent is the authoritative depth control.
-        let (ox, oy) = bg_element_origin(layer);
+        let (ox, oy) = bg_clip_origin(parts);
         // at the opacity the SOURCE authored for its plane. A promoted element used to spawn fully
         // opaque whatever the source said, so clocktown's lighting sheet -- a screen-sized overlay
         // its own placements set to zero -- was drawn over the whole stage at full strength.
