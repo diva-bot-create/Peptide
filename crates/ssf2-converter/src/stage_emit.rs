@@ -3112,73 +3112,6 @@ fn bg_element_origin(layer: &BgLayerRef) -> (f64, f64) {
     if x.is_finite() && y.is_finite() { (x, y) } else { (0.0, 0.0) }
 }
 
-/// Where a whole clip sits: the topmost-leftmost of its parts.
-///
-/// The entity places each part as an offset FROM this, and the spawn puts the object HERE, so the
-/// two have to agree -- taking the first part's origin in one and the shared one in the other puts
-/// a clip's moving half somewhere its plate is not.
-fn bg_clip_origin(parts: &[&BgLayerRef]) -> (f64, f64) {
-    let (ox, oy) = parts.iter().map(|l| bg_element_origin(l))
-        .fold((f64::MAX, f64::MAX), |(ax, ay), (bx, by)| (ax.min(bx), ay.min(by)));
-    if ox == f64::MAX { (0.0, 0.0) } else { (ox, oy) }
-}
-
-/// One CLIP as one entity, its parts as layers.
-///
-/// A stage's display tree is named clips, and a clip is one object however many shapes are inside
-/// it. The parts arrive here separated for good reasons -- the parser splits a clip by animating
-/// depth, and a mostly-still clip is split again into a plate plus what moves, so a big backdrop is
-/// rasterised once instead of once per frame -- and both belong INSIDE the object rather than
-/// instead of it. Kept apart as entities, `getBackground().clocktown_rainsplash_bg` is thirteen
-/// things and there is nothing to address.
-///
-/// The origin is shared across the parts, since they are one object and have to stay in register.
-fn bg_element_entity_multi(eid: &str, parts: &[&BgLayerRef], scale: f64) -> Value {
-    let g = |s: &str| det_uuid(&format!("bgelem::{eid}::{s}"));
-    let (ox, oy) = bg_clip_origin(parts);
-
-    let (mut symbols, mut keyframes, mut layers, mut layer_ids) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for (li, layer) in parts.iter().enumerate() {
-        let mut kfs: Vec<Value> = Vec::new();
-        for (j, f) in layer.frames.iter().enumerate() {
-            let sym = g(&format!("l{li}sym{j}"));
-            symbols.push(json!({
-                "$id": sym, "type": "IMAGE", "imageAsset": f.guid,
-                "x": f.x - ox, "y": f.y - oy, "pivotX": 0.0, "pivotY": 0.0,
-                // the frame's own orientation composes with the stage scale
-                "scaleX": scale * f.scale_x, "scaleY": scale * f.scale_y, "rotation": f.rotation,
-                // the frame's OWN opacity, which is how the source animates a tint or a glow
-                "alpha": f.alpha, "pluginMetadata": {}
-            }));
-            kfs.push(json!({
-                "$id": g(&format!("l{li}kf{j}")), "symbol": sym, "length": f.hold.max(1),
-                "tweened": false, "tweenType": "LINEAR", "type": "IMAGE", "pluginMetadata": {}
-            }));
-        }
-        // 30fps SSF2 source -> 60fps engine, exactly like the main stage entity and the hazards
-        crate::entity_gen::double_keyframe_lengths(&mut kfs);
-        let ids: Vec<String> = (0..layer.frames.len()).map(|j| g(&format!("l{li}kf{j}"))).collect();
-        keyframes.extend(kfs);
-        let lid = g(&format!("layer{li}"));
-        layers.push(json!({ "$id": lid, "name": layer.name.clone(), "type": "IMAGE",
-                            "hidden": false, "locked": false, "keyframes": ids,
-                            "pluginMetadata": {} }));
-        layer_ids.push(lid);
-    }
-    json!({
-        "export": true, "guid": g("entity"), "id": eid, "version": 5,
-        "pluginMetadata": { "com.fraymakers.FraymakersMetadata": { "objectType": "VFX", "version": "0.1.0" } },
-        "plugins": ["com.fraymakers.FraymakersTypes", "com.fraymakers.FraymakersMetadata"],
-        "tags": [], "paletteMap": {}, "tilesets": [], "terrains": [],
-        "symbols": symbols,
-        "keyframes": keyframes,
-        "layers": layers,
-        "animations": [ { "$id": g("anim"), "name": "active", "layers": layer_ids, "pluginMetadata": {} } ]
-    })
-}
-
-#[allow(dead_code)]
 fn bg_element_entity(eid: &str, layer: &BgLayerRef, scale: f64) -> Value {
     // Art is element-LOCAL: the stage offset is hoisted onto the vfx itself (VfxStats x/y)
     // instead of being baked into every symbol. Baking it in meant every element sat at the
@@ -3535,22 +3468,17 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
     -> Result<(String, Vec<Value>, Vec<String>)> {
     let mut spawns = String::new();
     let mut entries: Vec<Value> = Vec::new();
-    // One object per CLIP: the parts the parser and the plate split separated are layers of it.
-    // Grouped in first-appearance order so draw order is unchanged.
-    let mut groups: Vec<(String, Vec<&BgLayerRef>)> = Vec::new();
-    for layer in promoted.iter() {
-        match groups.iter_mut().find(|(c, _)| *c == layer.clip) {
-            Some((_, v)) => v.push(layer),
-            None => groups.push((layer.clip.clone(), vec![layer])),
-        }
-    }
-    // The handle each clip is reachable by: the name its plane knows it by, which is the name the
-    // stage class uses (`getBackground().clocktown_rainsplash_bg`). Kept in a module-scope var so
-    // the ported class has something to talk to.
-    let mut handles: Vec<String> = Vec::new();
-    for (i, (clip, parts)) in groups.iter().enumerate() {
-        let layer = parts[0];
-        let handle = clip_handle(clip);
+    // ONE VFX PER MOVIECLIP, which is what the source has: a nested clip carries its own
+    // timeline and loops on its own period, and the engine gives that for free to a VFX with
+    // `loop: true`. Merging a clip's children into layers of one animation puts them all on one
+    // clock -- a 28-frame rain splash then shows once in a 7440-frame cycle instead of the two
+    // hundred and sixty times SSF2 plays it.
+    //
+    // The named clip is still one thing, but at the HANDLE: see `clip_groups` below, where the
+    // name its plane knows it by is bound to all the objects that came out of it.
+    let mut clip_parts: Vec<(String, Vec<String>)> = Vec::new();
+    for (i, layer) in promoted.iter().enumerate() {
+        let handle = clip_handle(&layer.clip);
         let eid = format!("{}_{}", model.id, layer.eid);
         // an element whose clip branches between labels can't be a VFX: a VFX holds one animation
         // and carries no script, so there is nothing to switch and nothing to switch it.
@@ -3558,13 +3486,13 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
             emit_bg_segmented(model, layer, &eid, i, lib, &mut spawns, &mut entries)?;
             continue;
         }
-        write_json(&lib.join("entities").join(format!("{eid}.entity")), &bg_element_entity_multi(&eid, parts, model.scale))?;
+        write_json(&lib.join("entities").join(format!("{eid}.entity")), &bg_element_entity(&eid, layer, model.scale))?;
         write_meta(&lib.join("entities").join(format!("{eid}.entity.meta")), &eid, &eid, "", Some("VFX"), None)?;
         // createVfx loops the element forever at its baked-in position (relativeWith:false ->
         // absolute), then reparent its sprite into the background container so it draws in front
         // of the static background art and behind the fighters. no owner / no VfxLayer: the
         // container reparent is the authoritative depth control.
-        let (ox, oy) = bg_clip_origin(parts);
+        let (ox, oy) = bg_element_origin(layer);
         // at the opacity the SOURCE authored for its plane. A promoted element used to spawn fully
         // opaque whatever the source said, so clocktown's lighting sheet -- a screen-sized overlay
         // its own placements set to zero -- was drawn over the whole stage at full strength.
@@ -3575,10 +3503,13 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
             format!("\t\t\tif (_bg{i} != null) {{ _bg{i}.getViewRootContainer().alpha = {a:.3}; }}\n")
         } else { String::new() };
         // bind it to the name its plane knows it by, so the ported class has an object to reach
-        let bind = match &handle {
-            Some(h) => { handles.push(h.clone()); format!("\t\t\t{h} = _bg{i};\n") }
-            None => String::new(),
-        };
+        if let Some(h) = &handle {
+            match clip_parts.iter_mut().find(|(c, _)| c == h) {
+                Some((_, v)) => v.push(format!("_bg{i}")),
+                None => clip_parts.push((h.clone(), vec![format!("_bg{i}")])),
+            }
+        }
+        let bind = String::new();
         spawns.push_str(&format!(
             "\t\t\tvar _bg{i} = match.createVfx(new VfxStats({{ spriteContent: self.getResource().getContent(\"{eid}\"), \
              animation: \"active\", x: {ox}, y: {oy}, loop: true, timeout: -1, relativeWith: false, resizeWith: false }}));\n\
@@ -3586,7 +3517,13 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
 {set_alpha}{bind}",
             container = layer.plane.container()));
     }
-    Ok((spawns, entries, handles))
+    // The named clip, bound to everything that came out of it. One clip is one thing to the stage
+    // class -- it says `clocktown_rainsplash_fg.setVisible(false)` -- while remaining the several
+    // independently-looping objects the source actually has.
+    for (clip, parts) in &clip_parts {
+        spawns.push_str(&format!("\t\t\t{clip} = __clipGroup([{}]);\n", parts.join(", ")));
+    }
+    Ok((spawns, entries, clip_parts.into_iter().map(|(c, _)| c).collect()))
 }
 
 /// One segmented backdrop element: a CUSTOM_GAME_OBJECT (entity + state-machine Script + stats),
@@ -3851,7 +3788,26 @@ fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str
     // its objects through the tree (`getBackground().clocktown_rainsplash_bg`), and after the port
     // there is no tree -- so the name it used is bound to the object that took that clip's place.
     let clip_vars = if clip_handles.is_empty() { String::new() } else {
-        format!("// the stage's own clips, under the names its class knows them by\n{}\n",
+        format!(
+            "// The stage's own clips, under the names its class knows them by. A named clip is\n\
+             // ONE thing to that class and several independently-looping objects underneath, which\n\
+             // is what it is in the source too -- so the name is bound to the group, and the group\n\
+             // passes on what is asked of it.\n\
+             function __clipGroup(parts) {{\n\
+             \tvar g = {{}};\n\
+             \tg.parts = parts;\n\
+             \tg.setVisible = function(v) {{\n\
+             \t\tfor (i in 0...parts.length) {{\n\
+             \t\t\tif (parts[i] != null) {{ parts[i].getViewRootContainer().visible = v; }}\n\
+             \t\t}}\n\
+             \t}};\n\
+             \tg.setAlpha = function(a) {{\n\
+             \t\tfor (i in 0...parts.length) {{\n\
+             \t\t\tif (parts[i] != null) {{ parts[i].getViewRootContainer().alpha = a; }}\n\
+             \t\t}}\n\
+             \t}};\n\
+             \treturn g;\n\
+             }}\n{}\n",
             clip_handles.iter().map(|h| format!("var {h} = null;")).collect::<Vec<_>>().join("\n"))
     };
     let haz_var = format!("{clip_vars}{w_var}{haz_var}");
