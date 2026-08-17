@@ -536,6 +536,71 @@ fn render_condition(cond: &Expr) -> String {
 
 // ─── Opcode constants ─────────────────────────────────────────────────────────
 
+/// `iffalse` short-circuits on false, which is `&&`; `iftrue` short-circuits on true, which is `||`.
+fn op_of(cond_inv: bool) -> &'static str { if cond_inv { "&&" } else { "||" } }
+
+/// One link of a short-circuit chain: its term, the operator its own test short-circuits with,
+/// and WHERE it jumps when it does. That last field is what decides the grouping.
+struct Link {
+    term: Expr,
+    op: &'static str,
+    target: usize,
+}
+
+/// Combine a chain's links into one condition.
+///
+/// One operator throughout is flat. A chain that CHANGES operator has to be grouped, and the
+/// grouping is not a matter of precedence -- it is written in the jump targets:
+///
+/// * clocktown's tingle spawn: the last `&&` jumps to the deciding branch ITSELF, so a false there
+///   skips the body whatever the `||`s would say. The ANDs gate everything, and the ORs are one
+///   operand: `a && b && c && d && (e || f || g)`.
+/// * sandbag's `removeAllEffects`: the `&&` jumps to the `||`'s OWN test, so a false there does
+///   not skip -- it flows on and the `||` decides. The ANDs are the first alternative:
+///   `(a && b) || c`.
+///
+/// Same operators, same order, opposite meanings. Reading the targets is the only way to tell them
+/// apart: an earlier attempt grouped by operator runs alone, got the second case backwards, and
+/// would have changed when sandbag clears its effects.
+fn combine_chain(links: Vec<Link>, consumer: usize) -> Option<Expr> {
+    let fold = |op: &'static str, terms: Vec<Expr>| -> Option<Expr> {
+        terms.into_iter().reduce(|a, b| Expr::BinOp(op, Box::new(a), Box::new(b)))
+    };
+    let (_, rest) = links.split_last()?;   // the final term carries no operator of its own
+    if rest.is_empty() { return Some(links.into_iter().next()?.term); }
+    let first_op = rest[0].op;
+    let terms: Vec<Expr> = links.iter().map(|l| l.term.clone()).collect();
+    if rest.iter().all(|l| l.op == first_op) {
+        return fold(first_op, terms);
+    }
+    // exactly one change of operator is the shape this reads
+    let switch = rest.iter().position(|l| l.op != first_op)?;
+    let second_op = rest[switch].op;
+    if rest[switch..].iter().any(|l| l.op != second_op) { return None; }
+
+    let gates = rest[switch - 1].target == consumer;
+    // a gating first run stands alone and the rest is its second operand; a non-gating one
+    // short-circuits INTO the second run, so it reaches one term further
+    let split = if gates { switch } else { switch + 1 };
+    if split == 0 || split >= terms.len() { return None; }
+    let join = if gates { first_op } else { second_op };
+    // Parenthesise an operand only where it changes the reading: one term needs none, and a group
+    // whose own operator IS the join reads the same either way. What must be wrapped is a group
+    // that binds differently from what joins it.
+    let group = |op: &'static str, terms: Vec<Expr>| -> Option<Expr> {
+        let n = terms.len();
+        let folded = fold(op, terms)?;
+        Some(if n > 1 && op != join {
+            Expr::GetLex(format!("({})", folded.render()))
+        } else {
+            folded
+        })
+    };
+    let head = group(first_op, terms[..split].to_vec())?;
+    let tail = group(second_op, terms[split..].to_vec())?;
+    Some(Expr::BinOp(join, Box::new(head), Box::new(tail)))
+}
+
 /// A chain longer than this is not a chain; the walk stops rather than looping on malformed input.
 const MAX_CHAIN_LINKS: usize = 32;
 /// A chain is at least two terms. (The older pair-shaped handling also claims this case, but gets
@@ -1447,7 +1512,9 @@ impl<'a> StructuredDecoder<'a> {
                         // A uniform chain of any length first; the pair-shaped handling below only
                         // knows one length and quietly reshapes anything longer.
                         let collapse = self
-                            .try_collapse_chain(raw_cond.clone(), then_start, else_start, &carry_stack)
+                            .try_collapse_chain(raw_cond.clone(), inv,
+                                if inv { then_start } else { else_start },
+                                if inv { else_start } else { then_start })
                             .and_then(|(cond, consumer)| {
                                 let cb = self.block_at(consumer)?.clone();
                                 let Terminator::Branch { cond_inv, target, fallthrough } = cb.term
@@ -1595,66 +1662,70 @@ impl<'a> StructuredDecoder<'a> {
     /// wrong operator, one term missing, and the remainder unrecoverable -- so the block guarding
     /// its falling rocks rendered as `if (false)`. Nothing announced it.
     ///
-    /// Only a UNIFORM chain is folded here (all `iffalse`, or all `iftrue`). A genuinely mixed
-    /// condition compiles to a different shape and is left to the caller's other handling.
+    /// A chain may CHANGE operator, and where it does the grouping comes from the jump targets --
+    /// see [`combine_chain`]. Two block layouts appear, and which one does is an accident of
+    /// whether anything jumps to a link's test: if something does, the `dup` starts a block of its
+    /// own; if nothing does, it sits in the same block as the term it tests.
     ///
     /// Returns the combined condition and the block whose branch consumes it.
-    fn try_collapse_chain(&mut self, first_cond: Expr, then_start: usize, else_start: usize,
-                          _initial_stack: &[Expr]) -> Option<(Expr, usize)>
+    fn try_collapse_chain(&mut self, first_cond: Expr, first_inv: bool, first_fallthrough: usize,
+                          first_target: usize) -> Option<(Expr, usize)>
     {
-        let mut terms = vec![first_cond];
-        let mut op: Option<&'static str> = None;
-        let (mut term_at, mut branch_at) = (then_start, else_start);
+        let mut links = vec![Link { term: first_cond, op: op_of(first_inv), target: first_target }];
+        let mut term_at = first_fallthrough;
 
         for _ in 0..MAX_CHAIN_LINKS {
-            // The next term is computed in the block BETWEEN this branch and the next: the spare
-            // copy is popped, the term evaluated, and it falls into the block that tests it.
             let tb = self.block_at(term_at)?.clone();
-            if !matches!(tb.term, Terminator::Fall(n) if n == branch_at) { return None; }
             // A link BEGINS by discarding the duplicated copy. Without that this matches two
             // independent `if`s that merely sit next to each other -- sandbag's LEFT/RIGHT pair
             // became `if (LEFT && null)` with the LEFT body swallowed, `null` being the very
             // placeholder seeded below for a `pop` that was never there.
             if self.bc.get(tb.start) != Some(&OP_POP) { return None; }
 
+            // A link's test may be preceded by type coercions (`coerce_a`/`convert_b`), which is
+            // how AS3 types the value; anything else means the block is doing work of its own and
+            // treating it as a link would swallow that work.
+            let (term_end, next, consumer) = match tb.term {
+                Terminator::Fall(at) => {
+                    let bb = self.block_at(at)?.clone();
+                    let Terminator::Branch { cond_inv, target, fallthrough } = bb.term
+                        else { return None };
+                    match self.op_before_term(&bb) {
+                        Some((dup, OP_DUP)) if self.only_coercions_before(bb.start, dup) =>
+                            (tb.end, Some((op_of(cond_inv), target, fallthrough)), at),
+                        _ => (tb.end, None, at),
+                    }
+                }
+                Terminator::Branch { cond_inv, target, fallthrough } => {
+                    match self.op_before_term(&tb) {
+                        Some((dup, OP_DUP)) if dup > tb.start
+                            && dup >= tb.start =>
+                            (dup, Some((op_of(cond_inv), target, fallthrough)), term_at),
+                        _ => (tb.end, None, term_at),
+                    }
+                }
+                _ => return None,
+            };
+
             let mut dec = BlockDecoder::new(self.bc, self.abc);
             dec.activation_slots = self.activation_slots.clone();
             dec.param_locals = self.param_locals.clone();
             dec.has_activation = !dec.activation_slots.is_empty();
             dec.stack = vec![Expr::Null]; // the `pop` of the duplicated copy consumes this
-            let term = dec.decode_range(tb.start, tb.end)
+            let term = dec.decode_range(tb.start, term_end)
                 .or_else(|| dec.stack.last().cloned())
                 .unwrap_or(Expr::Unknown);
             if matches!(term, Expr::Unknown) { return None; }
-            terms.push(term);
 
-            let bb = self.block_at(branch_at)?.clone();
-            let Terminator::Branch { cond_inv, target, fallthrough } = bb.term else { return None };
-
-            // `iffalse` short-circuits on false, which is `&&`; `iftrue` is `||`
-            let this_op = if cond_inv { "&&" } else { "||" };
-            match op {
-                None => op = Some(this_op),
-                Some(prev) if prev == this_op => {}
-                Some(_) => return None, // mixed: a different shape, left to other handling
-            }
-
-            match self.op_before_term(&bb) {
-                // A link's branch block holds the `dup`, the branch, and nothing that COMPUTES
-                // anything -- the term itself was worked out in the block that fell into this one.
-                // Type coercions are allowed because they are exactly that: `coerce_a`/`convert_b`
-                // between a term and its test are how AS3 types the value, and refusing them left
-                // clocktown's tingle spawn behind a dead condition. Anything else means the block
-                // is doing work, and treating it as a link swallows that work.
-                Some((at, OP_DUP)) if self.only_coercions_before(bb.start, at) =>
-                    { term_at = fallthrough; branch_at = target; }
-                // consumes it: this branch is the one that skips the body
-                _ => {
-                    if terms.len() < MIN_CHAIN_TERMS { return None; }
-                    let o = op.unwrap_or("&&");
-                    let combined = terms.into_iter()
-                        .reduce(|a, b| Expr::BinOp(o, Box::new(a), Box::new(b)))?;
-                    return Some((combined, branch_at));
+            match next {
+                Some((op, target, fallthrough)) => {
+                    links.push(Link { term, op, target });
+                    term_at = fallthrough;
+                }
+                None => {
+                    links.push(Link { term, op: "", target: consumer });
+                    if links.len() < MIN_CHAIN_TERMS { return None; }
+                    return combine_chain(links, consumer).map(|c| (c, consumer));
                 }
             }
         }
