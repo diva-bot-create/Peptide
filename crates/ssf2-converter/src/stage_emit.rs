@@ -283,21 +283,34 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     // The stage class's OWN code, alongside the generated script rather than instead of it.
     //
     // This is the thing that should eventually BE the stage script: SSF2 puts the cadence there --
-    // when a thwomp drops and onto which column, when the clock turns over, when it rains -- and
-    // the generated script can only spawn everything once and hope. It is written out for reading
-    // and not yet wired, because the reconstruction still loses conditions it cannot recover, and
-    // a stage whose hazards never fire is worse than a stage that spawns them bluntly.
+    // when a thwomp drops and onto which column, when the clock turns over, when it rains. The
+    // generated setup below is a conversion of the stage's DATA -- collision, backgrounds, weather,
+    // the objects it declares -- and this is a conversion of its CODE. Both, composed: the setup
+    // gives Fraymakers what the source never had to build, and the ported class then runs.
     //
-    // The spawns in it ARE converted now: SSF2 hands the engine a class, Fraymakers takes content,
-    // and the package ships each of those classes as content, so the call has an exact equivalent.
-    if let Some(src) = model.stage_script.as_ref() {
+    // Its spawns convert too: SSF2 hands the engine a class, Fraymakers takes content, and the
+    // package ships each of those classes as content.
+    // ...but NOT by loading the class wholesale, which was tried and fails for a reason worth
+    // stating: much of a stage class manipulates SSF2's DISPLAY TREE
+    // (`getBackground().clocktown_rainsplash_bg`, `m_rain.update()`), and this package has already
+    // converted those clips into art, VFX and its own weather. That code is not missing here, it is
+    // REDUNDANT -- and run as-is it reaches for a tree Fraymakers does not have and dies on null.
+    //
+    // So it is written beside the script for reading until the display-tree half can be told from
+    // the behaviour half. What transfers is the behaviour: the spawn cadence, the day counting, the
+    // timers. What does not is everything that arranges pictures.
+    let ported = model.stage_script.as_ref().map(|src| {
         let converted = crate::api_mappings::rewrite_spawn_enemy_calls(
             src, &|class: &str| format!("{id}{class}"));
+        stage_runnable(&converted)
+    }).unwrap_or_default();
+    if !ported.trim().is_empty() {
         write_script(&scripts.join(format!("{id}StageSource.hx.txt")), &format!(
-            "// {id}: the SSF2 stage class, decompiled and translated.\n             // Reference, not yet loaded -- see stage_emit for what is still missing.\n\n{converted}"))?;
+            "// {id}: the SSF2 stage class, decompiled, translated and made runnable.\n             // Reference, not loaded -- see stage_emit for what still stands in the way.\n\n{ported}"))?;
     }
+
     write_script(&scripts.join(format!("{id}Script.hx")),
-                 &script_hx(id, animated, &spawns, (&weather_spawn, &weather_frame)))?;
+                 &script_hx(id, animated, &spawns, (&weather_spawn, &weather_frame), ""))?;
     write_meta(&scripts.join(format!("{id}Script.hx.meta")), id, &format!("{id}Script"), "", Some("STAGE"), None)?;
     write_script(&scripts.join(format!("{id}StageStats.hx")), &stage_stats_hx(id, &art.parallax, model.scale))?;
     write_meta(&scripts.join(format!("{id}StageStats.hx.meta")), id, &format!("{id}StageStats"), "hscript", None, None)?;
@@ -1894,6 +1907,79 @@ struct ReconWrap {
     /// The class's own createSelfPlatform box (raw SSF2 coords, relative to the body origin):
     /// lowered to runtime structures created at the call site.
     self_platform: Option<(f64, f64, f64, f64)>,
+}
+
+/// Make a decompiled STAGE class runnable, which is a smaller job than the object-class version.
+///
+/// A stage script's module scope PERSISTS across frames -- the generated script already relies on
+/// that, keeping `m_hazardsSpawned` in a plain `var` -- so a stage's fields need none of the
+/// persistent-state machinery a custom game object needs, where a bare `var` re-initialises every
+/// frame. They become plain module-scope vars, which also lets them hold what they actually hold:
+/// clocktown's `m_previousTingle` is an OBJECT and `m_flamingRocks` an ARRAY, and `makeInt` can
+/// keep neither.
+///
+/// What still has to go is the api layer SSF2 supplies and Fraymakers does not: the weather object
+/// (this package emits weather from the stage's own declared particles instead) and the quality
+/// query (already answered at full quality). Timers do have an equivalent, and it is the engine's.
+fn stage_runnable(raw: &str) -> String {
+    static FIELD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let field = FIELD.get_or_init(|| regex::Regex::new(r"self\.(m_[A-Za-z0-9_]+)").unwrap());
+    static TIMER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let timer = TIMER.get_or_init(||
+        regex::Regex::new(r"(m_[A-Za-z0-9_]+)\s*=\s*new FrameTimer\(([^)]*)\)").unwrap());
+
+    // every field the class touches, in a stable order
+    let mut fields: Vec<String> = field.captures_iter(raw)
+        .map(|c| c[1].to_string()).collect();
+    fields.sort(); fields.dedup();
+
+    // a field initialised from a FrameTimer is one, and gets the engine's -- with the source's
+    // duration in SSF2 frames doubled, like every other ported timing
+    let mut timers: std::collections::BTreeMap<String, String> = Default::default();
+    for c in timer.captures_iter(raw) {
+        timers.insert(c[1].to_string(), c[2].trim().to_string());
+    }
+
+    let mut out = String::new();
+    out.push_str("// the stage class's own state. a stage script keeps its module scope between\n                  // frames, so these are plain vars.\n");
+    for f in &fields {
+        match timers.get(f) {
+            Some(dur) => out.push_str(&format!(
+                "var {f} = self.makeFrameTimer(({dur}) * {});\n", crate::entity_gen::FRAME_RATIO)),
+            None => out.push_str(&format!("var {f} = null;\n")),
+        }
+    }
+    out.push('\n');
+
+    for line in raw.lines() {
+        let t = line.trim();
+        // the api objects Fraymakers has no counterpart for, and this package covers another way
+        if t.contains("new RainWeather") || t.contains("SSF2StageQuality") {
+            out.push_str(&format!("{}// [ported elsewhere] {t}\n",
+                &line[..line.len() - line.trim_start().len()]));
+            continue;
+        }
+        // the timer construction is hoisted into the preamble above
+        if timer.is_match(t) && t.contains("new FrameTimer") { continue; }
+        out.push_str(&field.replace_all(line, "$1"));
+        out.push('\n');
+    }
+
+    // The class's own methods call each other through `self`; here they are plain functions in one
+    // script. And its lifecycle entry points are renamed, because the emitted script has its own
+    // `initialize`/`update` doing the Fraymakers-side setup -- structures, backgrounds, weather --
+    // that the source never had to do. The two are composed rather than one replacing the other:
+    // the setup is a conversion of the stage's DATA, this is a conversion of its CODE.
+    let mut fns: Vec<String> = regex::Regex::new(r"(?m)^function\s+([A-Za-z_]\w*)\s*\(")
+        .unwrap().captures_iter(&out).map(|c| c[1].to_string()).collect();
+    fns.sort(); fns.dedup();
+    let mut done = out;
+    for f in &fns {
+        done = done.replace(&format!("self.{f}("), &format!("{f}("));
+    }
+    done = done.replace("function initialize()", "function __source_initialize()")
+               .replace("function update()", "function __source_update()");
+    done
 }
 
 fn cgo_runnable(raw: &str, anims: &[String], scale: f64, wrap: Option<&ReconWrap>) -> String {
@@ -3596,7 +3682,8 @@ fn stage_stats_hx(id: &str, parallax: &[ParallaxRef], _scale: f64) -> String {
 /// Stage Script.hx — pause a static stage on frame 1; let an animated stage's timeline
 /// play (the SSF2 animated clips loop). The parallax background is camera-scrolled by
 /// StageStats, so no manual scroll is needed.
-fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str)) -> String {
+fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str),
+             ported: &str) -> String {
     let init = if animated { "\t// animated stage clips play + loop on the timeline" } else { "\tself.pause();" };
     // hazards spawn DEFERRED in update() once the match is live (one-shot via a flag). owner is
     // NULL: a stage hazard belongs to no fighter, so it damages everyone (a null hitbox owner
@@ -3640,16 +3727,26 @@ fn script_hx(id: &str, animated: bool, hazard_spawns: &str, weather: (&str, &str
                   \t}}\n{w_frame}"))
     };
     let haz_var = format!("{w_var}{haz_var}");
-    let update_fn = if haz_body.is_empty() {
+    // The stage's OWN code runs after the setup, every frame, exactly as SSF2 runs it. Without
+    // this the stage is furniture: everything it decides -- when a thwomp drops, when the clock
+    // turns over, when it rains -- lives in that update and simply never happened.
+    let (src_init, src_update) = if ported.trim().is_empty() {
+        (String::new(), String::new())
+    } else {
+        ("\t__source_initialize();\n".to_string(), "\t__source_update();\n".to_string())
+    };
+    let update_fn = if haz_body.is_empty() && src_update.is_empty() {
         "function update() {}\n".to_string()
     } else {
-        format!("function update() {{\n{haz_body}}}\n")
+        format!("function update() {{\n{haz_body}{src_update}}}\n")
     };
     format!(
         "// API Script for {id} (converted from SSF2)\n\n\
+{ported}\
 {haz_var}\
 function initialize() {{\n\
 {init}\n\
+{src_init}\
 }}\n\
 {update_fn}\
 function onTeardown() {{}}\n\
@@ -3731,7 +3828,7 @@ mod hazard_tests {
         // a null hitbox owner is neutral and passes the engine's team-hit validation (hits
         // everyone), and createCustomGameObject accepts a null owner.
         let spawn = "\t\t\tvar _hz0 = match.createCustomGameObject(self.getResource().getContent(\"demohazard0\"), owner);\n";
-        let s = script_hx("demo", false, spawn, ("", ""));
+        let s = script_hx("demo", false, spawn, ("", ""), "");
         assert!(s.contains("var owner = null;"), "hazard owner should be null: {s}");
         assert!(s.contains("createCustomGameObject"), "no spawn call: {s}");
     }
