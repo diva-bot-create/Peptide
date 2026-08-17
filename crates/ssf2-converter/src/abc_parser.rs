@@ -364,7 +364,18 @@ impl<'a> Reader<'a> {
 
 // ─── ABC parsing ─────────────────────────────────────────────────────────────
 
+/// Read an ABC file.
+///
+/// The reading is Ruffle's (`crate::abc_ruffle`); this crate keeps the shape and everything built
+/// on it. The hand-rolled walk that used to be here is [`parse_by_hand`], kept as the thing the
+/// parity test checks the mapping against -- a second opinion is worth having about a format where
+/// an off-by-one renames every symbol without failing anything.
 pub fn parse(data: &[u8]) -> Result<AbcFile> {
+    crate::abc_ruffle::parse(data)
+}
+
+/// The hand-rolled ABC walk. Superseded by [`parse`]; see `tests/abc_reader_parity.rs`.
+pub fn parse_by_hand(data: &[u8]) -> Result<AbcFile> {
     let mut r = Reader::new(data);
 
     // Header: minor version, major version
