@@ -2,11 +2,18 @@
 //!
 //! `abc_parser` hand-rolls the byte-level walk of an ABC file: pools, namespaces, multinames,
 //! classes, traits, method bodies. The `swf` crate we already depend on ships that walk
-//! (`swf::avm2::read`), written and exercised by a Flash emulator, and hand-rolling it a second
-//! time has cost us: traits came back as a `u8` kind read straight out of the byte, so slots and
-//! methods were indistinguishable to a caller that did not already know the encoding -- which is
-//! how "decompile every method a class defines" ended up feeding the class's FIELDS to the
-//! decompiler. Ruffle models a trait as an enum, where that mistake cannot be spelled.
+//! (`swf::avm2::read`), written and exercised by a Flash emulator.
+//!
+//! What this is NOT is a bug fix. Both readers were compared across every stage in the sweep and
+//! six characters -- sixteen files, sixteen ABC blocks -- and they agree exactly, so the hand
+//! walk was reading this content correctly. (An earlier version of this note blamed it for the
+//! slots-among-methods bug. That was wrong: the trait kind was recorded correctly and a caller
+//! ignored it, and Ruffle mixes slots into the same trait list too, so nothing about that reader
+//! would have prevented it.)
+//!
+//! The reason to prefer it is smaller surface, not present-day correctness: one implementation of
+//! a format instead of two, plus typed traits, real namespaces, method signatures and exception
+//! tables that the hand walk skipped and future work would otherwise have to add.
 //!
 //! This module does the mapping and nothing else. Everything downstream -- every extractor, the
 //! decompiler -- keeps its existing types, so the swap is a change of who does the reading rather
