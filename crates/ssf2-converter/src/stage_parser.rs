@@ -371,6 +371,13 @@ pub struct ParallaxLayer {
 #[derive(Clone, Debug)]
 pub struct BgLayer {
     pub name: String,
+    /// The clip INSTANCE this layer belongs to, in SSF2's own terms: the linkage plus the
+    /// placement chain that reached it. A named clip is the unit of identity in a stage's display
+    /// tree, and a clip is one object however many shapes are inside it -- so the still plate and
+    /// the parts moving over it are LAYERS of one thing, not separate things. Two placements of
+    /// the same linkage (bowserscastle's sixteen ember emitters) differ in the path, so they stay
+    /// the separate objects they are.
+    pub clip: String,
     pub frames: Vec<StageArt>,
     /// The opacity the SOURCE authored for this element (the lowest its placements carry). SSF2
     /// makes an overlay subtle -- or hides it entirely, leaving it for code to raise -- by setting
@@ -2544,7 +2551,7 @@ fn render_art_layers(
                 let mut segments = segments;
                 for s in &mut segments { s.frames = rle(std::mem::take(&mut s.frames)); }
                 let frames = segments.iter().flat_map(|s| s.frames.iter().cloned()).collect();
-                return Some(((sname.clone(), *ax, *ay, *apath), BgLayer { name: sname.clone(), frames, segments, pan: None, fades: false, authored_alpha: elem_alpha }));
+                return Some(((sname.clone(), *ax, *ay, *apath), BgLayer { name: sname.clone(), clip: format!("{sname}#{apath}"), frames, segments, pan: None, fades: false, authored_alpha: elem_alpha }));
             }
             // ONE shape the source moves or turns is emitted as that shape ONCE, placed by a
             // transform each frame -- the same thing the character path does with an arm. Baking
@@ -2558,7 +2565,7 @@ fn render_art_layers(
                                                       shape_defs, bitmaps) {
                     let p = loop_period(&fs);
                     return Some(((sname.clone(), *ax, *ay, *apath),
-                                 BgLayer { name: sname.clone(), pan: None, fades: false, authored_alpha: elem_alpha, frames: rle(fs[..p].to_vec()), segments: Vec::new() }));
+                                 BgLayer { name: sname.clone(), clip: format!("{sname}#{apath}"), pan: None, fades: false, authored_alpha: elem_alpha, frames: rle(fs[..p].to_vec()), segments: Vec::new() }));
                 }
             }
             let frames = if animated {
@@ -2571,7 +2578,7 @@ fn render_art_layers(
                 composite_grp(grp, bounds).into_iter().collect()
             };
             (!frames.is_empty()).then(|| ((sname.clone(), *ax, *ay, *apath),
-                                          BgLayer { name: sname.clone(), frames, segments: Vec::new(), pan: None, fades: false, authored_alpha: elem_alpha }))
+                                          BgLayer { name: sname.clone(), clip: format!("{sname}#{apath}"), frames, segments: Vec::new(), pan: None, fades: false, authored_alpha: elem_alpha }))
         }).collect();
 
         // Parts of ONE source clip run off ONE timeline. Split into separate elements they each
@@ -3038,7 +3045,7 @@ fn engine_added_bg_layers(
             (x_fm, y_fm)
         });
         if let Some(art) = to_art(&bg_id, bg_x, bg_y) {
-            bg_layers.push(BgLayer { name: format!("engineLayer{li}"), frames: vec![art], segments: Vec::new(), pan: None, fades: false, authored_alpha: 1.0 });
+            bg_layers.push(BgLayer { name: format!("engineLayer{li}"), clip: format!("engineLayer{li}"), frames: vec![art], segments: Vec::new(), pan: None, fades: false, authored_alpha: 1.0 });
         }
         // foreground = any same-size sibling whose deck row is clearly CUT OUT (a near parapet that
         // must draw IN FRONT of the fighter), at ITS OWN authored placement, falling back to the
@@ -3934,7 +3941,7 @@ fn timeline_tracks(
         // origin (to keep its content centred) and pull the objects out of alignment with each
         // other.
         let name = format!("{}_{}_{}", name_of.get(&key).cloned().unwrap_or_default(), key.0, key.1);
-        out.push(BgLayer { name, frames: collapsed, segments: Vec::new(), pan: None, fades, authored_alpha: 1.0 });
+        out.push(BgLayer { name: name.clone(), clip: name, frames: collapsed, segments: Vec::new(), pan: None, fades, authored_alpha: 1.0 });
     }
     out
 }
