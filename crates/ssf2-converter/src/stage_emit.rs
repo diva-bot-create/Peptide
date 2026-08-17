@@ -110,6 +110,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     let mut bg_refs: Vec<BgLayerRef> = Vec::new();
     for (i, layer) in model.art.background.iter().enumerate() {
         bg_refs.extend(build_element_layers(&elem_ids[i], bg_layer_name(&layer.name, i),
+                                            layer.clip.clone(),
                                             &layer.frames, &layer.segments,
                                             BgPlane::Background, layer.pan, layer.fades, layer.authored_alpha, &mut write_layer)?);
     }
@@ -148,7 +149,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
     let promote_fg = !inline_bg && fg_refs.len() > 1;
     if promote_fg {
         promoted_bg.push(BgLayerRef {
-            name: "Foreground Art".to_string(), eid: "fg".to_string(),
+            name: "Foreground Art".to_string(), eid: "fg".to_string(), clip: "fg".to_string(),
             frames: fg_refs.clone(), plane: BgPlane::Foreground, segments: Vec::new(), pan: None, fades: false, authored_alpha: model.art.foreground_alpha,
         });
     }
@@ -165,6 +166,7 @@ pub fn emit_stage(model: &StageModel, out_root: &Path) -> Result<(PathBuf, PathB
             // the other's art.
             let eid = &format!("fge_{}", fg_elem_ids[i]);
             promoted_bg.extend(build_element_layers(eid, bg_layer_name(&layer.name, i),
+                                                    layer.clip.clone(),
                                                     &layer.frames, &layer.segments,
                                                     BgPlane::Foreground, layer.pan, layer.fades, layer.authored_alpha, &mut write_layer)?);
         }
@@ -777,6 +779,10 @@ struct ParallaxRef {
 /// One backdrop element as its own layer: a display name + its frame sequence (1 = static).
 struct BgLayerRef {
     name: String, eid: String, frames: Vec<ArtRef>, plane: BgPlane,
+    /// Which CLIP INSTANCE this is part of (see `BgLayer::clip`). A stage's display tree is named
+    /// clips, and one clip is one object -- so parts of the same clip, whether the parser split
+    /// them by animating depth or the plate/moving split did, are LAYERS of one entity.
+    clip: String,
     /// The element's label-delimited segments as `(label, frame count, jump)`, when its SSF2 clip
     /// branches between them instead of looping. Frame counts index into `frames`, which is the
     /// segments concatenated in timeline order. Empty for an ordinary looping element.
@@ -3090,6 +3096,66 @@ fn bg_element_origin(layer: &BgLayerRef) -> (f64, f64) {
     if x.is_finite() && y.is_finite() { (x, y) } else { (0.0, 0.0) }
 }
 
+/// One CLIP as one entity, its parts as layers.
+///
+/// A stage's display tree is named clips, and a clip is one object however many shapes are inside
+/// it. The parts arrive here separated for good reasons -- the parser splits a clip by animating
+/// depth, and a mostly-still clip is split again into a plate plus what moves, so a big backdrop is
+/// rasterised once instead of once per frame -- and both belong INSIDE the object rather than
+/// instead of it. Kept apart as entities, `getBackground().clocktown_rainsplash_bg` is thirteen
+/// things and there is nothing to address.
+///
+/// The origin is shared across the parts, since they are one object and have to stay in register.
+fn bg_element_entity_multi(eid: &str, parts: &[&BgLayerRef], scale: f64) -> Value {
+    let g = |s: &str| det_uuid(&format!("bgelem::{eid}::{s}"));
+    // one origin for the whole clip: each part keeps its offset FROM it, so the plate and the
+    // parts moving over it line up the way the source drew them
+    let (ox, oy) = parts.iter().map(|l| bg_element_origin(l))
+        .fold((f64::MAX, f64::MAX), |(ax, ay), (bx, by)| (ax.min(bx), ay.min(by)));
+    let (ox, oy) = if ox == f64::MAX { (0.0, 0.0) } else { (ox, oy) };
+
+    let (mut symbols, mut keyframes, mut layers, mut layer_ids) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (li, layer) in parts.iter().enumerate() {
+        let mut kfs: Vec<Value> = Vec::new();
+        for (j, f) in layer.frames.iter().enumerate() {
+            let sym = g(&format!("l{li}sym{j}"));
+            symbols.push(json!({
+                "$id": sym, "type": "IMAGE", "imageAsset": f.guid,
+                "x": f.x - ox, "y": f.y - oy, "pivotX": 0.0, "pivotY": 0.0,
+                // the frame's own orientation composes with the stage scale
+                "scaleX": scale * f.scale_x, "scaleY": scale * f.scale_y, "rotation": f.rotation,
+                // the frame's OWN opacity, which is how the source animates a tint or a glow
+                "alpha": f.alpha, "pluginMetadata": {}
+            }));
+            kfs.push(json!({
+                "$id": g(&format!("l{li}kf{j}")), "symbol": sym, "length": f.hold.max(1),
+                "tweened": false, "tweenType": "LINEAR", "type": "IMAGE", "pluginMetadata": {}
+            }));
+        }
+        // 30fps SSF2 source -> 60fps engine, exactly like the main stage entity and the hazards
+        crate::entity_gen::double_keyframe_lengths(&mut kfs);
+        let ids: Vec<String> = (0..layer.frames.len()).map(|j| g(&format!("l{li}kf{j}"))).collect();
+        keyframes.extend(kfs);
+        let lid = g(&format!("layer{li}"));
+        layers.push(json!({ "$id": lid, "name": layer.name.clone(), "type": "IMAGE",
+                            "hidden": false, "locked": false, "keyframes": ids,
+                            "pluginMetadata": {} }));
+        layer_ids.push(lid);
+    }
+    json!({
+        "export": true, "guid": g("entity"), "id": eid, "version": 5,
+        "pluginMetadata": { "com.fraymakers.FraymakersMetadata": { "objectType": "VFX", "version": "0.1.0" } },
+        "plugins": ["com.fraymakers.FraymakersTypes", "com.fraymakers.FraymakersMetadata"],
+        "tags": [], "paletteMap": {}, "tilesets": [], "terrains": [],
+        "symbols": symbols,
+        "keyframes": keyframes,
+        "layers": layers,
+        "animations": [ { "$id": g("anim"), "name": "active", "layers": layer_ids, "pluginMetadata": {} } ]
+    })
+}
+
+#[allow(dead_code)]
 fn bg_element_entity(eid: &str, layer: &BgLayerRef, scale: f64) -> Value {
     // Art is element-LOCAL: the stage offset is hoisted onto the vfx itself (VfxStats x/y)
     // instead of being baked into every symbol. Baking it in meant every element sat at the
@@ -3259,6 +3325,7 @@ fn bg_segment_script_hx(eid: &str, layer: &BgLayerRef) -> String {
 fn build_element_layers(
     eid: &str,
     name: String,
+    clip: String,
     frames: &[crate::stage_parser::StageArt],
     segments: &[crate::stage_parser::BgSegment],
     plane: BgPlane,
@@ -3275,14 +3342,17 @@ fn build_element_layers(
             let plate_ref = write_layer(&plate_id, &plate)?;
             let moving_refs = write_element_frames(eid, &moving, false, write_layer)?;
             return Ok(vec![
-                BgLayerRef { name: format!("{name} (plate)"), eid: plate_id, frames: vec![plate_ref],
+                // the still part and what moves over it are one clip, kept apart so the plate is
+                // rasterised once -- as LAYERS of that clip, not as two objects
+                BgLayerRef { name: format!("{name} (plate)"), eid: plate_id, clip: clip.clone(),
+                             frames: vec![plate_ref],
                              plane, segments: Vec::new(), pan, fades, authored_alpha },
-                BgLayerRef { name, eid: eid.to_string(), frames: moving_refs, plane, segments: Vec::new(), pan, fades, authored_alpha },
+                BgLayerRef { name, eid: eid.to_string(), clip, frames: moving_refs, plane, segments: Vec::new(), pan, fades, authored_alpha },
             ]);
         }
     }
     let refs = write_element_frames(eid, frames, !segs.is_empty(), write_layer)?;
-    Ok(vec![BgLayerRef { name, eid: eid.to_string(), frames: refs, plane, segments: segs, pan, fades, authored_alpha }])
+    Ok(vec![BgLayerRef { name, eid: eid.to_string(), clip, frames: refs, plane, segments: segs, pan, fades, authored_alpha }])
 }
 
 /// Split a mostly-static animated element into a still PLATE plus a small moving piece.
@@ -3434,7 +3504,17 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
     -> Result<(String, Vec<Value>)> {
     let mut spawns = String::new();
     let mut entries: Vec<Value> = Vec::new();
-    for (i, layer) in promoted.iter().enumerate() {
+    // One object per CLIP: the parts the parser and the plate split separated are layers of it.
+    // Grouped in first-appearance order so draw order is unchanged.
+    let mut groups: Vec<(String, Vec<&BgLayerRef>)> = Vec::new();
+    for layer in promoted.iter() {
+        match groups.iter_mut().find(|(c, _)| *c == layer.clip) {
+            Some((_, v)) => v.push(layer),
+            None => groups.push((layer.clip.clone(), vec![layer])),
+        }
+    }
+    for (i, (_, parts)) in groups.iter().enumerate() {
+        let layer = parts[0];
         let eid = format!("{}_{}", model.id, layer.eid);
         // an element whose clip branches between labels can't be a VFX: a VFX holds one animation
         // and carries no script, so there is nothing to switch and nothing to switch it.
@@ -3442,7 +3522,7 @@ fn emit_bg_elements(model: &StageModel, promoted: &[BgLayerRef], lib: &Path)
             emit_bg_segmented(model, layer, &eid, i, lib, &mut spawns, &mut entries)?;
             continue;
         }
-        write_json(&lib.join("entities").join(format!("{eid}.entity")), &bg_element_entity(&eid, layer, model.scale))?;
+        write_json(&lib.join("entities").join(format!("{eid}.entity")), &bg_element_entity_multi(&eid, parts, model.scale))?;
         write_meta(&lib.join("entities").join(format!("{eid}.entity.meta")), &eid, &eid, "", Some("VFX"), None)?;
         // createVfx loops the element forever at its baked-in position (relativeWith:false ->
         // absolute), then reparent its sprite into the background container so it draws in front
